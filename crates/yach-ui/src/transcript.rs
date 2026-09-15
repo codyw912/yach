@@ -32,12 +32,22 @@ pub enum EntryKind {
     HarnessOutcome {
         kind: HarnessOutcomeKind,
     },
+    /// A context-compaction checkpoint. The backend owns compaction; this
+    /// records that one occurred so `/status` and the status bar can report
+    /// observed compactions instead of a placeholder.
+    Compaction,
     Error,
 }
 
 /// Most lines of live tool output kept visible under a running tool call;
 /// older lines scroll away, matching the bounded "active tool card" shape.
-const STREAM_TAIL_MAX_LINES: usize = 8;
+///
+/// 24 is enough to show a typical cargo/rustc failure (error, snippet, and
+/// notes) instead of a spinner tail, while still leaving room in a normal
+/// terminal for the prompt, status bar, and prior history. This stays a
+/// deliberate retention cap, not unbounded scrollback: completed output is
+/// replaced by the result summary and remains expandable separately.
+const STREAM_TAIL_MAX_LINES: usize = 24;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolReviewRowStatus {
     Pending,
@@ -226,6 +236,14 @@ impl Transcript {
         self.entries.push(TranscriptEntry::new(
             message.to_owned(),
             EntryKind::HarnessOutcome { kind },
+        ));
+        self.bump_revision();
+    }
+
+    pub fn append_compaction(&mut self, message: &str) {
+        self.entries.push(TranscriptEntry::new(
+            message.to_owned(),
+            EntryKind::Compaction,
         ));
         self.bump_revision();
     }
@@ -420,6 +438,11 @@ impl Transcript {
         })
     }
 
+    /// Whether a review row still holds the keyboard.
+    ///
+    /// Deliberately includes `Resolved`: between the user's decision and the
+    /// tool's result the call is still in flight, so input stays with the
+    /// review row. Only an interrupted review releases it early.
     pub fn has_unresolved_review(&self) -> bool {
         self.entries.iter().any(|entry| {
             matches!(entry.kind, EntryKind::ToolCall { .. })
@@ -429,6 +452,30 @@ impl Transcript {
                         ToolReviewRowStatus::Resolved(ToolReviewResolution::Interrupted)
                     )
                 })
+        })
+    }
+
+    /// Currently highlighted option on the pending review row, if any.
+    #[must_use]
+    pub fn pending_review_selection(&self) -> Option<ToolReviewDecision> {
+        self.entries.iter().rev().find_map(|entry| {
+            entry
+                .review
+                .as_ref()
+                .filter(|review| matches!(review.status, ToolReviewRowStatus::Pending))
+                .map(|review| review.selected)
+        })
+    }
+
+    /// Whether the pending review is a command, which is the only payload
+    /// offering a session grant.
+    #[must_use]
+    pub fn pending_review_is_command(&self) -> bool {
+        self.entries.iter().rev().any(|entry| {
+            entry.review.as_ref().is_some_and(|review| {
+                matches!(review.status, ToolReviewRowStatus::Pending)
+                    && matches!(review.payload, ToolReviewPayload::Command { .. })
+            })
         })
     }
 
@@ -538,10 +585,6 @@ impl Transcript {
         self.revision
     }
 
-    pub fn compaction_count(&self) -> usize {
-        0
-    }
-
     fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }
@@ -587,6 +630,9 @@ fn review_status_label(status: ToolReviewRowStatus) -> &'static str {
         ToolReviewRowStatus::Pending => "pending",
         ToolReviewRowStatus::Submitted(ToolReviewDecision::Approve) => "approve submitted",
         ToolReviewRowStatus::Submitted(ToolReviewDecision::Reject) => "reject submitted",
+        ToolReviewRowStatus::Submitted(ToolReviewDecision::ApproveForSession) => {
+            "session approve submitted"
+        }
         ToolReviewRowStatus::Resolved(ToolReviewResolution::Approved) => "approved",
         ToolReviewRowStatus::Resolved(ToolReviewResolution::Rejected) => "rejected",
         ToolReviewRowStatus::Resolved(ToolReviewResolution::Interrupted) => "interrupted",
@@ -615,18 +661,32 @@ fn review_detail(review: &ToolReviewRow) -> String {
         }
     }
     if matches!(review.status, ToolReviewRowStatus::Pending) {
-        let approve = if review.selected == ToolReviewDecision::Approve {
-            "› Approve"
+        // Session approval only makes sense for commands: edits already
+        // have a session-wide posture in the `accept-edits` approval mode.
+        let offers_session_grant = matches!(review.payload, ToolReviewPayload::Command { .. });
+        let options: &[(ToolReviewDecision, &str)] = if offers_session_grant {
+            &[
+                (ToolReviewDecision::Approve, "Approve once"),
+                (
+                    ToolReviewDecision::ApproveForSession,
+                    "Approve for this session",
+                ),
+                (ToolReviewDecision::Reject, "Reject"),
+            ]
         } else {
-            "  Approve"
+            &[
+                (ToolReviewDecision::Approve, "Approve"),
+                (ToolReviewDecision::Reject, "Reject"),
+            ]
         };
-        let reject = if review.selected == ToolReviewDecision::Reject {
-            "› Reject"
-        } else {
-            "  Reject"
-        };
-        lines.push(approve.to_owned());
-        lines.push(reject.to_owned());
+        for (decision, label) in options {
+            let marker = if review.selected == *decision {
+                "›"
+            } else {
+                " "
+            };
+            lines.push(format!("{marker} {label}"));
+        }
         lines.push(String::from("↑/↓ or j/k select · Enter confirm"));
     }
     lines.join("\n")
@@ -684,6 +744,7 @@ fn entry_display_text(entry: &TranscriptEntry) -> String {
         | EntryKind::AssistantText
         | EntryKind::Status
         | EntryKind::HarnessOutcome { .. }
+        | EntryKind::Compaction
         | EntryKind::Error => entry.content.clone(),
     }
 }
@@ -959,6 +1020,13 @@ fn render_entry_lines(entry: &TranscriptEntry, width: u16, theme: &Theme) -> Vec
                 2,
             )
         }
+        EntryKind::Compaction => (
+            Span::styled("⟲ ", Style::new().fg(colors.accent).bold()),
+            Span::raw("  "),
+            display_text,
+            Style::new().fg(colors.muted),
+            2,
+        ),
         EntryKind::Error => (
             Span::styled("✗ ", Style::new().fg(colors.error).bold()),
             Span::raw("  "),
@@ -1143,6 +1211,8 @@ fn transcript_line_style(
     if line.starts_with("@@") || line.starts_with('›') {
         return Style::new().fg(theme.colors.diff_hunk).bold();
     }
+    // Unselected option rows are dimmed; the selected one is caught by the
+    // `›` marker above.
     if line.starts_with("  Approve") || line.starts_with("  Reject") || line.starts_with("↑/↓")
     {
         return Style::new().fg(theme.colors.dim);
@@ -1240,9 +1310,10 @@ fn bottom_aligned_top_padding(visible_lines: usize, viewport_height: usize) -> u
 #[cfg(test)]
 mod tests {
     use super::{
-        EntryKind, HarnessOutcomeKind, ToolReviewRowStatus, Transcript, TranscriptRenderCache,
-        bottom_aligned_top_padding, char_boundary_at_or_before, entry_display_text,
-        harness_outcome_style, render_lines, render_lines_with_theme, render_uncached, wrap_text,
+        EntryKind, HarnessOutcomeKind, STREAM_TAIL_MAX_LINES, ToolReviewRowStatus, Transcript,
+        TranscriptRenderCache, bottom_aligned_top_padding, char_boundary_at_or_before,
+        entry_display_text, harness_outcome_style, render_lines, render_lines_with_theme,
+        render_uncached, wrap_text,
     };
     use crate::theme::Theme;
     use ratatui::buffer::Buffer;
@@ -1280,7 +1351,32 @@ mod tests {
             EntryKind::ToolResult { .. }
         ));
         assert_eq!(transcript.entries().len(), 2);
-        assert_eq!(transcript.compaction_count(), 0);
+    }
+
+    #[test]
+    fn compaction_checkpoints_render_their_summary() {
+        // The backend projects a checkpoint as a `system` message; before
+        // this entry kind existed the UI dropped it, so a resumed session
+        // showed no sign that compaction had happened.
+        let mut transcript = Transcript::new();
+        transcript.append_compaction("— compacted: 120K → ~40K tokens —\nkept the migration plan");
+        let entry = &transcript.entries()[0];
+        assert!(matches!(entry.kind, EntryKind::Compaction));
+
+        let rendered = render_lines(transcript.entries(), 80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("kept the migration plan"),
+            "compaction summary must be visible, got: {rendered}"
+        );
     }
 
     #[test]
@@ -1300,6 +1396,21 @@ mod tests {
         assert_eq!(
             transcript.entries()[0].stream_tail,
             "Compiling yach-proto\nCompiling yach-backend\n"
+        );
+
+        for index in 0..200 {
+            transcript.append_tool_call_output("call-1", &format!("line-{index}\n"));
+        }
+        let expected_start = 200 - STREAM_TAIL_MAX_LINES;
+        let expected: String = (expected_start..200).fold(String::new(), |mut acc, index| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "line-{index}");
+            acc
+        });
+        assert_eq!(transcript.entries()[0].stream_tail, expected);
+        assert_eq!(
+            transcript.entries()[0].stream_tail.lines().count(),
+            STREAM_TAIL_MAX_LINES
         );
 
         assert!(transcript.finish_tool_call(
@@ -1323,7 +1434,7 @@ mod tests {
         let tail = &transcript.entries()[0].stream_tail;
         assert!(!tail.contains("line-0\n"));
         assert!(tail.contains("line-29\n"));
-        assert!(tail.lines().count() <= 8);
+        assert_eq!(tail.lines().count(), STREAM_TAIL_MAX_LINES);
     }
 
     #[test]
@@ -1430,6 +1541,66 @@ mod tests {
         assert!(lines.iter().all(|line| line.spans.iter().all(|span| {
             span.style.bg == Some(Theme::default().colors.tool_pending_background)
         })));
+    }
+
+    #[test]
+    fn command_reviews_offer_a_session_grant_and_edit_reviews_do_not() {
+        let mut transcript = Transcript::new();
+        transcript.append_tool_call(Some("request-1"), "bash", Some("cargo test"));
+        transcript.begin_tool_review(
+            "request-1",
+            "bash",
+            ToolReviewPayload::Command {
+                command: CommandReviewSummary {
+                    review_id: String::from("command-review-1"),
+                    permission_decision_id: String::from("permission-1"),
+                    command: String::from("cargo test"),
+                    workdir: None,
+                    timeout_ms: 30_000,
+                },
+            },
+        );
+        let rendered = render_lines(transcript.entries(), 100)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Approve for this session"),
+            "a command review offers a session grant, got: {rendered}"
+        );
+        assert!(transcript.pending_review_is_command());
+
+        // Edits already have `accept-edits` as their session-wide posture,
+        // so offering a per-edit grant would duplicate that authority.
+        let mut edits = Transcript::new();
+        edits.append_tool_call(Some("request-2"), "edit_text_file", Some("src/lib.rs"));
+        edits.begin_tool_review(
+            "request-2",
+            "edit_text_file",
+            ToolReviewPayload::LocalEdit {
+                preview: LocalEditPreviewSummary {
+                    preview_id: String::from("preview-1"),
+                    transaction_id: String::from("transaction-1"),
+                    permission_decision_id: String::from("permission-2"),
+                    path: String::from("src/lib.rs"),
+                    operation: String::from("replace"),
+                    review_state: LocalEditReviewState::NeedsUserApproval,
+                    diff_summary: String::from("+ added"),
+                    diff_summary_truncated: false,
+                },
+            },
+        );
+        let edit_rendered = render_lines(edits.entries(), 100)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            !edit_rendered.contains("for this session"),
+            "an edit review must not offer a session grant, got: {edit_rendered}"
+        );
+        assert!(!edits.pending_review_is_command());
     }
 
     #[test]

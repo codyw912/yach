@@ -17,12 +17,14 @@ use yach_proto::{
 };
 use zeroize::Zeroize;
 
+use crate::input::PromptHistory;
 use crate::layout;
 use crate::lifecycle::{StatusLifecycle, is_lifecycle_status, status_lifecycle};
 use crate::perf_metrics::PerfMetrics;
 use crate::session_tree::{SessionTree, branch_summary_line, build_session_tree};
 use crate::slash_commands::{
     SlashAction, SlashCommand, SlashParseResult, match_slash_commands, parse_slash_command,
+    suggest_slash_command,
 };
 use crate::theme::Theme;
 use crate::thinking_level::ThinkingLevel;
@@ -688,6 +690,7 @@ pub struct App {
     scroll_offset: usize,
     scrollback_archive_count: usize,
     prompt: TextArea<'static>,
+    prompt_history: PromptHistory,
     active_tools: Vec<ActiveTool>,
     /// Estimated percent of the usable context window in use, from
     /// backend session stats (the compaction trigger's accounting).
@@ -760,6 +763,7 @@ impl App {
             scroll_offset: 0,
             scrollback_archive_count: 0,
             prompt: TextArea::default(),
+            prompt_history: PromptHistory::default(),
             active_tools: Vec::new(),
             context_used_percent: None,
             session_stats: None,
@@ -831,6 +835,16 @@ impl App {
             || String::from("session stats loaded"),
             |count| format!("session messages: {count}"),
         );
+    }
+
+    /// Compaction checkpoints reported by the backend for this session.
+    /// Backend-owned so it is unaffected by `/clear` and correct after
+    /// resume; absent stats read as zero rather than as unknown.
+    fn session_compaction_count(&self) -> u64 {
+        self.session_stats
+            .as_ref()
+            .and_then(|stats| stats.compaction_count)
+            .unwrap_or_default()
     }
 
     fn set_stream_state(&mut self, stream_state: StreamState) {
@@ -1599,6 +1613,7 @@ impl App {
     }
 
     fn apply_backend_state(&mut self, state: BackendState) {
+        const BACKEND_OWNED_STATUS: [&str; 2] = ["state loaded", "compacting"];
         let busy = self.backend_busy();
         match &state.session_model {
             SessionModelState::Active {
@@ -1660,9 +1675,17 @@ impl App {
         {
             self.set_stream_state(StreamState::Idle);
         }
+        // Backend state arrives periodically and unprompted, so it may only
+        // replace a status it owns. Overwriting anything else discards the
+        // response to the user's last action -- an unknown-command
+        // suggestion, a review hint, a refused submission -- moments after
+        // it appears. "compacting" is backend-owned, so it must be replaced
+        // once compaction ends or it would linger indefinitely.
         if state.is_compacting {
             self.status_message = String::from("compacting");
-        } else if !self.status_message.starts_with("connected") {
+        } else if self.status_message.is_empty()
+            || BACKEND_OWNED_STATUS.contains(&self.status_message.as_str())
+        {
             self.status_message = String::from("state loaded");
         }
     }
@@ -1849,16 +1872,12 @@ impl App {
             (KeyCode::Up | KeyCode::Char('k'), modifiers)
                 if modifiers.is_empty() && self.transcript.has_pending_review() =>
             {
-                self.transcript
-                    .select_pending_review(ToolReviewDecision::Approve);
-                self.scroll_to_bottom();
+                self.step_pending_review_selection(-1);
             }
             (KeyCode::Down | KeyCode::Char('j'), modifiers)
                 if modifiers.is_empty() && self.transcript.has_pending_review() =>
             {
-                self.transcript
-                    .select_pending_review(ToolReviewDecision::Reject);
-                self.scroll_to_bottom();
+                self.step_pending_review_selection(1);
             }
             (KeyCode::Enter, modifiers)
                 if modifiers.is_empty() && self.transcript.has_pending_review() =>
@@ -1881,6 +1900,35 @@ impl App {
         true
     }
 
+    fn step_pending_review_selection(&mut self, delta: isize) {
+        let Some(current) = self.transcript.pending_review_selection() else {
+            return;
+        };
+        // Approve-once first, so the least-authority choice is where the
+        // selection starts. Session approval is offered only for commands:
+        // edits already have `accept-edits` as their session-wide posture.
+        let options: &[ToolReviewDecision] = if self.transcript.pending_review_is_command() {
+            &[
+                ToolReviewDecision::Approve,
+                ToolReviewDecision::ApproveForSession,
+                ToolReviewDecision::Reject,
+            ]
+        } else {
+            &[ToolReviewDecision::Approve, ToolReviewDecision::Reject]
+        };
+        let index = options
+            .iter()
+            .position(|option| *option == current)
+            .unwrap_or(0);
+        // Saturating rather than wrapping: wrapping past Reject back to
+        // Approve makes it easy to overshoot into granting authority.
+        let next = index
+            .saturating_add_signed(delta)
+            .min(options.len().saturating_sub(1));
+        self.transcript.select_pending_review(options[next]);
+        self.scroll_to_bottom();
+    }
+
     fn submit_inline_tool_review(&mut self, decision: Option<ToolReviewDecision>) {
         let submission = match decision {
             Some(decision) => self.transcript.submit_pending_review_as(decision),
@@ -1897,6 +1945,9 @@ impl App {
         });
         self.status_message = match decision {
             ToolReviewDecision::Approve => String::from("review approval submitted"),
+            ToolReviewDecision::ApproveForSession => {
+                String::from("approved for this session; identical commands will not re-prompt")
+            }
             ToolReviewDecision::Reject => String::from("review rejection submitted"),
         };
         self.scroll_to_bottom();
@@ -2054,6 +2105,11 @@ impl App {
                     };
                     self.transcript.append_harness_outcome(kind, &message.text);
                 }
+                // The backend projects a compaction checkpoint as a `system`
+                // message (`runner/session_state.rs`). It was previously
+                // dropped, so a resumed session showed neither the summary
+                // nor a truthful compaction count.
+                "system" => self.transcript.append_compaction(&message.text),
                 _ => {}
             }
         }
@@ -2073,8 +2129,29 @@ impl App {
         if modifiers.contains(KeyModifiers::SUPER) || modifiers.contains(KeyModifiers::HYPER) {
             return;
         }
+        if modifiers.is_empty() && matches!(key, KeyCode::Up | KeyCode::Down) {
+            self.apply_prompt_history_key(key);
+            return;
+        }
 
         self.prompt.input(textarea_input(key, modifiers));
+    }
+
+    fn apply_prompt_history_key(&mut self, key: KeyCode) {
+        let before = self.prompt.cursor();
+        self.prompt.input(textarea_input(key, KeyModifiers::NONE));
+        if self.prompt.cursor() != before {
+            return;
+        }
+        let replacement = match key {
+            KeyCode::Up => self.prompt_history.older(&self.prompt_text()),
+            KeyCode::Down => self.prompt_history.newer(),
+            _ => None,
+        };
+        let Some(text) = replacement else {
+            return;
+        };
+        self.set_prompt_text(&text);
     }
 
     /// Mouse-wheel scrolling over the transcript, three lines per notch.
@@ -3223,11 +3300,14 @@ impl App {
                     stats.tool_message_count.unwrap_or_default(),
                 ));
             }
+            if let Some(total) = stats.total_tokens {
+                lines.push(format!(
+                    "tokens: {}",
+                    crate::status_bar::format_token_capacity(total)
+                ));
+            }
         }
-        lines.push(format!(
-            "compactions: {}",
-            self.transcript.compaction_count()
-        ));
+        lines.push(format!("compactions: {}", self.session_compaction_count()));
         self.transcript.append_status(&lines.join("\n"));
         self.scroll_to_bottom();
     }
@@ -3366,7 +3446,22 @@ impl App {
                 self.status_message = String::from("slash command arguments are not supported yet");
                 return;
             }
-            SlashParseResult::Unknown | SlashParseResult::NotSlash => {}
+            // A mistyped command previously fell through to the provider as
+            // an ordinary prompt, silently spending a turn and leaving the
+            // user's intent unexecuted.
+            SlashParseResult::Unknown { typed } => {
+                self.status_message = match suggest_slash_command(&typed) {
+                    Some(suggestion) => {
+                        format!(
+                            "unknown command {typed} — did you mean {}?",
+                            suggestion.name
+                        )
+                    }
+                    None => format!("unknown command {typed}"),
+                };
+                return;
+            }
+            SlashParseResult::NotSlash => {}
         }
 
         let session_id = self.session_id.clone();
@@ -3374,6 +3469,7 @@ impl App {
             session_id,
             prompt: input.clone(),
         }) {
+            self.prompt_history.record(input.clone());
             self.clear_input();
             // Inline rendering leaves completed turns in terminal-native
             // scrollback when the next real turn begins. The new user row
@@ -3901,6 +3997,7 @@ impl BenchmarkApp {
         self.app
             .set_transcript_viewport(viewport_width, viewport_height);
 
+        let compaction_count = self.app.session_compaction_count();
         let render_params = layout::RenderParams {
             transcript: &self.app.transcript,
             transcript_cache: &mut self.app.transcript_cache,
@@ -3912,7 +4009,12 @@ impl BenchmarkApp {
             approval_mode: self.app.approval_mode.as_str(),
             status_message: &self.app.status_message,
             is_connected: self.app.is_connected,
-            compaction_count: self.app.transcript.compaction_count(),
+            compaction_count,
+            total_tokens: self
+                .app
+                .session_stats
+                .as_ref()
+                .and_then(|stats| stats.total_tokens),
             context_used_percent: self.app.context_used_percent,
             context_window: self
                 .app
@@ -4095,6 +4197,7 @@ pub async fn run_tui_with_trace_and_options(
         let thinking_idx = app.thinking_select_index();
         let perf_metrics = app.perf_metrics.clone();
         let show_fork_hint = app.supports(Capability::SessionForking);
+        let compaction_count = app.session_compaction_count();
 
         let render_start = std::time::Instant::now();
         if !first_render_recorded && let Some(trace) = trace.as_ref() {
@@ -4113,7 +4216,11 @@ pub async fn run_tui_with_trace_and_options(
                 approval_mode: approval_mode.as_str(),
                 status_message: &status_message,
                 is_connected: app.is_connected,
-                compaction_count: app.transcript.compaction_count(),
+                compaction_count,
+                total_tokens: app
+                    .session_stats
+                    .as_ref()
+                    .and_then(|stats| stats.total_tokens),
                 terminal_focused: app.terminal_focused,
                 context_used_percent: app.context_used_percent,
                 context_window: app
@@ -4994,6 +5101,92 @@ mod tests {
     }
 
     #[test]
+    fn up_recalls_the_previous_submitted_prompt() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.set_prompt_text("retry this after cancel");
+        app.submit_input();
+        assert!(app.prompt_text().is_empty());
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+
+        assert_eq!(app.prompt_text(), "retry this after cancel");
+    }
+
+    #[test]
+    fn down_restores_the_stashed_in_progress_prompt_draft() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.set_prompt_text("already sent");
+        app.submit_input();
+        app.set_prompt_text("unsent draft");
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "already sent");
+
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "unsent draft");
+    }
+
+    #[test]
+    fn down_steps_prompt_history_toward_the_current_draft() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.set_prompt_text("first");
+        app.submit_input();
+        app.set_prompt_text("second");
+        app.submit_input();
+        app.set_prompt_text("draft");
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "second");
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "first");
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "second");
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "draft");
+    }
+
+    #[test]
+    fn up_on_an_interior_prompt_line_moves_the_cursor() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        app.set_prompt_text("previous");
+        app.submit_input();
+        app.set_prompt_text("hello\nworld");
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            app.prompt_text(),
+            "hello\nworld",
+            "Up on the last line of a multi-line draft must not recall history"
+        );
+
+        app.handle_key(KeyCode::Char('X'), KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "helloX\nworld");
+    }
+
+    #[test]
+    fn empty_prompt_history_leaves_the_draft_unchanged() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert!(app.prompt_text().is_empty());
+
+        app.set_prompt_text("draft");
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "draft");
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.prompt_text(), "draft");
+    }
+
+    #[test]
     fn dialog_requests_are_resolved_inside_the_tui() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
@@ -5578,6 +5771,7 @@ mod tests {
             assistant_message_count: None,
             tool_message_count: None,
             total_tokens: None,
+            compaction_count: None,
             context_window: Some(120_000),
             context_used_percent: Some(42),
         }));
@@ -5592,6 +5786,7 @@ mod tests {
             assistant_message_count: None,
             tool_message_count: None,
             total_tokens: None,
+            compaction_count: None,
             context_window: Some(240_000),
             context_used_percent: Some(21),
         }));
@@ -8035,6 +8230,7 @@ mod tests {
             assistant_message_count: Some(4),
             tool_message_count: Some(5),
             total_tokens: None,
+            compaction_count: None,
             context_window: Some(200_000),
             context_used_percent: Some(42),
         }));
@@ -8075,6 +8271,7 @@ mod tests {
             assistant_message_count: None,
             tool_message_count: None,
             total_tokens: None,
+            compaction_count: None,
             context_window: Some(120_000),
             context_used_percent: Some(42),
         }));
@@ -8098,6 +8295,7 @@ mod tests {
             assistant_message_count: None,
             tool_message_count: None,
             total_tokens: None,
+            compaction_count: None,
             context_window: Some(240_000),
             context_used_percent: Some(21),
         }));
@@ -8111,7 +8309,123 @@ mod tests {
     }
 
     #[test]
-    fn slash_prefixes_do_not_execute_commands() {
+    fn edit_review_navigation_cannot_select_a_hidden_session_grant() {
+        // Rendering hides ApproveForSession for edits, so navigation must
+        // skip it too: otherwise one Down keypress lands on an invisible
+        // option and Enter approves the edit instead of rejecting it.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.transcript
+            .append_tool_call(Some("request-1"), "edit_text_file", Some("src/lib.rs"));
+        app.transcript.begin_tool_review(
+            "request-1",
+            "edit_text_file",
+            ToolReviewPayload::LocalEdit {
+                preview: yach_proto::LocalEditPreviewSummary {
+                    preview_id: String::from("preview-1"),
+                    transaction_id: String::from("transaction-1"),
+                    permission_decision_id: String::from("permission-1"),
+                    path: String::from("src/lib.rs"),
+                    operation: String::from("replace"),
+                    review_state: LocalEditReviewState::NeedsUserApproval,
+                    diff_summary: String::from("+ added"),
+                    diff_summary_truncated: false,
+                },
+            },
+        );
+
+        app.step_pending_review_selection(1);
+        assert_eq!(
+            app.transcript.pending_review_selection(),
+            Some(ToolReviewDecision::Reject),
+            "one step down on an edit review must reach Reject, not a hidden option"
+        );
+    }
+
+    #[test]
+    fn command_review_navigation_exposes_all_three_options() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.transcript
+            .append_tool_call(Some("request-1"), "bash", Some("cargo test"));
+        app.transcript.begin_tool_review(
+            "request-1",
+            "bash",
+            ToolReviewPayload::Command {
+                command: yach_proto::CommandReviewSummary {
+                    review_id: String::from("command-review-1"),
+                    permission_decision_id: String::from("permission-1"),
+                    command: String::from("cargo test"),
+                    workdir: None,
+                    timeout_ms: 30_000,
+                },
+            },
+        );
+
+        assert_eq!(
+            app.transcript.pending_review_selection(),
+            Some(ToolReviewDecision::Approve)
+        );
+        app.step_pending_review_selection(1);
+        assert_eq!(
+            app.transcript.pending_review_selection(),
+            Some(ToolReviewDecision::ApproveForSession)
+        );
+        app.step_pending_review_selection(1);
+        assert_eq!(
+            app.transcript.pending_review_selection(),
+            Some(ToolReviewDecision::Reject)
+        );
+        // Saturating, not wrapping: overshooting must not land on approval.
+        app.step_pending_review_selection(1);
+        assert_eq!(
+            app.transcript.pending_review_selection(),
+            Some(ToolReviewDecision::Reject)
+        );
+    }
+
+    fn compacting_state(is_compacting: bool) -> BackendState {
+        BackendState {
+            session_model: yach_proto::SessionModelState::Resolving { requested: None },
+            default_model: yach_proto::DefaultModelState::Absent,
+            session_id: None,
+            session_file: None,
+            thinking_level: None,
+            is_streaming: false,
+            is_compacting,
+            message_count: None,
+            pending_message_count: None,
+        }
+    }
+
+    #[test]
+    fn backend_state_clears_its_own_compacting_status_but_not_a_user_message() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+
+        app.apply_backend_state(compacting_state(true));
+        assert_eq!(app.status_message, "compacting");
+
+        // Backend-owned, so it must be replaced once compaction ends;
+        // otherwise it lingers for the rest of the session.
+        app.apply_backend_state(compacting_state(false));
+        assert_eq!(app.status_message, "state loaded");
+
+        // A message answering the user's last action is not backend-owned
+        // and must survive periodic state updates.
+        app.status_message = String::from("unknown command /aproval — did you mean /approval?");
+        app.apply_backend_state(compacting_state(false));
+        assert_eq!(
+            app.status_message,
+            "unknown command /aproval — did you mean /approval?"
+        );
+    }
+
+    #[test]
+    fn mistyped_commands_suggest_instead_of_spending_a_turn() {
+        // This previously asserted that `/clearance` was submitted as a
+        // prompt, pinning the defect: a typo silently spent a provider turn
+        // and never ran what the user meant.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
         app.transcript.append_user_message("keep me");
@@ -8119,18 +8433,29 @@ mod tests {
 
         app.submit_input();
 
-        assert_eq!(app.transcript.entries().len(), 2);
+        assert!(
+            rx.try_recv().is_err(),
+            "a mistyped command must not reach the provider"
+        );
+        assert!(
+            app.status_message.contains("/clear"),
+            "status should name the nearest command, got: {}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn text_that_merely_starts_with_a_slash_is_still_a_prompt() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_prompt_text("/usr/bin/env is missing, can you check");
+
+        app.submit_input();
+
         let event = rx.try_recv();
-        assert!(event.is_ok());
-        let Ok(event) = event else {
-            return;
-        };
-        assert_eq!(
-            event,
-            ClientEvent::PromptSubmitted {
-                session_id: String::from("default"),
-                prompt: String::from("/clearance"),
-            }
+        assert!(
+            matches!(event, Ok(ClientEvent::PromptSubmitted { .. })),
+            "multi-word text is a prompt, not a command: {event:?}"
         );
     }
 

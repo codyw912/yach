@@ -69,18 +69,6 @@ fn bench_entry_slice_access(c: &mut Criterion) {
     });
 }
 
-fn bench_compaction_count(c: &mut Criterion) {
-    let mut transcript = Transcript::new();
-    for i in 0..1000 {
-        transcript.append_delta(&format!("token_{i} "));
-    }
-    c.bench_function("transcript/compaction_count_1000", |b| {
-        b.iter(|| {
-            black_box(transcript.compaction_count());
-        });
-    });
-}
-
 criterion_group!(
     benches,
     bench_append_deltas,
@@ -88,6 +76,5 @@ criterion_group!(
     bench_alternating_entries,
     bench_tool_call_entries,
     bench_entry_slice_access,
-    bench_compaction_count,
 );
 criterion_main!(benches);

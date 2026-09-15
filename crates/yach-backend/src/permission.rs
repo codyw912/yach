@@ -427,6 +427,7 @@ impl PermissionDecisionEngine {
         request: &PermissionRequest,
         approval_mode: ApprovalMode,
         user_allowlisted: bool,
+        session_granted: bool,
     ) -> PermissionDecision {
         if request.capability != PermissionCapability::ShellCommand
             || request.risk != PermissionRisk::ProcessExecution
@@ -439,6 +440,18 @@ impl PermissionDecisionEngine {
                 reviewer: PermissionReviewer::None,
                 mode: PermissionMode::Allow,
                 reason: String::from("shell_user_allowlist"),
+                rationale: None,
+            };
+        }
+        // A session grant is the user's own prior review of this exact
+        // command, so it carries its own reason rather than masquerading as
+        // config authority or as a mode change.
+        if session_granted {
+            return PermissionDecision::Allowed {
+                decision_id: next_permission_decision_id(),
+                reviewer: PermissionReviewer::User,
+                mode: PermissionMode::Allow,
+                reason: String::from("shell_session_grant"),
                 rationale: None,
             };
         }
@@ -739,8 +752,12 @@ mod tests {
 
     #[test]
     fn shell_modes_preserve_allowlist_and_full_access_reasons() {
-        let review =
-            PermissionDecisionEngine::decide_shell(&shell_request(), ApprovalMode::Review, false);
+        let review = PermissionDecisionEngine::decide_shell(
+            &shell_request(),
+            ApprovalMode::Review,
+            false,
+            false,
+        );
         assert!(matches!(
             review,
             PermissionDecision::NeedsUserReview {
@@ -753,6 +770,7 @@ mod tests {
         let full_access = PermissionDecisionEngine::decide_shell(
             &shell_request(),
             ApprovalMode::FullAccess,
+            false,
             false,
         );
         assert!(matches!(
@@ -768,6 +786,7 @@ mod tests {
             &shell_request(),
             ApprovalMode::FullAccess,
             true,
+            false,
         );
         assert!(matches!(
             allowlisted,
@@ -776,6 +795,50 @@ mod tests {
                 ..
             } if reason == "shell_user_allowlist"
         ));
+    }
+
+    #[test]
+    fn a_session_grant_allows_with_its_own_provenance() {
+        // A grant must be distinguishable from config authority and from a
+        // mode change, so an audit can tell why a command ran unprompted.
+        let granted = PermissionDecisionEngine::decide_shell(
+            &shell_request(),
+            ApprovalMode::Review,
+            false,
+            true,
+        );
+        assert!(
+            matches!(
+                granted,
+                PermissionDecision::Allowed {
+                    mode: PermissionMode::Allow,
+                    reviewer: PermissionReviewer::User,
+                    ref reason,
+                    ..
+                } if reason == "shell_session_grant"
+            ),
+            "expected a session-grant allow, got {granted:?}"
+        );
+    }
+
+    #[test]
+    fn config_allowlist_outranks_a_session_grant() {
+        // Both allow, but the durable reason must win so evidence reports
+        // the standing authority rather than a transient grant.
+        let both = PermissionDecisionEngine::decide_shell(
+            &shell_request(),
+            ApprovalMode::Review,
+            true,
+            true,
+        );
+        assert!(
+            matches!(
+                both,
+                PermissionDecision::Allowed { ref reason, .. }
+                    if reason == "shell_user_allowlist"
+            ),
+            "expected allowlist provenance, got {both:?}"
+        );
     }
 
     #[test]

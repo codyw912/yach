@@ -122,9 +122,17 @@ pub struct SlashCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashParseResult {
     Command(SlashAction),
-    CommandWithArgs { action: SlashAction, args: String },
+    CommandWithArgs {
+        action: SlashAction,
+        args: String,
+    },
     ArgumentsUnsupported,
-    Unknown,
+    /// A leading-slash token matching no command. Carries what was typed so
+    /// the client can name it and suggest a correction instead of silently
+    /// sending it to the provider as a prompt.
+    Unknown {
+        typed: String,
+    },
     NotSlash,
 }
 
@@ -133,6 +141,35 @@ pub fn match_slash_commands(prefix: &str) -> Vec<&'static SlashCommand> {
         .iter()
         .filter(|cmd| cmd.name.starts_with(prefix))
         .collect()
+}
+
+/// Closest command to a mistyped one, or `None` when nothing is close.
+///
+/// Shared-prefix scoring only: it corrects truncations and typos in the tail
+/// (`/appro`, `/aproval`) without guessing at unrelated input. A transposed
+/// first letter is deliberately not matched, since suggesting a command the
+/// user did not mean is worse than saying nothing.
+#[must_use]
+pub fn suggest_slash_command(typed: &str) -> Option<&'static SlashCommand> {
+    let typed = typed.trim_start_matches('/');
+    if typed.is_empty() {
+        return None;
+    }
+    SLASH_COMMANDS
+        .iter()
+        .filter_map(|cmd| {
+            let name = cmd.name.trim_start_matches('/');
+            let shared = name
+                .chars()
+                .zip(typed.chars())
+                .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+                .count();
+            // Require more than a single shared character so `/x` does not
+            // pull in every command starting with the same letter.
+            (shared >= 2).then_some((shared, cmd))
+        })
+        .max_by_key(|(shared, _)| *shared)
+        .map(|(_, cmd)| cmd)
 }
 
 pub fn parse_slash_command(input: &str) -> SlashParseResult {
@@ -148,7 +185,15 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
     let has_args = parts.next().is_some();
 
     let Some(command) = SLASH_COMMANDS.iter().find(|cmd| cmd.name == command) else {
-        return SlashParseResult::Unknown;
+        // Only a bare single token is a command attempt. `/usr/bin/env is
+        // missing` is ordinary prose that happens to start with a slash, and
+        // swallowing it would be worse than the typo it guards against.
+        if has_args {
+            return SlashParseResult::NotSlash;
+        }
+        return SlashParseResult::Unknown {
+            typed: command.to_owned(),
+        };
     };
 
     if has_args {
@@ -173,7 +218,10 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{SlashAction, SlashParseResult, match_slash_commands, parse_slash_command};
+    use super::{
+        SlashAction, SlashParseResult, match_slash_commands, parse_slash_command,
+        suggest_slash_command,
+    };
 
     #[test]
     fn completion_includes_executable_commands() {
@@ -237,8 +285,35 @@ mod tests {
             parse_slash_command("/clear"),
             SlashParseResult::Command(SlashAction::Clear)
         );
-        assert_eq!(parse_slash_command("/clearance"), SlashParseResult::Unknown);
-        assert_eq!(parse_slash_command("/quit-now"), SlashParseResult::Unknown);
+        assert_eq!(
+            parse_slash_command("/clearance"),
+            SlashParseResult::Unknown {
+                typed: String::from("/clearance")
+            }
+        );
+        assert_eq!(
+            parse_slash_command("/quit-now"),
+            SlashParseResult::Unknown {
+                typed: String::from("/quit-now")
+            }
+        );
+    }
+
+    #[test]
+    fn suggestions_correct_typos_without_guessing() {
+        assert_eq!(
+            suggest_slash_command("/aproval").map(|cmd| cmd.name),
+            Some("/approval"),
+            "a tail typo should resolve to its command"
+        );
+        assert_eq!(
+            suggest_slash_command("/compac").map(|cmd| cmd.name),
+            Some("/compact"),
+            "a truncation should resolve to its command"
+        );
+        // One shared character is not evidence of intent.
+        assert_eq!(suggest_slash_command("/z").map(|cmd| cmd.name), None);
+        assert_eq!(suggest_slash_command("/").map(|cmd| cmd.name), None);
     }
 
     #[test]

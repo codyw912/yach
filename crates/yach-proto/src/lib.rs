@@ -484,6 +484,10 @@ pub struct SessionStats {
     /// from the same accounting as the auto-compaction trigger.
     #[serde(default)]
     pub context_used_percent: Option<u8>,
+    /// Compaction checkpoints recorded in this session's log. Backend-owned
+    /// so it survives a client-side `/clear` and is correct after resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -671,6 +675,10 @@ pub enum LocalEditDecision {
 #[serde(rename_all = "snake_case")]
 pub enum ToolReviewDecision {
     Approve,
+    /// Approve this request and auto-approve byte-identical repeats for the
+    /// rest of this session. Memory-only: grants are never persisted, so a
+    /// restart prompts again and durable authority stays with user config.
+    ApproveForSession,
     Reject,
 }
 

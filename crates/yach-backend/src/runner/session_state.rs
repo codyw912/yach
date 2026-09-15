@@ -47,7 +47,9 @@ pub(super) fn send_native_session_messages_from_log(
                 review_resolutions.insert(
                     (turn_id.0.clone(), tool_request_id.0.clone()),
                     match decision {
-                        ToolReviewDecision::Approve => ToolReviewResolution::Approved,
+                        ToolReviewDecision::Approve | ToolReviewDecision::ApproveForSession => {
+                            ToolReviewResolution::Approved
+                        }
                         ToolReviewDecision::Reject => ToolReviewResolution::Rejected,
                     },
                 );
@@ -351,6 +353,32 @@ pub(super) fn send_native_session_stats_with_estimate(
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
+    // Compaction is backend-owned, so the count comes from the log rather
+    // than the client's transcript: it stays correct across `/clear` and
+    // resume, and needs no new protocol event.
+    let compaction_count = u64::try_from(
+        log.events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::CompactionCheckpoint { .. }))
+            .count(),
+    )
+    .ok();
+    // Provider usage is persisted per assistant entry
+    // (`ProviderMetadata.usage`), already summed across that turn's
+    // requests, so summing entries gives the session total and survives
+    // resume. `None` when no entry reported usage, so an unknown total is
+    // never rendered as zero.
+    let total_tokens = log
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::EntryAppended {
+                provider: Some(metadata),
+                ..
+            } => metadata.usage.as_ref().and_then(|usage| usage.total_tokens),
+            _ => None,
+        })
+        .reduce(u64::saturating_add);
     let user_message_count = count_native_role(&messages, Role::User);
     let assistant_message_count = count_native_role(&messages, Role::Assistant);
     let tool_message_count = count_native_role(&messages, Role::Tool);
@@ -366,9 +394,10 @@ pub(super) fn send_native_session_stats_with_estimate(
             user_message_count,
             assistant_message_count,
             tool_message_count,
-            total_tokens: None,
+            total_tokens,
             context_window: context_budget.map(|budget| budget.context_window),
             context_used_percent,
+            compaction_count,
         },
     )));
 }
