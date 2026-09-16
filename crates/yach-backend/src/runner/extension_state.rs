@@ -367,6 +367,29 @@ fn extension_diagnostic_record_from_activation(
         last_error_summary: diagnostic.last_error_summary.clone(),
         registered_tools: diagnostic.registered_tools.clone(),
         provider_visible_tools: diagnostic.provider_visible_tools.clone(),
+        capabilities: diagnostic
+            .requested_capabilities
+            .as_ref()
+            .map(proto_capability_names),
+        capability_grant: proto_capability_grant(&diagnostic.capability_grant),
+    }
+}
+
+fn proto_capability_names(
+    capabilities: &std::collections::BTreeSet<crate::ExtensionCapability>,
+) -> Vec<String> {
+    capabilities
+        .iter()
+        .map(crate::ExtensionCapability::as_str)
+        .map(String::from)
+        .collect()
+}
+
+fn proto_capability_grant(grant: &crate::ExtensionCapabilityGrantStatus) -> Option<Vec<String>> {
+    match grant {
+        crate::ExtensionCapabilityGrantStatus::Unknown => None,
+        crate::ExtensionCapabilityGrantStatus::Absent => Some(Vec::new()),
+        crate::ExtensionCapabilityGrantStatus::Approved(set) => Some(proto_capability_names(set)),
     }
 }
 

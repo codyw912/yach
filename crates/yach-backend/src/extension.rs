@@ -17,6 +17,9 @@ use std::os::unix::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::extension_capability::{
+    ExtensionCapability, ExtensionCapabilityGrantStatus, load_grant, requested_capabilities,
+};
 use crate::extension_install::ExtensionInstallRecord;
 use crate::{
     ExtensionStaticContextFile, ProviderToolVisibility, ResolvedToolCatalog,
@@ -637,6 +640,11 @@ pub struct ExtensionActivationDiagnostic {
     pub last_error_summary: Option<String>,
     pub registered_tools: Vec<String>,
     pub provider_visible_tools: Vec<String>,
+    /// `None` means the manifest was not available, so capabilities are
+    /// unknown. `Some` is the set derived from declared tool contributions;
+    /// empty means the extension requests none.
+    pub requested_capabilities: Option<BTreeSet<ExtensionCapability>>,
+    pub capability_grant: ExtensionCapabilityGrantStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -1027,6 +1035,12 @@ impl ExtensionActivationDiagnostic {
             last_error_summary,
             registered_tools: Vec::new(),
             provider_visible_tools: Vec::new(),
+            requested_capabilities: Some(requested_capabilities(
+                &record.manifest.contributes.tools,
+            )),
+            capability_grant: ExtensionCapabilityGrantStatus::from_loaded(load_grant(
+                &record.manifest.id.0,
+            )),
         }
     }
 
@@ -1056,6 +1070,8 @@ impl ExtensionActivationDiagnostic {
             last_error_summary,
             registered_tools: Vec::new(),
             provider_visible_tools: Vec::new(),
+            requested_capabilities: None,
+            capability_grant: ExtensionCapabilityGrantStatus::Unknown,
         }
     }
 

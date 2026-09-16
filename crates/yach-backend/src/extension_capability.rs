@@ -34,6 +34,28 @@ impl ExtensionCapability {
     }
 }
 
+/// What diagnostics can say about a recorded grant.
+///
+/// `Unknown` is for construction sites that do not have the manifest or
+/// extension id. Collapsing that into `Absent` would print
+/// `capability_grant=none` for an extension whose grant was never consulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionCapabilityGrantStatus {
+    Unknown,
+    Absent,
+    Approved(BTreeSet<ExtensionCapability>),
+}
+
+impl ExtensionCapabilityGrantStatus {
+    #[must_use]
+    pub fn from_loaded(grant: Option<ExtensionCapabilityGrant>) -> Self {
+        match grant {
+            None => Self::Absent,
+            Some(grant) => Self::Approved(grant.approved),
+        }
+    }
+}
+
 /// The capability set a manifest's tools request, derived rather than
 /// declared separately so the summary cannot understate the tools.
 #[must_use]

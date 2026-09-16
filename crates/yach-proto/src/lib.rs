@@ -782,6 +782,14 @@ pub struct ExtensionDiagnosticRecord {
     pub last_error_summary: Option<String>,
     pub registered_tools: Vec<String>,
     pub provider_visible_tools: Vec<String>,
+    /// `None` means unknown. `Some` is the declared snake_case names; empty
+    /// means the extension requests none.
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
+    /// `None` means unknown. `Some` is the approved snake_case names; empty
+    /// means no grant is recorded.
+    #[serde(default)]
+    pub capability_grant: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1890,6 +1898,8 @@ mod tests {
                 last_error_summary: None,
                 registered_tools: vec![String::from("toy_tool")],
                 provider_visible_tools: vec![String::from("toy_tool")],
+                capabilities: None,
+                capability_grant: None,
             }],
             message: None,
         };
