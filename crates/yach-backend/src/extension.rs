@@ -875,6 +875,11 @@ impl ExtensionActivationSnapshot {
             self.diagnostics.push(diagnostic.clone());
             return diagnostic;
         }
+        if let Some(reason) = capability_block_reason(&record.manifest) {
+            diagnostic.mark_blocked(ExtensionActivationErrorKind::PolicyBlocked, &reason);
+            self.diagnostics.push(diagnostic.clone());
+            return diagnostic;
+        }
 
         self.host_start_count = self.host_start_count.saturating_add(1);
         let mut registry = self.registry.clone();
@@ -1133,6 +1138,34 @@ impl ExtensionActivationDiagnostic {
     }
 }
 
+/// The reason activation must be refused, or `None` when the manifest's
+/// requested capabilities are covered by a recorded grant.
+///
+/// Both activation entry points call this before spawning a host. Keeping
+/// it in one place is the point: a second copy is how `/extension-reload`
+/// would drift into bypassing the contract.
+fn capability_block_reason(manifest: &ExtensionManifest) -> Option<String> {
+    let requested =
+        crate::extension_capability::requested_capabilities(&manifest.contributes.tools);
+    if requested.is_empty() {
+        return None;
+    }
+    let grant = crate::extension_capability::load_grant(&manifest.id.0);
+    let missing = crate::extension_capability::missing_capabilities(&requested, grant.as_ref());
+    if missing.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = missing
+        .iter()
+        .map(crate::extension_capability::ExtensionCapability::as_str)
+        .collect();
+    Some(format!(
+        "extension requests ungranted capabilities: {}. Grant with `/extension-trust {}`.",
+        names.join(", "),
+        manifest.id.0
+    ))
+}
+
 pub fn activate_background_metadata_extensions(
     package_records: &[ExtensionPackageRecord],
     config: ExtensionBackgroundActivationConfig,
@@ -1161,6 +1194,11 @@ pub fn activate_background_metadata_extensions(
             continue;
         }
         if record.manifest.contributes.tools.is_empty() {
+            snapshot.diagnostics.push(diagnostic);
+            continue;
+        }
+        if let Some(reason) = capability_block_reason(&record.manifest) {
+            diagnostic.mark_blocked(ExtensionActivationErrorKind::PolicyBlocked, &reason);
             snapshot.diagnostics.push(diagnostic);
             continue;
         }
@@ -2742,6 +2780,35 @@ mod tests {
                     "provider_visible": true
                 }]
             }
+        })
+    }
+
+    fn unique_capability_gate_id(label: &str) -> Result<String, String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(format!(
+            "test.capability-gate.{label}-{}-{}",
+            std::process::id(),
+            now.as_nanos()
+        ))
+    }
+
+    fn post_first_paint_record_with_risk(
+        extension_id: &str,
+        risk: &str,
+    ) -> Result<ExtensionPackageRecord, String> {
+        let mut value = post_first_paint_toy_tool_manifest_json();
+        value["id"] = serde_json::json!(extension_id);
+        value["contributes"]["tools"][0]["risk"] = serde_json::json!(risk);
+        let manifest = parse_valid_manifest(value)?;
+        let package_root = PathBuf::from("/tmp/yach-capability-gate");
+        Ok(ExtensionPackageRecord {
+            manifest,
+            scope: ExtensionInstallScope::User,
+            package_root: package_root.clone(),
+            manifest_path: package_root.join("yach.extension.json"),
+            source_ref: Some(String::from("./extension")),
         })
     }
 
@@ -4395,6 +4462,110 @@ done
             &results[0].content,
             &String::from("{\"kind\":\"toy\",\"label\":\"fixture\"}"),
         )
+    }
+
+    #[test]
+    fn an_extension_requesting_network_without_a_grant_is_policy_blocked() -> Result<(), String> {
+        // The id is generated per run, so no grant for it can exist under any HOME.
+        let record = post_first_paint_record_with_risk(
+            &unique_capability_gate_id("network")?,
+            "uses_network",
+        )?;
+        let snapshot = activate_background_metadata_extensions(
+            std::slice::from_ref(&record),
+            ExtensionBackgroundActivationConfig::conservative(),
+            None,
+        );
+
+        if snapshot.host_start_count != 0 {
+            return Err(String::from(
+                "consent is checked before spawn, so no host may start",
+            ));
+        }
+        if snapshot.diagnostics.is_empty() {
+            return Err(String::from("expected an activation diagnostic"));
+        }
+        let Some(diagnostic) = snapshot.diagnostics.first() else {
+            return Ok(());
+        };
+        expect_equal(
+            &diagnostic.last_error_kind,
+            &Some(ExtensionActivationErrorKind::PolicyBlocked),
+        )?;
+        let Some(summary) = diagnostic.last_error_summary.as_deref() else {
+            return Err(format!(
+                "the diagnostic must name the missing capability: {diagnostic:?}"
+            ));
+        };
+        if !summary.contains("uses_network") {
+            return Err(format!(
+                "the diagnostic must name the missing capability: {diagnostic:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reloading_an_extension_cannot_bypass_the_capability_gate() -> Result<(), String> {
+        let record = post_first_paint_record_with_risk(
+            &unique_capability_gate_id("reload")?,
+            "uses_network",
+        )?;
+        let mut snapshot = ExtensionActivationSnapshot::default();
+        let before = snapshot.host_start_count;
+
+        let diagnostic = snapshot.reload_extension_from_record(
+            &record,
+            ExtensionBackgroundActivationConfig::conservative(),
+            None,
+        );
+
+        if snapshot.host_start_count != before {
+            return Err(String::from(
+                "reload must check consent before spawning a host",
+            ));
+        }
+        expect_equal(
+            &diagnostic.last_error_kind,
+            &Some(ExtensionActivationErrorKind::PolicyBlocked),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_scoped_extension_activates_without_a_grant() -> Result<(), String> {
+        let package = TestPackageRoot::new("capability-gate-file-scoped")?;
+        package.write_json_file(
+            "yach.extension.json",
+            &post_first_paint_toy_tool_manifest_json(),
+        )?;
+        package.write_file("host.sh", &toy_extension_host_script())?;
+        let index = ExtensionManifestIndex::from_package_roots([ExtensionPackageRoot {
+            root: package.path.clone(),
+            scope: ExtensionInstallScope::User,
+            source_ref: Some(String::from("test-package-root")),
+        }])
+        .map_err(|error| format!("{error:?}"))?;
+
+        let snapshot = activate_background_metadata_extensions(
+            index.records(),
+            ExtensionBackgroundActivationConfig {
+                registration_timeout: Duration::from_secs(1),
+                invocation_timeout: Duration::from_secs(1),
+                max_stdout_line_bytes: 4096,
+                max_result_bytes: 4096,
+            },
+            None,
+        );
+        expect_equal(&snapshot.host_start_count, &1)?;
+        expect_equal(&snapshot.diagnostics.len(), &1)?;
+        expect_equal(
+            &snapshot.diagnostics[0].activation_state,
+            &ExtensionActivationState::Active,
+        )?;
+        expect_equal(&snapshot.diagnostics[0].last_error_kind, &None)?;
+        Ok(())
     }
 
     #[test]
