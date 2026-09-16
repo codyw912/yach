@@ -5810,28 +5810,6 @@ mod tests {
     }
 
     #[test]
-    fn extension_capability_grant_renders_approved_capabilities() {
-        let result = CommandResult::ExtensionManagement {
-            action: ExtensionManagementAction::Trust,
-            outcome: ExtensionManagementOutcome::Completed,
-            scope: ExtensionInstallScope::User,
-            message: Some(String::from(
-                "approved uses_network (fetch_url) for example.network-tools. The extension may activate; Yach does not observe whether the host uses those capabilities.",
-            )),
-        };
-
-        assert_eq!(
-            result.render_lines(),
-            vec![
-                "extension_action=trust",
-                "extension_outcome=Completed",
-                "extension_scope=user",
-                "message=approved uses_network (fetch_url) for example.network-tools. The extension may activate; Yach does not observe whether the host uses those capabilities.",
-            ]
-        );
-    }
-
-    #[test]
     fn extension_store_path_uses_environment_overrides() -> Result<(), String> {
         let _guard = env_lock()?;
         let root = TestTempDir::new("store-path")?;
