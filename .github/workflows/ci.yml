@@ -17,8 +17,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Pinned to the same version as `rust-toolchain.toml`, which the
+      # contributor shell reads. `@stable` here would float while devenv's
+      # pinned inputs do not, which is how the dev shell ended up four
+      # releases behind CI. Bump both in the same change.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy,rustfmt
 
@@ -50,7 +54,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev

@@ -1,0 +1,22 @@
+# Single source of truth for the Rust version.
+#
+# The devenv shell reads this file via `languages.rust.toolchainFile`, and
+# rustup honours it directly. CI does NOT read it: `dtolnay/rust-toolchain`
+# selects its toolchain from the action revision, so `.github/workflows/`
+# carries the same version as an explicit `@<version>` pin. `just
+# toolchain-check` fails when the two disagree.
+#
+# To bump, all three steps are required:
+#   1. Change `channel` below.
+#   2. Change every `dtolnay/rust-toolchain@<version>` in .github/workflows/.
+#   3. Make the pinned devenv inputs able to supply it: edit the `nixpkgs`
+#      and `rust-overlay` revisions in devenv.yaml to a revision new enough
+#      to carry the version, then run `devenv update` to re-lock. `devenv
+#      update` alone cannot advance those revisions -- they are exact
+#      commits, so it only re-locks what is already written there.
+#
+# `just toolchain-check` catches a missed step 2. A missed step 3 fails when
+# the shell is built, not at lint time.
+[toolchain]
+channel = "1.98.1"
+components = ["rustc", "cargo", "clippy", "rustfmt", "rust-analyzer"]

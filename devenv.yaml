@@ -3,14 +3,14 @@ inputs:
   devenv:
     url: github:cachix/devenv/v2.3.1?dir=src/modules
   nixpkgs:
-    url: github:NixOS/nixpkgs/c06b4ae3d6599a672a6210b7021d699c351eebda
+    url: github:NixOS/nixpkgs/ef34387ddd751e1ab8857adf4676492d32eb24ec
   git-hooks:
     url: github:cachix/git-hooks.nix
     inputs:
       nixpkgs:
         follows: nixpkgs
   rust-overlay:
-    url: github:oxalica/rust-overlay/055977c30249484010750e03074c744dcdaa0d23
+    url: github:oxalica/rust-overlay/89e99bf0778a8f2cd18c9360c3f19c1ee47fc739
     inputs:
       nixpkgs:
         follows: nixpkgs

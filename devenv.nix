@@ -29,11 +29,16 @@
     samply
   ];
 
-  # Rust environment
+  # Rust environment.
+  #
+  # The toolchain version lives in `rust-toolchain.toml` so the contributor
+  # shell and CI resolve the same compiler from one file. `channel =
+  # "stable"` would instead resolve against whatever rust-overlay revision
+  # `devenv.yaml` happens to pin, which drifts from CI's floating `@stable`
+  # as the lock ages — this repository sat four releases behind that way.
   languages.rust = {
     enable = true;
-    channel = "stable";
-    components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ];
+    toolchainFile = ./rust-toolchain.toml;
     targets = [ ];
   };
 

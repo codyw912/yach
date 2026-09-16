@@ -39,10 +39,20 @@ This repo uses Jujutsu (`jj`) for local development.
 - If you need shell syntax like pipes, redirects, or `&&`, run it through `just dev-shell '<cmd>'`.
 - Avoid running bare `cargo ...` unless you are already inside the project's devenv shell via `direnv`, `direnv exec`, or `devenv shell`.
 
-- CI lints with `dtolnay/rust-toolchain@stable`, which can be newer than the
-  dev shell's pin, so `just lint` passing locally does not guarantee CI
-  passes. Reproduce CI clippy before pushing:
-  `nix shell nixpkgs#rustup nixpkgs#pkg-config nixpkgs#openssl --command bash -c 'export PATH="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH"; cargo clippy --all-targets --all-features -- -D warnings'`
+- The Rust version lives in `rust-toolchain.toml`. The devenv shell reads it
+  via `languages.rust.toolchainFile`. CI does not read it: the
+  `dtolnay/rust-toolchain` action selects from its own revision, so the
+  workflows pin `@<version>` explicitly. `just toolchain-check`, which runs
+  as part of `just lint`, fails when those disagree.
+- Bumping requires three coordinated edits, listed at the top of
+  `rust-toolchain.toml`: the channel, every workflow pin, and the
+  `devenv.yaml` input revisions (which are exact commits — `devenv update`
+  re-locks them but cannot advance them).
+- This is alignment, not a guarantee. If you suspect a mismatch — a bump in
+  flight, an unexpected lint, a CI failure that does not reproduce — run
+  `just lint-ci`, which installs the version the workflows pin and lints
+  with it outside the devenv shell. Do not reach for the floating `stable`
+  toolchain for this: it tests a different compiler than CI.
 
 ## Cross Building
 
