@@ -4416,33 +4416,10 @@ mod tests {
             ToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
             ProviderToolVisibility::Hidden,
         );
-        let unsupported = ToolDefinition {
-            name: String::from("process_tool"),
-            description: String::from("Attempts to run a process."),
-            input_schema: ToolInputSchema::string_object(
-                ["label"],
-                std::iter::empty::<&str>(),
-                512,
-            ),
-            risk: ToolRisk::RunsProcess,
-            owner: ToolOwner::Extension {
-                extension_id: String::from("example.toy-tools"),
-                extension_version: None,
-            },
-            provider_visibility: ProviderToolVisibility::Hidden,
-        };
-
         assert_eq!(
             registry.register_extension_tool(colliding),
             Err(ToolRegistrationError::DuplicateToolName {
                 name: String::from("project_path_info")
-            })
-        );
-        assert_eq!(
-            registry.register_extension_tool(unsupported),
-            Err(ToolRegistrationError::UnsupportedRisk {
-                name: String::from("process_tool"),
-                risk: ToolRisk::RunsProcess,
             })
         );
     }

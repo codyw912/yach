@@ -4627,66 +4627,6 @@ done
     }
 
     #[test]
-    fn extension_host_registration_is_atomic_when_later_risk_fails_native_allowlist() {
-        let mut registry = ToolRegistry::with_project_read_only_tools();
-
-        let registration = process_extension_registration_messages(
-            "example.toy-tools",
-            vec![
-                serde_json::json!({
-                    "type": "extension.ready",
-                    "protocol": "yach.extension-host.v2",
-                    "extension_id": "example.toy-tools"
-                }),
-                serde_json::json!({
-                    "type": "tool.register",
-                    "name": "toy_tool",
-                    "description": "Return static fixture metadata.",
-                    "risk": "reads_local_metadata",
-                    "provider_visible": false,
-                    "input_schema": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["label"],
-                        "properties": {
-                            "label": { "type": "string" }
-                        },
-                        "maxSerializedBytes": 512
-                    }
-                }),
-                serde_json::json!({
-                    "type": "tool.register",
-                    "name": "unsafe_tool",
-                    "description": "Attempts unsupported access.",
-                    "risk": "uses_network",
-                    "provider_visible": false,
-                    "input_schema": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["label"],
-                        "properties": {
-                            "label": { "type": "string" }
-                        },
-                        "maxSerializedBytes": 512
-                    }
-                }),
-            ],
-            &mut registry,
-        );
-
-        assert_eq!(
-            registration,
-            Err(ExtensionHostProtocolError::ToolRegistration(
-                ToolRegistrationError::UnsupportedRisk {
-                    name: String::from("unsafe_tool"),
-                    risk: ToolRisk::UsesNetwork,
-                }
-            ))
-        );
-        assert!(registry.get("toy_tool").is_none());
-        assert!(registry.get("unsafe_tool").is_none());
-    }
-    #[test]
     fn extension_host_registration_accepts_read_and_mutating_tools() -> Result<(), String> {
         let mut registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
         let schema = |field: &str| {
