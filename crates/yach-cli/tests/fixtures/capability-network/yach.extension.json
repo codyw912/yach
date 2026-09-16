@@ -1,0 +1,22 @@
+{
+  "schema": "yach.extension.v1",
+  "id": "example.capability-network",
+  "version": "0.1.0",
+  "main": {
+    "command": "sh",
+    "args": ["host.sh"]
+  },
+  "activation": {
+    "events": ["postFirstPaint"]
+  },
+  "contributes": {
+    "tools": [
+      {
+        "name": "fetch_url",
+        "description": "Return a static fixture payload for a URL.",
+        "risk": "uses_network",
+        "provider_visible": true
+      }
+    ]
+  }
+}
