@@ -1161,13 +1161,22 @@ impl ExtensionActivationDiagnostic {
 /// it in one place is the point: a second copy is how `/extension-reload`
 /// would drift into bypassing the contract.
 fn capability_block_reason(manifest: &ExtensionManifest) -> Option<String> {
+    capability_block_reason_with_grant(
+        manifest,
+        crate::extension_capability::load_grant(&manifest.id.0).as_ref(),
+    )
+}
+
+fn capability_block_reason_with_grant(
+    manifest: &ExtensionManifest,
+    grant: Option<&crate::extension_capability::ExtensionCapabilityGrant>,
+) -> Option<String> {
     let requested =
         crate::extension_capability::requested_capabilities(&manifest.contributes.tools);
     if requested.is_empty() {
         return None;
     }
-    let grant = crate::extension_capability::load_grant(&manifest.id.0);
-    let missing = crate::extension_capability::missing_capabilities(&requested, grant.as_ref());
+    let missing = crate::extension_capability::missing_capabilities(&requested, grant);
     if missing.is_empty() {
         return None;
     }
@@ -2687,7 +2696,7 @@ fn is_valid_process_command(command: &str) -> bool {
     !command.is_empty() && !command.chars().any(char::is_whitespace)
 }
 
-fn is_valid_extension_id(id: &str) -> bool {
+pub(crate) fn is_valid_extension_id(id: &str) -> bool {
     !id.is_empty()
         && id.split('.').all(|part| {
             !part.is_empty()
@@ -4545,6 +4554,51 @@ done
             &diagnostic.last_error_kind,
             &Some(ExtensionActivationErrorKind::PolicyBlocked),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn capability_block_reason_clears_after_a_covering_grant() -> Result<(), String> {
+        let record = post_first_paint_record_with_risk(
+            &unique_capability_gate_id("grant-loop")?,
+            "uses_network",
+        )?;
+        let before = capability_block_reason_with_grant(&record.manifest, None);
+        if before.is_none() {
+            return Err(String::from(
+                "ungranted network tool must produce a block reason",
+            ));
+        }
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("{error:?}"))?;
+        let path = std::env::temp_dir().join(format!(
+            "yach-cap-block-{}-{}.json",
+            std::process::id(),
+            stamp.as_nanos()
+        ));
+        let stored = crate::extension_capability::grant_requested_at(
+            &path,
+            &record.manifest.version,
+            &record.manifest.contributes.tools,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        let Some(grant) = stored else {
+            let _ = fs::remove_file(&path);
+            return Err(String::from("network tool should produce a grant"));
+        };
+        let after = capability_block_reason_with_grant(&record.manifest, Some(&grant));
+        let revoked = crate::extension_capability::revoke_grant_at(&path);
+        let _ = fs::remove_file(&path);
+        revoked.map_err(|error| format!("{error:?}"))?;
+        if after.is_some() {
+            return Err(format!("covering grant must clear the block: {after:?}"));
+        }
+        let uncovered = capability_block_reason_with_grant(&record.manifest, None);
+        if uncovered.is_none() {
+            return Err(String::from("revoking must restore the block"));
+        }
         Ok(())
     }
 

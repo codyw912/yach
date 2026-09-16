@@ -748,6 +748,8 @@ pub enum LocalEditFinishedOutcome {
 pub enum ExtensionLifecycleAction {
     Stop,
     Reload,
+    Trust,
+    Revoke,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

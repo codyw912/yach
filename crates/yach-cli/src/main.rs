@@ -17,11 +17,13 @@ use yach_backend::{
     ExtensionActivationErrorKind, ExtensionActivationState, ExtensionCapability,
     ExtensionCapabilityGrantStatus, ExtensionInstallError, ExtensionInstallRecord,
     ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex,
-    ExtensionPackageRoot, ExtensionPackageRootLoader, ModelDiscoveryFuture, ModelDiscoveryOutcome,
-    ProviderConfig, ProviderError, ProviderErrorKind, ProviderMessage, ProviderModel,
-    ProviderRequest, Role, RunnerConfig, TurnId, fresh_session_id, latest_session_log_path_in,
+    ExtensionPackageRecord, ExtensionPackageRoot, ExtensionPackageRootLoader, ModelDiscoveryFuture,
+    ModelDiscoveryOutcome, ProviderConfig, ProviderError, ProviderErrorKind, ProviderMessage,
+    ProviderModel, ProviderRequest, Role, RunnerConfig, TurnId, fresh_session_id,
+    grant_confirmation_message, grant_id_from_selector, grant_requested,
+    latest_session_log_path_in,
     model_discovery::DiscoveredProviderModel,
-    project_session_log_dir,
+    nothing_to_grant_message, project_session_log_dir, revoke_confirmation_message, revoke_grant,
     rig_adapter::{
         MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
     },
@@ -192,6 +194,12 @@ enum Command {
     ExtensionDoctor {
         extension_id: Option<String>,
     },
+    ExtensionTrust {
+        selector: String,
+    },
+    ExtensionRevoke {
+        selector: String,
+    },
     Rpc {
         args: Vec<String>,
     },
@@ -221,6 +229,12 @@ fn extension_command_from_args(args: &[String]) -> Command {
         }
         Some("doctor") => Command::ExtensionDoctor {
             extension_id: args.get(1).cloned(),
+        },
+        Some("trust") => Command::ExtensionTrust {
+            selector: args.get(1).cloned().unwrap_or_default(),
+        },
+        Some("revoke") => Command::ExtensionRevoke {
+            selector: args.get(1).cloned().unwrap_or_default(),
         },
         _ => Command::ExtensionList,
     }
@@ -372,6 +386,8 @@ impl Command {
             Self::ExtensionDoctor { extension_id } => {
                 run_extension_doctor_command(extension_id.as_deref())
             }
+            Self::ExtensionTrust { selector } => run_extension_trust_command(selector),
+            Self::ExtensionRevoke { selector } => run_extension_revoke_command(selector),
             Self::Tui { backend, resume } => run_tui_command(*backend, *resume, trace),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
             Self::TuiProviderConnectionSmoke => run_tui_provider_connection_smoke_command(),
@@ -495,6 +511,8 @@ enum ExtensionManagementAction {
     Remove,
     Enable,
     Disable,
+    Trust,
+    Revoke,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -958,6 +976,8 @@ const fn extension_management_action_label(action: ExtensionManagementAction) ->
         ExtensionManagementAction::Remove => "remove",
         ExtensionManagementAction::Enable => "enable",
         ExtensionManagementAction::Disable => "disable",
+        ExtensionManagementAction::Trust => "trust",
+        ExtensionManagementAction::Revoke => "revoke",
     }
 }
 
@@ -4385,6 +4405,169 @@ fn run_extension_doctor_command(extension_id: Option<&str>) -> CommandResult {
     extension_diagnostics_result(ExtensionDiagnosticsCommand::Doctor, extension_id)
 }
 
+fn run_extension_trust_command(selector: &str) -> CommandResult {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return extension_capability_management_result(
+            ExtensionManagementAction::Trust,
+            ExtensionManagementOutcome::Failed,
+            None,
+            Some(String::from("extension selector is required")),
+        );
+    }
+    match loaded_extension_package_record(selector) {
+        Ok(None) => extension_capability_management_result(
+            ExtensionManagementAction::Trust,
+            ExtensionManagementOutcome::Failed,
+            None,
+            Some(format!("extension {selector} not found")),
+        ),
+        Ok(Some(record)) => {
+            let extension_id = record.manifest.id.0.as_str();
+            match grant_requested(
+                extension_id,
+                &record.manifest.version,
+                &record.manifest.contributes.tools,
+            ) {
+                Ok(None) => extension_capability_management_result(
+                    ExtensionManagementAction::Trust,
+                    ExtensionManagementOutcome::Completed,
+                    Some(extension_id),
+                    Some(nothing_to_grant_message(extension_id)),
+                ),
+                Ok(Some(grant)) => extension_capability_management_result(
+                    ExtensionManagementAction::Trust,
+                    ExtensionManagementOutcome::Completed,
+                    Some(extension_id),
+                    Some(grant_confirmation_message(
+                        extension_id,
+                        &record.manifest.contributes.tools,
+                        &grant.approved,
+                    )),
+                ),
+                Err(error) => extension_capability_management_result(
+                    ExtensionManagementAction::Trust,
+                    ExtensionManagementOutcome::Failed,
+                    Some(extension_id),
+                    Some(format!("failed to write capability grant: {error}")),
+                ),
+            }
+        }
+        Err(message) => extension_capability_management_result(
+            ExtensionManagementAction::Trust,
+            ExtensionManagementOutcome::Failed,
+            None,
+            Some(message),
+        ),
+    }
+}
+
+fn run_extension_revoke_command(selector: &str) -> CommandResult {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return extension_capability_management_result(
+            ExtensionManagementAction::Revoke,
+            ExtensionManagementOutcome::Failed,
+            None,
+            Some(String::from("extension selector is required")),
+        );
+    }
+    let discovered = match loaded_extension_package_record(selector) {
+        Ok(record) => record,
+        Err(message) => {
+            return extension_capability_management_result(
+                ExtensionManagementAction::Revoke,
+                ExtensionManagementOutcome::Failed,
+                None,
+                Some(message),
+            );
+        }
+    };
+    let extension_id = match grant_id_from_selector(
+        discovered
+            .as_ref()
+            .map(|record| record.manifest.id.0.as_str()),
+        selector,
+    ) {
+        Ok(id) => id,
+        Err(message) => {
+            return extension_capability_management_result(
+                ExtensionManagementAction::Revoke,
+                ExtensionManagementOutcome::Failed,
+                None,
+                Some(message),
+            );
+        }
+    };
+    match revoke_grant(&extension_id) {
+        Ok(had_grant) => extension_capability_management_result(
+            ExtensionManagementAction::Revoke,
+            ExtensionManagementOutcome::Completed,
+            Some(&extension_id),
+            Some(revoke_confirmation_message(&extension_id, had_grant)),
+        ),
+        Err(error) => extension_capability_management_result(
+            ExtensionManagementAction::Revoke,
+            ExtensionManagementOutcome::Failed,
+            Some(&extension_id),
+            Some(format!("failed to remove capability grant: {error}")),
+        ),
+    }
+}
+
+fn loaded_extension_package_record(
+    selector: &str,
+) -> Result<Option<ExtensionPackageRecord>, String> {
+    #[cfg(not(test))]
+    if let Err(error) = ensure_bundled_hashline_install_record() {
+        return Err(format!(
+            "failed to prepare bundled hashline extension: {error}"
+        ));
+    }
+    let install_records = loaded_extension_install_records()?;
+    let index = ExtensionManifestIndex::from_package_roots(
+        extension_package_roots_from_env_and_install_records(&install_records),
+    )
+    .map_err(|error| {
+        format!(
+            "extension lookup failed: {}",
+            extension_package_index_error_label(&error)
+        )
+    })?;
+    Ok(index
+        .records()
+        .iter()
+        .find(|record| extension_package_record_matches(record, selector))
+        .cloned())
+}
+
+fn extension_package_record_matches(record: &ExtensionPackageRecord, selector: &str) -> bool {
+    record.manifest.id.0 == selector
+        || record.source_ref.as_deref() == Some(selector)
+        || record.package_root.to_string_lossy() == selector
+        || record.manifest_path.to_string_lossy() == selector
+}
+
+fn extension_capability_management_result(
+    action: ExtensionManagementAction,
+    outcome: ExtensionManagementOutcome,
+    extension_id: Option<&str>,
+    message: Option<String>,
+) -> CommandResult {
+    let message = match (extension_id, message) {
+        (Some(extension_id), Some(message)) if !message.contains(extension_id) => {
+            Some(format!("{message} ({extension_id})"))
+        }
+        (_, message) => message,
+    };
+    CommandResult::ExtensionManagement {
+        action,
+        outcome,
+        scope: ExtensionInstallScope::User,
+        message,
+    }
+}
+
 fn extension_diagnostics_result(
     command: ExtensionDiagnosticsCommand,
     extension_id: Option<&str>,
@@ -5500,6 +5683,32 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn extension_cli_parses_trust_and_revoke_commands() {
+        assert_eq!(
+            CliArgs::from_args(
+                ["extension", "trust", "example.network-tools"]
+                    .into_iter()
+                    .map(String::from)
+            )
+            .command,
+            Command::ExtensionTrust {
+                selector: String::from("example.network-tools"),
+            }
+        );
+        assert_eq!(
+            CliArgs::from_args(
+                ["extension", "revoke", "example.network-tools"]
+                    .into_iter()
+                    .map(String::from)
+            )
+            .command,
+            Command::ExtensionRevoke {
+                selector: String::from("example.network-tools"),
+            }
+        );
+    }
     #[test]
     fn tui_provider_connection_smoke_fixture_serves_create_refresh_picker_and_prompt() {
         let fixture = super::TuiProviderConnectionSmokeFixture::start(
@@ -5596,6 +5805,28 @@ mod tests {
                 "extension_outcome=Completed",
                 "extension_scope=user",
                 "message=installed ./ext",
+            ]
+        );
+    }
+
+    #[test]
+    fn extension_capability_grant_renders_approved_capabilities() {
+        let result = CommandResult::ExtensionManagement {
+            action: ExtensionManagementAction::Trust,
+            outcome: ExtensionManagementOutcome::Completed,
+            scope: ExtensionInstallScope::User,
+            message: Some(String::from(
+                "approved uses_network (fetch_url) for example.network-tools. The extension may activate; Yach does not observe whether the host uses those capabilities.",
+            )),
+        };
+
+        assert_eq!(
+            result.render_lines(),
+            vec![
+                "extension_action=trust",
+                "extension_outcome=Completed",
+                "extension_scope=user",
+                "message=approved uses_network (fetch_url) for example.network-tools. The extension may activate; Yach does not observe whether the host uses those capabilities.",
             ]
         );
     }

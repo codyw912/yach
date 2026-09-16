@@ -265,7 +265,10 @@ pub(super) async fn handle_native_extension_lifecycle_request(
         return;
     }
 
-    if action == ExtensionLifecycleAction::Reload {
+    if matches!(
+        action,
+        ExtensionLifecycleAction::Reload | ExtensionLifecycleAction::Trust
+    ) {
         let Some(record) = extension_package_record_from_scan_state(scan_state, &selector).await
         else {
             let _ = tx.send(BackendEvent::Server(
@@ -279,13 +282,67 @@ pub(super) async fn handle_native_extension_lifecycle_request(
             ));
             return;
         };
-        schedule_native_extension_reload(
-            tx.clone(),
-            activation_state.clone(),
-            request_id,
-            selector,
-            record,
-        );
+        if action == ExtensionLifecycleAction::Trust {
+            schedule_native_extension_trust(
+                tx.clone(),
+                activation_state.clone(),
+                request_id,
+                selector,
+                record,
+            );
+        } else {
+            schedule_native_extension_reload(
+                tx.clone(),
+                activation_state.clone(),
+                request_id,
+                selector,
+                record,
+            );
+        }
+        return;
+    }
+
+    if action == ExtensionLifecycleAction::Revoke {
+        let record = extension_package_record_from_scan_state(scan_state, &selector).await;
+        let discovered_id = record.as_ref().map(|record| record.manifest.id.0.as_str());
+        let extension_id = match crate::grant_id_from_selector(discovered_id, &selector) {
+            Ok(id) => id,
+            Err(message) => {
+                let _ = tx.send(BackendEvent::Server(
+                    ServerEvent::ExtensionLifecycleFinished {
+                        request_id,
+                        action,
+                        selector,
+                        outcome: ExtensionLifecycleOutcome::Failed,
+                        message,
+                    },
+                ));
+                return;
+            }
+        };
+        let (outcome, message) = match crate::revoke_grant(&extension_id) {
+            Ok(had_grant) => {
+                let mut snapshot = activation_state.lock().await;
+                let _ = snapshot.stop_extension(&selector);
+                (
+                    ExtensionLifecycleOutcome::Completed,
+                    crate::revoke_confirmation_message(&extension_id, had_grant),
+                )
+            }
+            Err(error) => (
+                ExtensionLifecycleOutcome::Failed,
+                format!("failed to remove capability grant: {error}"),
+            ),
+        };
+        let _ = tx.send(BackendEvent::Server(
+            ServerEvent::ExtensionLifecycleFinished {
+                request_id,
+                action,
+                selector,
+                outcome,
+                message,
+            },
+        ));
         return;
     }
 
@@ -312,8 +369,10 @@ pub(super) async fn handle_native_extension_lifecycle_request(
                     format!("extension is not active: {selector}"),
                 ),
             },
-            ExtensionLifecycleAction::Reload => {
-                unreachable!("reload is scheduled before snapshot lock");
+            ExtensionLifecycleAction::Reload
+            | ExtensionLifecycleAction::Trust
+            | ExtensionLifecycleAction::Revoke => {
+                unreachable!("reload, trust, and revoke are handled before snapshot lock");
             }
         }
     };
@@ -436,6 +495,63 @@ fn schedule_native_extension_reload(
             ServerEvent::ExtensionLifecycleFinished {
                 request_id,
                 action: ExtensionLifecycleAction::Reload,
+                selector,
+                outcome,
+                message,
+            },
+        ));
+    });
+}
+
+fn schedule_native_extension_trust(
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    activation_state: ExtensionActivationSnapshotState,
+    request_id: String,
+    selector: String,
+    record: crate::ExtensionPackageRecord,
+) {
+    tokio::task::spawn_blocking(move || {
+        let extension_id = record.manifest.id.0.as_str();
+        let (outcome, message) = match crate::grant_requested(
+            extension_id,
+            &record.manifest.version,
+            &record.manifest.contributes.tools,
+        ) {
+            Ok(None) => (
+                ExtensionLifecycleOutcome::Completed,
+                crate::nothing_to_grant_message(extension_id),
+            ),
+            Ok(Some(grant)) => {
+                let grant_message = crate::grant_confirmation_message(
+                    extension_id,
+                    &record.manifest.contributes.tools,
+                    &grant.approved,
+                );
+                let mut snapshot = activation_state.blocking_lock();
+                let (reload_outcome, reload_message) = extension_reload_lifecycle_outcome(
+                    &snapshot.reload_extension_from_record(
+                        &record,
+                        crate::ExtensionBackgroundActivationConfig::conservative(),
+                        None,
+                    ),
+                    &selector,
+                );
+                match reload_outcome {
+                    ExtensionLifecycleOutcome::Completed => {
+                        (ExtensionLifecycleOutcome::Completed, grant_message)
+                    }
+                    _ => (reload_outcome, format!("{grant_message}; {reload_message}")),
+                }
+            }
+            Err(error) => (
+                ExtensionLifecycleOutcome::Failed,
+                format!("failed to write capability grant: {error}"),
+            ),
+        };
+        let _ = tx.send(BackendEvent::Server(
+            ServerEvent::ExtensionLifecycleFinished {
+                request_id,
+                action: ExtensionLifecycleAction::Trust,
                 selector,
                 outcome,
                 message,
