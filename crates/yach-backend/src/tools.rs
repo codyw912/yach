@@ -2754,6 +2754,12 @@ fn extension_host_error_label(error: &crate::ExtensionHostProtocolError) -> &'st
         crate::ExtensionHostProtocolError::ToolRegistration(_) => {
             "extension_host_tool_registration_failed"
         }
+        crate::ExtensionHostProtocolError::UndeclaredTool { .. } => {
+            "extension_host_undeclared_tool"
+        }
+        crate::ExtensionHostProtocolError::ToolRiskMismatch { .. } => {
+            "extension_host_tool_risk_mismatch"
+        }
     }
 }
 
