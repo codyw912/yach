@@ -22,6 +22,7 @@ mod edit_harness;
 pub mod edit_profile;
 mod error_dialect;
 mod extension;
+mod extension_capability;
 mod extension_install;
 mod permission;
 mod provider;
@@ -62,6 +63,7 @@ pub use error_dialect::{
     parse_retry_after_ms, select_error_dialect,
 };
 pub use extension::*;
+pub use extension_capability::*;
 pub use extension_install::*;
 pub use permission::*;
 pub use provider::*;
