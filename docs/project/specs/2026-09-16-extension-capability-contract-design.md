@@ -57,6 +57,38 @@ allowlist (`crates/yach-backend/src/tools.rs:2088`) accepts all five.
 (`crates/yach-backend/src/tools.rs:2004`), which is why the risk variant
 existing was not by itself sufficient.
 
+### The manifest must bind what the host may register
+
+Consent is computed from the manifest, but today the manifest does not
+constrain what the host actually registers. Activation passes only the tool
+*count* into registration (`crates/yach-backend/src/extension.rs:1224`), and
+the registration loop accepts the host's `name`, `risk`, `description`,
+`provider_visible`, and schema verbatim
+(`crates/yach-backend/src/extension.rs:1800`).
+
+Widening the allowed risks without fixing that would make this whole
+contract cosmetic: a manifest declaring one `metadata` tool would be granted
+silently under the file-scoped path, and the host could then register a
+`uses_network` tool that registration accepts. The user would have consented
+to a summary the host never had to honor.
+
+So two requirements, in order:
+
+1. **Check consent before spawn.** The capability set is derived from the
+   manifest and checked against the grant *before* the host process starts,
+   not after registration reports what it wants.
+2. **Reject registrations that do not match the manifest.** Each
+   `tool.register` must correspond to a manifest-declared tool with the same
+   name and the same risk. A registration naming an undeclared tool, or
+   declaring a different risk than the manifest, fails activation as a
+   protocol error.
+
+This is ordinary protocol validation — the kernel comparing two things it
+already has — not sandboxing. It does not prevent the subprocess from using
+the network directly; see the honesty section. What it prevents is the
+*registered tool surface* diverging from the declaration the user consented
+to, which is a claim this design can actually keep.
+
 ### The capability set is derived, not declared twice
 
 An extension's capability set is computed from its tools' declared risks.
@@ -165,6 +197,14 @@ it.
   registration previously failed with `UnsupportedRisk`.
 - A `UsesNetwork` tool reaches `Allowed` through `ToolPermissionPolicy` when
   allowlisted, and is advertised to providers.
+- A host that registers a tool absent from its manifest fails activation as
+  a protocol error, and the tool is not registered.
+- A host that registers a manifest-declared tool with a *different* risk
+  than the manifest declares — a `metadata` declaration registering as
+  `uses_network` — fails activation, so consent cannot be obtained for one
+  surface and spent on another.
+- Consent is checked before the host process is spawned, so an extension
+  without a grant never starts a subprocess.
 - An extension requesting network capability with no grant activates as
   `PolicyBlocked`, and its diagnostic names the missing capability.
 - After a grant, the same extension activates and its tool is callable.
