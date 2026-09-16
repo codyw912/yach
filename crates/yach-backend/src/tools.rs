@@ -2069,19 +2069,25 @@ impl ToolRegistry {
         &self.definitions
     }
 
-    pub fn register_extension_tool(
-        &mut self,
-        definition: ToolDefinition,
-    ) -> Result<(), ToolRegistrationError> {
+    /// Why `definition` would be refused registration, or `None` when it
+    /// would be accepted. `register_extension_tool` and any caller
+    /// pre-validating a batch must consult this same rule, so a widened
+    /// risk vocabulary cannot admit a tool in one place and reject it in
+    /// the other.
+    #[must_use]
+    pub fn extension_tool_rejection(
+        &self,
+        definition: &ToolDefinition,
+    ) -> Option<ToolRegistrationError> {
         if self.get(&definition.name).is_some() {
-            return Err(ToolRegistrationError::DuplicateToolName {
-                name: definition.name,
+            return Some(ToolRegistrationError::DuplicateToolName {
+                name: definition.name.clone(),
             });
         }
 
         if !matches!(&definition.owner, ToolOwner::Extension { .. }) {
-            return Err(ToolRegistrationError::UnsupportedOwner {
-                name: definition.name,
+            return Some(ToolRegistrationError::UnsupportedOwner {
+                name: definition.name.clone(),
             });
         }
 
@@ -2091,10 +2097,21 @@ impl ToolRegistry {
                 | ToolRisk::ReadsLocalContent
                 | ToolRisk::MutatesLocalState
         ) {
-            return Err(ToolRegistrationError::UnsupportedRisk {
-                name: definition.name,
+            return Some(ToolRegistrationError::UnsupportedRisk {
+                name: definition.name.clone(),
                 risk: definition.risk,
             });
+        }
+
+        None
+    }
+
+    pub fn register_extension_tool(
+        &mut self,
+        definition: ToolDefinition,
+    ) -> Result<(), ToolRegistrationError> {
+        if let Some(error) = self.extension_tool_rejection(&definition) {
+            return Err(error);
         }
 
         self.definitions.push(definition);

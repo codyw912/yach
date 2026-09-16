@@ -81,6 +81,12 @@ pub enum ExtensionToolRisk {
     ReadsLocalMetadata,
     ReadsLocalContent,
     MutatesLocalState,
+    /// Declares that the tool contacts the network. A declaration the user
+    /// grants at activation; it is not enforced. See
+    /// docs/project/specs/2026-09-16-extension-capability-contract-design.md.
+    UsesNetwork,
+    /// Declares that the tool runs a process.
+    RunsProcess,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionToolReplacementContract {
@@ -171,6 +177,8 @@ impl From<ExtensionToolRisk> for ToolRisk {
             ExtensionToolRisk::ReadsLocalMetadata => Self::ReadsLocalMetadata,
             ExtensionToolRisk::ReadsLocalContent => Self::ReadsLocalContent,
             ExtensionToolRisk::MutatesLocalState => Self::MutatesLocalState,
+            ExtensionToolRisk::UsesNetwork => Self::UsesNetwork,
+            ExtensionToolRisk::RunsProcess => Self::RunsProcess,
         }
     }
 }
@@ -1741,12 +1749,15 @@ pub fn process_extension_registration_messages(
 
     let mut staged_names = BTreeSet::new();
     for definition in &staged_definitions {
-        if registry.get(&definition.name).is_some() || !staged_names.insert(&definition.name) {
+        if !staged_names.insert(&definition.name) {
             return Err(ExtensionHostProtocolError::ToolRegistration(
                 ToolRegistrationError::DuplicateToolName {
                     name: definition.name.clone(),
                 },
             ));
+        }
+        if let Some(error) = registry.extension_tool_rejection(definition) {
+            return Err(ExtensionHostProtocolError::ToolRegistration(error));
         }
     }
 
@@ -2462,6 +2473,8 @@ fn parse_tool_risk(risk: String) -> Result<ExtensionToolRisk, ExtensionManifestE
         "reads_local_metadata" => Ok(ExtensionToolRisk::ReadsLocalMetadata),
         "reads_local_content" => Ok(ExtensionToolRisk::ReadsLocalContent),
         "mutates_local_state" => Ok(ExtensionToolRisk::MutatesLocalState),
+        "uses_network" => Ok(ExtensionToolRisk::UsesNetwork),
+        "runs_process" => Ok(ExtensionToolRisk::RunsProcess),
         _ => Err(ExtensionManifestError::UnsupportedToolRisk { risk }),
     }
 }
@@ -3211,6 +3224,51 @@ done
                 risk: String::from("writes_local_files")
             })
         );
+    }
+
+    #[test]
+    fn manifest_parses_network_and_process_tool_risks() {
+        let manifest = serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "capability-fixture",
+            "version": "1.0.0",
+            "main": { "command": "fixture-host" },
+            "contributes": {
+                "tools": [
+                    {
+                        "name": "fetch_url",
+                        "description": "Fetch a URL.",
+                        "risk": "uses_network",
+                        "provider_visible": true
+                    },
+                    {
+                        "name": "run_helper",
+                        "description": "Run a helper process.",
+                        "risk": "runs_process",
+                        "provider_visible": true
+                    }
+                ]
+            }
+        });
+
+        let parsed = parse_extension_manifest(manifest);
+        assert!(parsed.is_ok(), "manifest should parse: {parsed:?}");
+        let Ok(manifest) = parsed else { return };
+        let risks: Vec<ExtensionToolRisk> = manifest
+            .contributes
+            .tools
+            .iter()
+            .map(|tool| tool.risk)
+            .collect();
+        assert_eq!(
+            risks,
+            vec![
+                ExtensionToolRisk::UsesNetwork,
+                ExtensionToolRisk::RunsProcess
+            ]
+        );
+        assert_eq!(ToolRisk::from(risks[0]), ToolRisk::UsesNetwork);
+        assert_eq!(ToolRisk::from(risks[1]), ToolRisk::RunsProcess);
     }
 
     #[test]
@@ -4545,7 +4603,7 @@ done
                     "type": "tool.register",
                     "name": "unsafe_tool",
                     "description": "Attempts unsupported access.",
-                    "risk": "uses_network",
+                    "risk": "writes_local_files",
                     "provider_visible": false,
                     "input_schema": {
                         "type": "object",
@@ -4566,6 +4624,67 @@ done
             Err(ExtensionHostProtocolError::UnsupportedRisk)
         );
         assert!(registry.get("toy_tool").is_none());
+    }
+
+    #[test]
+    fn extension_host_registration_is_atomic_when_later_risk_fails_native_allowlist() {
+        let mut registry = ToolRegistry::with_project_read_only_tools();
+
+        let registration = process_extension_registration_messages(
+            "example.toy-tools",
+            vec![
+                serde_json::json!({
+                    "type": "extension.ready",
+                    "protocol": "yach.extension-host.v2",
+                    "extension_id": "example.toy-tools"
+                }),
+                serde_json::json!({
+                    "type": "tool.register",
+                    "name": "toy_tool",
+                    "description": "Return static fixture metadata.",
+                    "risk": "reads_local_metadata",
+                    "provider_visible": false,
+                    "input_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["label"],
+                        "properties": {
+                            "label": { "type": "string" }
+                        },
+                        "maxSerializedBytes": 512
+                    }
+                }),
+                serde_json::json!({
+                    "type": "tool.register",
+                    "name": "unsafe_tool",
+                    "description": "Attempts unsupported access.",
+                    "risk": "uses_network",
+                    "provider_visible": false,
+                    "input_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["label"],
+                        "properties": {
+                            "label": { "type": "string" }
+                        },
+                        "maxSerializedBytes": 512
+                    }
+                }),
+            ],
+            &mut registry,
+        );
+
+        assert_eq!(
+            registration,
+            Err(ExtensionHostProtocolError::ToolRegistration(
+                ToolRegistrationError::UnsupportedRisk {
+                    name: String::from("unsafe_tool"),
+                    risk: ToolRisk::UsesNetwork,
+                }
+            ))
+        );
+        assert!(registry.get("toy_tool").is_none());
+        assert!(registry.get("unsafe_tool").is_none());
     }
     #[test]
     fn extension_host_registration_accepts_read_and_mutating_tools() -> Result<(), String> {
@@ -4707,7 +4826,7 @@ done
                     "type": "tool.register",
                     "name": "toy_tool",
                     "description": "Return static fixture metadata.",
-                    "risk": "uses_network",
+                    "risk": "writes_local_files",
                     "provider_visible": false,
                     "input_schema": {
                         "type": "object",
