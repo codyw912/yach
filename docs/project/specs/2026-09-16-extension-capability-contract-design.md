@@ -205,6 +205,10 @@ it.
   surface and spent on another.
 - Consent is checked before the host process is spawned, so an extension
   without a grant never starts a subprocess.
+- Reloading an extension applies the same gate. `/extension-reload` reaches a
+  second activation entry point that spawns a host on its own path
+  (`crates/yach-backend/src/extension.rs:801`), so the check is shared rather
+  than duplicated, and reloading an ungranted or widened manifest is blocked.
 - An extension requesting network capability with no grant activates as
   `PolicyBlocked`, and its diagnostic names the missing capability.
 - After a grant, the same extension activates and its tool is callable.

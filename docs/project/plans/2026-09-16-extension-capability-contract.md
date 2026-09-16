@@ -787,14 +787,27 @@ jj commit crates/yach-backend/src/extension.rs \
 
 **Files:**
 - Modify: `crates/yach-backend/src/extension.rs:1116-1180` (`activate_background_metadata_extensions`)
+- Modify: `crates/yach-backend/src/extension.rs:801-861` (`reload_extension_from_record`)
 - Modify: `crates/yach-backend/src/extension.rs:555-580` (`ExtensionActivationErrorKind` if a reason string is added)
 - Test: `crates/yach-backend/src/extension.rs` (inline `mod tests`)
+
+**There are two activation entry points, and both spawn hosts.**
+`activate_background_metadata_extensions` runs at startup;
+`reload_extension_from_record` is reached from `/extension-reload` and
+increments `host_start_count` then calls `activate_extension_host_record`
+directly (`crates/yach-backend/src/extension.rs:859-861`). They already
+duplicate the same three guards — project trust, activation event, empty
+tools. Adding the consent check to only the first would leave
+`/extension-reload` as a bypass of the entire contract, so this task adds
+one shared check used by both.
 
 **Interfaces:**
 - Consumes: `requested_capabilities`, `load_grant`, `missing_capabilities`
   from Task 3.
-- Produces: activation marks `PolicyBlocked` when capabilities are missing,
-  with a message naming each missing capability and the grant command.
+- Produces: `fn capability_block_reason(manifest: &ExtensionManifest) -> Option<String>`
+  — `Some(message)` when the manifest requests ungranted capabilities,
+  `None` when activation may proceed. Both entry points call it before
+  spawning. The message names each missing capability and the grant command.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -847,6 +860,40 @@ no real grant is read:
     }
 
     #[test]
+    fn reloading_an_extension_cannot_bypass_the_capability_gate() {
+        // `/extension-reload` reaches reload_extension_from_record, which
+        // spawns a host on its own path. If the consent check lived only in
+        // the startup path, reloading would activate an ungranted network
+        // extension.
+        let home = std::env::temp_dir().join(format!("yach-cap-reload-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&home);
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let record = /* same helper as above: manifest declaring one
+            uses_network tool, no grant on disk */ todo_build_record();
+        let mut snapshot = ExtensionActivationSnapshot::default();
+        let before = snapshot.host_start_count;
+
+        let diagnostic = snapshot.reload_extension_from_record(
+            &record,
+            ExtensionBackgroundActivationConfig::default(),
+            None,
+        );
+
+        assert_eq!(
+            snapshot.host_start_count, before,
+            "reload must check consent before spawning a host"
+        );
+        assert!(
+            matches!(
+                diagnostic.error_kind(),
+                Some(ExtensionActivationErrorKind::PolicyBlocked)
+            ),
+            "expected PolicyBlocked on reload, got {diagnostic:?}"
+        );
+    }
+
+    #[test]
     fn a_file_scoped_extension_activates_without_a_grant() {
         // The three local risks are untouched by this contract, so an
         // existing extension must not acquire a new activation gate.
@@ -878,38 +925,75 @@ is what proves the pre-spawn ordering; keep it in whatever form compiles.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `just dev cargo test -p yach-backend --lib requesting_network_without_a_grant`
-Expected: FAIL — activation currently proceeds.
+Run: `just dev cargo test -p yach-backend --lib without_a_grant` and
+`just dev cargo test -p yach-backend --lib cannot_bypass_the_capability_gate`
+Expected: FAIL on both — neither activation path checks consent yet. The
+reload failure is the one that matters most: it is the path a user reaches
+from `/extension-reload`.
 
-- [ ] **Step 3: Check consent before spawning**
+- [ ] **Step 3: Add one shared consent check and call it from both paths**
 
-In `activate_background_metadata_extensions`, after the project-trust and
-activation-event checks and **before** `host_start_count` is incremented or
-`activate_extension_host_record` is called:
+Add a free function next to the other activation helpers:
 
 ```rust
-        let requested = crate::extension_capability::requested_capabilities(
-            &record.manifest.contributes.tools,
-        );
-        if !requested.is_empty() {
-            let grant = crate::extension_capability::load_grant(&record.manifest.id.0);
-            let missing =
-                crate::extension_capability::missing_capabilities(&requested, grant.as_ref());
-            if !missing.is_empty() {
-                let names: Vec<&str> = missing.iter().map(|c| c.as_str()).collect();
-                diagnostic.mark_blocked(
-                    ExtensionActivationErrorKind::PolicyBlocked,
-                    &format!(
-                        "extension requests ungranted capabilities: {}. Grant with `/extension-trust {}`.",
-                        names.join(", "),
-                        record.manifest.id.0
-                    ),
-                );
-                snapshot.diagnostics.push(diagnostic);
-                continue;
-            }
+/// The reason activation must be refused, or `None` when the manifest's
+/// requested capabilities are covered by a recorded grant.
+///
+/// Both activation entry points call this before spawning a host. Keeping
+/// it in one place is the point: a second copy is how `/extension-reload`
+/// would drift into bypassing the contract.
+fn capability_block_reason(manifest: &ExtensionManifest) -> Option<String> {
+    let requested =
+        crate::extension_capability::requested_capabilities(&manifest.contributes.tools);
+    if requested.is_empty() {
+        return None;
+    }
+    let grant = crate::extension_capability::load_grant(&manifest.id.0);
+    let missing = crate::extension_capability::missing_capabilities(&requested, grant.as_ref());
+    if missing.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = missing.iter().map(ExtensionCapability::as_str).collect();
+    Some(format!(
+        "extension requests ungranted capabilities: {}. Grant with `/extension-trust {}`.",
+        names.join(", "),
+        manifest.id.0
+    ))
+}
+```
+
+`ExtensionManifest` is the manifest type on `ExtensionPackageRecord`;
+confirm its real name with
+`grep -n 'pub manifest:' crates/yach-backend/src/extension.rs | head -2`
+and use that.
+
+In `activate_background_metadata_extensions`, after the existing
+project-trust, activation-event, and empty-tools guards and **before**
+`host_start_count` is incremented:
+
+```rust
+        if let Some(reason) = capability_block_reason(&record.manifest) {
+            diagnostic.mark_blocked(ExtensionActivationErrorKind::PolicyBlocked, &reason);
+            snapshot.diagnostics.push(diagnostic);
+            continue;
         }
 ```
+
+In `reload_extension_from_record`, at the same position — after its
+empty-tools guard at `crates/yach-backend/src/extension.rs:854-857` and
+before `host_start_count` is incremented at line 859:
+
+```rust
+        if let Some(reason) = capability_block_reason(&record.manifest) {
+            diagnostic.mark_blocked(ExtensionActivationErrorKind::PolicyBlocked, &reason);
+            self.diagnostics.push(diagnostic.clone());
+            return diagnostic;
+        }
+```
+
+Note the two paths differ in how they record a diagnostic — one pushes to a
+snapshot and continues the loop, the other pushes a clone and returns it.
+Follow each function's existing guards rather than unifying that.
 
 Match `mark_blocked`'s real signature — check whether it takes `&str` or
 `String` and adapt.
@@ -1106,8 +1190,15 @@ undetected by Yach.
 The capability path is user-facing, so prove it outside unit tests. Use the
 TUI visual harness (`tests/visual/`, and see `just tui-visual`) or
 `yach rpc` against a fixture extension, and record what you observed in the
-commit message. `Wait+Screen` does not match the TUI's alternate screen once
-it takes over — settle on timing and assert with screenshots.
+commit message.
+
+Harness note: `tests/visual/hardening.tape` settles on timing and asserts
+with screenshots rather than `Wait+Screen`, because the older
+`tests/visual/session.tape` waits on `/no model/`, a string its fixture no
+longer renders. `Wait+Screen` itself works — it was probed against both
+ordinary shell output and alternate-screen content — so prefer it where the
+string you wait for is one the current fixture actually prints, and fall back
+to timing plus screenshots otherwise.
 
 - [ ] **Step 5: Verify and commit**
 
