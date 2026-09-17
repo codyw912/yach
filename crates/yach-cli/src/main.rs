@@ -15,13 +15,13 @@ use yach_connections::{ConnectionId, CredentialError, CredentialStore, ProviderS
 use yach_backend::{
     BackendMetadata, CatalogModelEntry, DialectSelection, ExtensionActivationDiagnostic,
     ExtensionActivationErrorKind, ExtensionActivationState, ExtensionCapability,
-    ExtensionCapabilityGrantStatus, ExtensionInstallError, ExtensionInstallRecord,
-    ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex,
-    ExtensionPackageRecord, ExtensionPackageRoot, ExtensionPackageRootLoader, ModelDiscoveryFuture,
-    ModelDiscoveryOutcome, ProviderConfig, ProviderError, ProviderErrorKind, ProviderMessage,
-    ProviderModel, ProviderRequest, Role, RunnerConfig, TurnId, fresh_session_id,
-    grant_confirmation_message, grant_id_from_selector, grant_requested,
-    latest_session_log_path_in,
+    ExtensionCapabilityGrantStatus, ExtensionDecisionSurface, ExtensionInstallError,
+    ExtensionInstallRecord, ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore,
+    ExtensionManifestIndex, ExtensionPackageRecord, ExtensionPackageRoot,
+    ExtensionPackageRootLoader, ModelDiscoveryFuture, ModelDiscoveryOutcome, ProviderConfig,
+    ProviderError, ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, Role,
+    RunnerConfig, TurnId, fresh_session_id, grant_confirmation_message, grant_id_from_selector,
+    grant_requested, latest_session_log_path_in,
     model_discovery::DiscoveredProviderModel,
     nothing_to_grant_message, project_session_log_dir, revoke_confirmation_message, revoke_grant,
     rig_adapter::{
@@ -4428,6 +4428,7 @@ fn run_extension_trust_command(selector: &str) -> CommandResult {
                 extension_id,
                 &record.manifest.version,
                 &record.manifest.contributes.tools,
+                ExtensionDecisionSurface::Cli,
             ) {
                 Ok(None) => extension_capability_management_result(
                     ExtensionManagementAction::Trust,
@@ -4499,7 +4500,7 @@ fn run_extension_revoke_command(selector: &str) -> CommandResult {
             );
         }
     };
-    match revoke_grant(&extension_id) {
+    match revoke_grant(&extension_id, ExtensionDecisionSurface::Cli) {
         Ok(had_grant) => extension_capability_management_result(
             ExtensionManagementAction::Revoke,
             ExtensionManagementOutcome::Completed,

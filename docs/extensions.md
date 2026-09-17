@@ -68,7 +68,17 @@ The same check runs at startup and on `/extension-reload`. Reloading does
 not bypass it.
 
 Grants live only in user home, at `~/.yach/extensions/<extension-id>.json`.
-A project checkout cannot grant capability.
+That private JSON document is the inspectable audit artifact: current
+authority, any imported legacy grant (`legacy_baseline`), and ordered
+grant/revoke decisions. A project checkout cannot grant capability.
+
+Older three-field grant files still authorize until the next trust or revoke,
+which imports them as `legacy_baseline` in the same replacement. A write that
+fails before the new file is renamed leaves the previous document unchanged.
+If the new file is already visible but directory durability cannot be
+confirmed, the command reports that uncertainty instead of success or
+rollback. On platforms that cannot sync directories, crash durability of the
+directory entry is weaker than the file contents.
 
 ## Granting and revoking
 
@@ -102,8 +112,9 @@ The extension may activate; Yach does not observe whether the host uses those ca
 An extension that requests no capabilities prints that nothing needed a
 grant, and writes no file.
 
-Revoke deletes the grant. If the package is still loaded, the TUI also
-stops the host. After you have already uninstalled the package, pass the
+Revoke keeps the document and clears current authority, so activation stays
+denied even though history remains. If the package is still loaded, the TUI
+also stops the host. After you have already uninstalled the package, pass the
 extension id from the manifest — a path or other selector is rejected when
 nothing is discovered:
 

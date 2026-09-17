@@ -320,20 +320,21 @@ pub(super) async fn handle_native_extension_lifecycle_request(
                 return;
             }
         };
-        let (outcome, message) = match crate::revoke_grant(&extension_id) {
-            Ok(had_grant) => {
-                let mut snapshot = activation_state.lock().await;
-                let _ = snapshot.stop_extension(&selector);
-                (
-                    ExtensionLifecycleOutcome::Completed,
-                    crate::revoke_confirmation_message(&extension_id, had_grant),
-                )
-            }
-            Err(error) => (
-                ExtensionLifecycleOutcome::Failed,
-                format!("failed to remove capability grant: {error}"),
-            ),
-        };
+        let (outcome, message) =
+            match crate::revoke_grant(&extension_id, crate::ExtensionDecisionSurface::Lifecycle) {
+                Ok(had_grant) => {
+                    let mut snapshot = activation_state.lock().await;
+                    let _ = snapshot.stop_extension(&selector);
+                    (
+                        ExtensionLifecycleOutcome::Completed,
+                        crate::revoke_confirmation_message(&extension_id, had_grant),
+                    )
+                }
+                Err(error) => (
+                    ExtensionLifecycleOutcome::Failed,
+                    format!("failed to remove capability grant: {error}"),
+                ),
+            };
         let _ = tx.send(BackendEvent::Server(
             ServerEvent::ExtensionLifecycleFinished {
                 request_id,
@@ -516,6 +517,7 @@ fn schedule_native_extension_trust(
             extension_id,
             &record.manifest.version,
             &record.manifest.contributes.tools,
+            crate::ExtensionDecisionSurface::Lifecycle,
         ) {
             Ok(None) => (
                 ExtensionLifecycleOutcome::Completed,

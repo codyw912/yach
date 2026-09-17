@@ -4570,30 +4570,45 @@ done
             ));
         }
 
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        let home =
+            std::env::temp_dir().join(format!("yach-cap-block-home-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&home).map_err(|error| format!("{error:?}"))?;
+        let store = crate::ExtensionAuthorityStore::in_home(&home);
+        let stored = store
+            .grant_requested(
+                &record.manifest.id.0,
+                &record.manifest.version,
+                &record.manifest.contributes.tools,
+                crate::ExtensionDecisionSurface::Cli,
+            )
             .map_err(|error| format!("{error:?}"))?;
-        let path = std::env::temp_dir().join(format!(
-            "yach-cap-block-{}-{}.json",
-            std::process::id(),
-            stamp.as_nanos()
-        ));
-        let stored = crate::extension_capability::grant_requested_at(
-            &path,
-            &record.manifest.version,
-            &record.manifest.contributes.tools,
-        )
-        .map_err(|error| format!("{error:?}"))?;
         let Some(grant) = stored else {
-            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir_all(&home);
             return Err(String::from("network tool should produce a grant"));
         };
         let after = capability_block_reason_with_grant(&record.manifest, Some(&grant));
-        let revoked = crate::extension_capability::revoke_grant_at(&path);
-        let _ = fs::remove_file(&path);
+        let revoked =
+            store.revoke_grant(&record.manifest.id.0, crate::ExtensionDecisionSurface::Cli);
+        let reloaded = store
+            .load_grant(&record.manifest.id.0)
+            .map_err(|error| format!("{error:?}"))?;
+        let retained = home
+            .join(".yach")
+            .join("extensions")
+            .join(format!("{}.json", record.manifest.id.0));
+        let document_retained = retained.is_file();
+        let _ = fs::remove_dir_all(&home);
         revoked.map_err(|error| format!("{error:?}"))?;
         if after.is_some() {
             return Err(format!("covering grant must clear the block: {after:?}"));
+        }
+        if reloaded.is_some() {
+            return Err(String::from(
+                "revoking must deny activation while retaining the document",
+            ));
+        }
+        if !document_retained {
+            return Err(String::from("revoke must retain the authority document"));
         }
         let uncovered = capability_block_reason_with_grant(&record.manifest, None);
         if uncovered.is_none() {
