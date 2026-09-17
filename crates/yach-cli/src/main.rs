@@ -553,6 +553,14 @@ impl CommandResult {
                     1
                 }
             }
+            Self::ExtensionDiagnostics {
+                outcome: ExtensionDiagnosticsOutcome::Failed,
+                ..
+            }
+            | Self::ExtensionManagement {
+                outcome: ExtensionManagementOutcome::Failed,
+                ..
+            } => 1,
             Self::HeadlessRun { exit_code } | Self::Rpc { exit_code } => *exit_code,
             Self::Version
             | Self::Usage
@@ -4647,17 +4655,65 @@ fn installed_extension_records() -> Vec<ExtensionInstallRecord> {
 }
 
 fn loaded_extension_install_records() -> Result<Vec<ExtensionInstallRecord>, String> {
-    let mut records = load_extension_install_store_for_scope(ExtensionInstallScope::User)?.records;
-    records.extend(load_extension_install_store_for_scope(ExtensionInstallScope::Project)?.records);
+    let user = extension_store_path(ExtensionInstallScope::User)
+        .map_err(|_| String::from("store_path"))?;
+    let project = extension_store_path(ExtensionInstallScope::Project)
+        .map_err(|_| String::from("store_path"))?;
+    loaded_extension_install_records_from_paths(&user, &project)
+}
+
+fn loaded_extension_install_records_from_paths(
+    user: &Path,
+    project: &Path,
+) -> Result<Vec<ExtensionInstallRecord>, String> {
+    let mut records = load_install_records_at(user)?;
+    if !same_install_store(user, project)? {
+        records.extend(load_install_records_at(project)?);
+    }
     Ok(records)
 }
 
-fn load_extension_install_store_for_scope(
-    scope: ExtensionInstallScope,
-) -> Result<ExtensionInstallStore, String> {
-    let path = extension_store_path(scope).map_err(|_| String::from("store_path"))?;
-    ExtensionInstallStore::load_from_path(&path)
+fn load_install_records_at(path: &Path) -> Result<Vec<ExtensionInstallRecord>, String> {
+    ExtensionInstallStore::load_from_path(path)
+        .map(|store| store.records)
         .map_err(|error| extension_install_error_label(&error).to_owned())
+}
+
+fn same_install_store(first: &Path, second: &Path) -> Result<bool, String> {
+    if first == second {
+        return Ok(true);
+    }
+
+    let first_canonical = canonicalize_store_for_identity(first)?;
+    let second_canonical = canonicalize_store_for_identity(second)?;
+    let (Some(first_canonical), Some(second_canonical)) = (first_canonical, second_canonical)
+    else {
+        return Ok(false);
+    };
+    if first_canonical == second_canonical {
+        return Ok(true);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let first_metadata = std::fs::metadata(first).map_err(|_| String::from("store_io"))?;
+        let second_metadata = std::fs::metadata(second).map_err(|_| String::from("store_io"))?;
+        Ok(first_metadata.dev() == second_metadata.dev()
+            && first_metadata.ino() == second_metadata.ino())
+    }
+
+    #[cfg(not(unix))]
+    Ok(false)
+}
+
+fn canonicalize_store_for_identity(path: &Path) -> Result<Option<PathBuf>, String> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(String::from("store_io")),
+    }
 }
 
 fn extension_diagnostic_records_from_index(

@@ -2440,20 +2440,51 @@ fn load_extension_package_root(
         });
     }
 
-    manifest_paths
-        .into_iter()
-        .map(|manifest_path| {
-            ensure_manifest_path_stays_inside_package_root(&package_root.root, &manifest_path)?;
-            let manifest = read_extension_manifest_file(&manifest_path)?;
-            Ok(ExtensionPackageRecord {
-                manifest,
-                scope: package_root.scope,
-                package_root: package_root.root.clone(),
-                manifest_path,
-                source_ref: package_root.source_ref.clone(),
-            })
-        })
-        .collect()
+    let mut records = Vec::new();
+    let mut canonical_manifests = BTreeSet::new();
+    #[cfg(unix)]
+    let mut manifest_file_ids = BTreeSet::new();
+
+    for manifest_path in manifest_paths {
+        ensure_manifest_path_stays_inside_package_root(&package_root.root, &manifest_path)?;
+        let canonical_manifest = fs::canonicalize(&manifest_path).map_err(|_| {
+            ExtensionPackageIndexError::MissingManifestFile {
+                path: manifest_path.clone(),
+            }
+        })?;
+        let duplicate = canonical_manifests.contains(&canonical_manifest) || {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+
+                let metadata = fs::metadata(&manifest_path).map_err(|_| {
+                    ExtensionPackageIndexError::MissingManifestFile {
+                        path: manifest_path.clone(),
+                    }
+                })?;
+                !manifest_file_ids.insert((metadata.dev(), metadata.ino()))
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        if duplicate {
+            continue;
+        }
+        canonical_manifests.insert(canonical_manifest);
+
+        let manifest = read_extension_manifest_file(&manifest_path)?;
+        records.push(ExtensionPackageRecord {
+            manifest,
+            scope: package_root.scope,
+            package_root: package_root.root.clone(),
+            manifest_path,
+            source_ref: package_root.source_ref.clone(),
+        });
+    }
+
+    Ok(records)
 }
 
 fn discover_extension_manifest_paths(
@@ -3776,6 +3807,105 @@ done
             &index.records()[0].manifest.id,
             &ExtensionId(String::from("example.toy-tools")),
         )
+    }
+
+    #[test]
+    fn extension_package_root_deduplicates_repeated_default_manifest_pointer() -> Result<(), String>
+    {
+        let package = TestPackageRoot::new("repeated_default_manifest")?;
+        let manifest_path =
+            package.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+        package.write_json_file(
+            "package.json",
+            &serde_json::json!({
+                "yach": { "manifests": ["yach.extension.json"] }
+            }),
+        )?;
+
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&index.records().len(), &1)?;
+        expect_equal(&index.records()[0].manifest_path, &manifest_path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_package_root_deduplicates_symlinked_manifest_pointer() -> Result<(), String> {
+        let package = TestPackageRoot::new("symlinked_manifest")?;
+        let manifest_path =
+            package.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+        std::os::unix::fs::symlink(&manifest_path, package.path.join("alias.extension.json"))
+            .map_err(|error| format!("{error:?}"))?;
+        package.write_json_file(
+            "package.json",
+            &serde_json::json!({
+                "yach": { "manifests": ["alias.extension.json"] }
+            }),
+        )?;
+
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&index.records().len(), &1)?;
+        expect_equal(&index.records()[0].manifest_path, &manifest_path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_package_root_deduplicates_hard_linked_manifest_pointer() -> Result<(), String> {
+        let package = TestPackageRoot::new("hard_linked_manifest")?;
+        let manifest_path =
+            package.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+        std::fs::hard_link(&manifest_path, package.path.join("alias.extension.json"))
+            .map_err(|error| format!("{error:?}"))?;
+        package.write_json_file(
+            "package.json",
+            &serde_json::json!({
+                "yach": { "manifests": ["alias.extension.json"] }
+            }),
+        )?;
+
+        let index = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+
+        expect_equal(&index.records().len(), &1)?;
+        expect_equal(&index.records()[0].manifest_path, &manifest_path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_package_root_validates_escape_before_alias_deduplication() -> Result<(), String> {
+        let package = TestPackageRoot::new("escaped_alias")?;
+        let manifest_path =
+            package.write_json_file("yach.extension.json", &toy_tool_manifest_json())?;
+        let outside = package.path.with_extension("outside.extension.json");
+        std::fs::hard_link(&manifest_path, &outside).map_err(|error| format!("{error:?}"))?;
+        std::os::unix::fs::symlink(&outside, package.path.join("escaped.extension.json"))
+            .map_err(|error| format!("{error:?}"))?;
+        package.write_json_file(
+            "package.json",
+            &serde_json::json!({
+                "yach": { "manifests": ["escaped.extension.json"] }
+            }),
+        )?;
+
+        let error = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ]);
+        let expected = Err(ExtensionPackageIndexError::ManifestPathEscapedPackageRoot {
+            root: package.path.clone(),
+            path: package.path.join("escaped.extension.json"),
+        });
+        let result = expect_equal(&error, &expected);
+        let _ = std::fs::remove_file(outside);
+        result
     }
 
     #[test]

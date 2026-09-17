@@ -102,6 +102,11 @@ reloads the extension so activation can proceed. The CLI command writes the
 grant only; the host starts on the next session, or after
 `/extension-reload` in a running TUI.
 
+Extension commands that report `extension_outcome=Failed` exit with status 1.
+Successful commands and diagnostic no-ops exit with status 0; malformed command
+usage exits with status 2. This lets scripts distinguish a printed diagnostic
+failure from a completed command without parsing its human-readable message.
+
 A successful grant prints the approved capabilities and the tools that
 requested each, then:
 

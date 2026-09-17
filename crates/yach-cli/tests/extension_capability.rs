@@ -91,6 +91,253 @@ fn stdout(output: &std::process::Output) -> String {
     String::from_utf8(output.stdout.clone()).test_unwrap()
 }
 
+fn run_cli_with_native_stores(home: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(args)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env_remove("YACH_EXTENSION_USER_STORE")
+        .env_remove("YACH_EXTENSION_PROJECT_STORE")
+        .env_remove("YACH_EXTENSION_PACKAGE_ROOTS")
+        .output()
+        .test_unwrap()
+}
+
+fn write_install_store(path: &Path, records: &serde_json::Value) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).test_unwrap();
+    }
+    fs::write(
+        path,
+        serde_json::json!({
+            "schema": "yach.extensions.v1",
+            "records": records,
+        })
+        .to_string(),
+    )
+    .test_unwrap();
+}
+
+fn install_record(package_root: &Path, scope: &str) -> serde_json::Value {
+    serde_json::json!({
+        "source": package_root.to_string_lossy(),
+        "kind": "local_path",
+        "scope": scope,
+        "enabled": true,
+        "package_root": package_root,
+    })
+}
+
+fn write_fixture_manifest(dest: &Path, id: &str, tool: &str) {
+    fs::create_dir_all(dest).test_unwrap();
+    fs::write(
+        dest.join("yach.extension.json"),
+        serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": id,
+            "version": "0.1.0",
+            "main": { "command": "sh", "args": ["host.sh"] },
+            "activation": { "events": [] },
+            "contributes": {
+                "tools": [{
+                    "name": tool,
+                    "description": "Test tool.",
+                    "risk": "reads_local_metadata",
+                    "provider_visible": false
+                }]
+            }
+        })
+        .to_string(),
+    )
+    .test_unwrap();
+}
+
+#[test]
+fn native_store_shared_by_home_and_cwd_is_loaded_once() {
+    let temp = TempPackage::new().test_unwrap();
+    let home = temp.root.join("home");
+    let package = temp.root.join("package");
+    fs::create_dir_all(&home).test_unwrap();
+    copy_fixture(&package);
+
+    let installed = run_cli_with_native_stores(
+        &home,
+        &home,
+        &["extension", "install", &package.to_string_lossy()],
+    );
+    assert!(installed.status.success(), "{}", stdout(&installed));
+
+    let doctor = run_cli_with_native_stores(
+        &home,
+        &home,
+        &["extension", "doctor", "example.capability-network"],
+    );
+    assert!(doctor.status.success(), "{}", stdout(&doctor));
+    assert!(stdout(&doctor).contains("extension_outcome=Completed"));
+
+    let trust = run_cli_with_native_stores(
+        &home,
+        &home,
+        &["extension", "trust", "example.capability-network"],
+    );
+    assert!(trust.status.success(), "{}", stdout(&trust));
+    assert!(stdout(&trust).contains("extension_outcome=Completed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_store_shared_through_symlinked_cwd_is_loaded_once() {
+    let temp = TempPackage::new().test_unwrap();
+    let home = temp.root.join("home");
+    let cwd_alias = temp.root.join("home-alias");
+    let package = temp.root.join("package");
+    fs::create_dir_all(&home).test_unwrap();
+    std::os::unix::fs::symlink(&home, &cwd_alias).test_unwrap();
+    copy_fixture(&package);
+
+    let installed = run_cli_with_native_stores(
+        &home,
+        &cwd_alias,
+        &["extension", "install", &package.to_string_lossy()],
+    );
+    assert!(installed.status.success(), "{}", stdout(&installed));
+
+    for action in ["doctor", "trust"] {
+        let output = run_cli_with_native_stores(
+            &home,
+            &cwd_alias,
+            &["extension", action, "example.capability-network"],
+        );
+        assert!(output.status.success(), "{action}: {}", stdout(&output));
+        assert!(stdout(&output).contains("extension_outcome=Completed"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn hard_linked_install_stores_are_loaded_once() {
+    let temp = TempPackage::new().test_unwrap();
+    let home = temp.root.join("home");
+    let cwd = temp.root.join("cwd");
+    let package = temp.root.join("package");
+    let user_store = temp.root.join("user.json");
+    let project_store = temp.root.join("project.json");
+    fs::create_dir_all(&home).test_unwrap();
+    fs::create_dir_all(&cwd).test_unwrap();
+    copy_fixture(&package);
+    write_install_store(
+        &user_store,
+        &serde_json::json!([install_record(&package, "user")]),
+    );
+    fs::hard_link(&user_store, &project_store).test_unwrap();
+
+    let doctor = run_cli(
+        &home,
+        &user_store,
+        &project_store,
+        &cwd,
+        &["extension", "doctor", "example.capability-network"],
+    );
+    assert!(doctor.status.success(), "{}", stdout(&doctor));
+    assert!(stdout(&doctor).contains("extension_outcome=Completed"));
+}
+
+#[test]
+fn shared_store_preserves_recorded_project_scope() {
+    let temp = TempPackage::new().test_unwrap();
+    let home = temp.root.join("home");
+    let cwd = temp.root.join("cwd");
+    let package = temp.root.join("package");
+    let store = temp.root.join("extensions.json");
+    fs::create_dir_all(&home).test_unwrap();
+    fs::create_dir_all(&cwd).test_unwrap();
+    copy_fixture(&package);
+    write_install_store(
+        &store,
+        &serde_json::json!([install_record(&package, "project")]),
+    );
+
+    let list = run_cli(&home, &store, &store, &cwd, &["extension", "list"]);
+    assert!(list.status.success(), "{}", stdout(&list));
+    let out = stdout(&list);
+    assert!(out.contains("id=example.capability-network"), "{out}");
+    assert!(out.contains("scope=project"), "{out}");
+}
+
+#[test]
+fn unrelated_invalid_project_store_is_not_hidden() {
+    let temp = TempPackage::new().test_unwrap();
+    let home = temp.root.join("home");
+    let cwd = temp.root.join("cwd");
+    let user_store = temp.root.join("user.json");
+    let project_store = temp.root.join("project.json");
+    fs::create_dir_all(&home).test_unwrap();
+    fs::create_dir_all(&cwd).test_unwrap();
+    write_install_store(&user_store, &serde_json::json!([]));
+
+    for (setup, expected_error) in [("malformed", "store_malformed"), ("unreadable", "store_io")] {
+        if setup == "malformed" {
+            fs::write(&project_store, "{not json").test_unwrap();
+        } else {
+            let _ = fs::remove_file(&project_store);
+            fs::create_dir(&project_store).test_unwrap();
+        }
+
+        let list = run_cli(
+            &home,
+            &user_store,
+            &project_store,
+            &cwd,
+            &["extension", "list"],
+        );
+        assert_eq!(list.status.code(), Some(1));
+        let out = stdout(&list);
+        assert!(out.contains("extension_outcome=Failed"), "{out}");
+        assert!(out.contains(expected_error), "{out}");
+
+        if setup == "unreadable" {
+            fs::remove_dir(&project_store).test_unwrap();
+        }
+    }
+}
+
+#[test]
+fn genuine_extension_id_and_tool_conflicts_fail_with_status_one() {
+    let temp = TempPackage::new().test_unwrap();
+    let home = temp.root.join("home");
+    let cwd = temp.root.join("cwd");
+    let first = temp.root.join("first");
+    let second = temp.root.join("second");
+    let user_store = temp.root.join("user.json");
+    let project_store = temp.root.join("project.json");
+    fs::create_dir_all(&home).test_unwrap();
+    fs::create_dir_all(&cwd).test_unwrap();
+
+    for second_id in ["example.conflict", "example.other-conflict"] {
+        write_fixture_manifest(&first, "example.conflict", "conflict_tool");
+        write_fixture_manifest(&second, second_id, "conflict_tool");
+        write_install_store(
+            &user_store,
+            &serde_json::json!([install_record(&first, "user")]),
+        );
+        write_install_store(
+            &project_store,
+            &serde_json::json!([install_record(&second, "project")]),
+        );
+
+        let doctor = run_cli(
+            &home,
+            &user_store,
+            &project_store,
+            &cwd,
+            &["extension", "doctor"],
+        );
+        assert_eq!(doctor.status.code(), Some(1));
+        let out = stdout(&doctor);
+        assert!(out.contains("extension_outcome=Failed"), "{out}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_trust_revoke_persists_across_isolated_child_restarts() {
@@ -253,7 +500,7 @@ fn cli_mutations_preserve_corrupt_and_unknown_authority_bytes() {
 
     let extensions = home.join(".yach/extensions");
     fs::create_dir_all(&extensions).test_unwrap();
-    fs::set_permissions(&home.join(".yach"), fs::Permissions::from_mode(0o700)).test_unwrap();
+    fs::set_permissions(home.join(".yach"), fs::Permissions::from_mode(0o700)).test_unwrap();
     fs::set_permissions(&extensions, fs::Permissions::from_mode(0o700)).test_unwrap();
     let authority = extensions.join("example.capability-network.json");
 
@@ -273,6 +520,7 @@ fn cli_mutations_preserve_corrupt_and_unknown_authority_bytes() {
             &cwd,
             &["extension", action, "example.capability-network"],
         );
+        assert_eq!(output.status.code(), Some(1));
         let out = stdout(&output);
         assert!(
             out.contains("extension_outcome=Failed"),
