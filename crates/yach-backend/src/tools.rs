@@ -23,6 +23,23 @@ pub enum ToolRisk {
     RunsProcess,
 }
 
+impl ToolRisk {
+    /// Risks an extension may declare on a contributed tool. `FixtureSafe`
+    /// is built-in-only. This is the single list registration and provider
+    /// advertising consult for extension-owned tools.
+    #[must_use]
+    pub const fn is_extension_declarable(self) -> bool {
+        matches!(
+            self,
+            Self::ReadsLocalMetadata
+                | Self::ReadsLocalContent
+                | Self::MutatesLocalState
+                | Self::UsesNetwork
+                | Self::RunsProcess
+        )
+    }
+}
+
 /// Ownership boundary for a yach-owned native tool definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolOwner {
@@ -800,10 +817,7 @@ fn project_provider_advertised_tool(
                 name: tool.name.clone(),
             });
         }
-    } else if !matches!(
-        tool.risk,
-        ToolRisk::ReadsLocalMetadata | ToolRisk::ReadsLocalContent | ToolRisk::MutatesLocalState
-    ) {
+    } else if !tool.risk.is_extension_declarable() {
         return Err(ProviderToolAdvertisingError::UnsupportedRisk {
             name: tool.name.clone(),
             risk: tool.risk,
@@ -1901,6 +1915,7 @@ pub struct ToolPermissionPolicy {
     content_advertising: BTreeSet<String>,
     agent_edit_advertising: BTreeSet<String>,
     process_execution: BTreeSet<String>,
+    network_execution: BTreeSet<String>,
 }
 
 impl ToolPermissionPolicy {
@@ -1917,6 +1932,7 @@ impl ToolPermissionPolicy {
             content_advertising: BTreeSet::new(),
             agent_edit_advertising: BTreeSet::new(),
             process_execution: BTreeSet::new(),
+            network_execution: BTreeSet::new(),
         }
     }
 
@@ -1935,6 +1951,7 @@ impl ToolPermissionPolicy {
             content_advertising: BTreeSet::new(),
             agent_edit_advertising: BTreeSet::new(),
             process_execution: BTreeSet::new(),
+            network_execution: BTreeSet::new(),
         }
     }
 
@@ -1949,6 +1966,7 @@ impl ToolPermissionPolicy {
             content_advertising: BTreeSet::new(),
             agent_edit_advertising: edit_names.into_iter().map(Into::into).collect(),
             process_execution: BTreeSet::new(),
+            network_execution: BTreeSet::new(),
         }
     }
 
@@ -1964,6 +1982,7 @@ impl ToolPermissionPolicy {
             content_advertising: content_names.into_iter().map(Into::into).collect(),
             agent_edit_advertising: edit_names.into_iter().map(Into::into).collect(),
             process_execution: BTreeSet::new(),
+            network_execution: BTreeSet::new(),
         }
     }
 
@@ -1978,13 +1997,20 @@ impl ToolPermissionPolicy {
     }
 
     #[must_use]
+    pub fn with_network_execution(mut self, names: &[&str]) -> Self {
+        self.network_execution = names.iter().copied().map(String::from).collect();
+        self
+    }
+
+    #[must_use]
     pub fn authorize(&self, definition: &ToolDefinition) -> ToolPermissionState {
         let allowed = match definition.risk {
             ToolRisk::FixtureSafe => self.fixture_execution.contains(&definition.name),
             ToolRisk::ReadsLocalMetadata => self.metadata_advertising.contains(&definition.name),
             ToolRisk::ReadsLocalContent => self.content_advertising.contains(&definition.name),
             ToolRisk::RunsProcess => self.process_execution.contains(&definition.name),
-            ToolRisk::MutatesLocalState | ToolRisk::UsesNetwork => false,
+            ToolRisk::UsesNetwork => self.network_execution.contains(&definition.name),
+            ToolRisk::MutatesLocalState => false,
         };
 
         if allowed {
@@ -2001,7 +2027,8 @@ impl ToolPermissionPolicy {
             ToolRisk::ReadsLocalContent => self.content_advertising.contains(&definition.name),
             ToolRisk::MutatesLocalState => self.agent_edit_advertising.contains(&definition.name),
             ToolRisk::RunsProcess => self.process_execution.contains(&definition.name),
-            ToolRisk::FixtureSafe | ToolRisk::UsesNetwork => false,
+            ToolRisk::UsesNetwork => self.network_execution.contains(&definition.name),
+            ToolRisk::FixtureSafe => false,
         }
     }
 }
@@ -2069,32 +2096,44 @@ impl ToolRegistry {
         &self.definitions
     }
 
-    pub fn register_extension_tool(
-        &mut self,
-        definition: ToolDefinition,
-    ) -> Result<(), ToolRegistrationError> {
+    /// Why `definition` would be refused registration, or `None` when it
+    /// would be accepted. `register_extension_tool` and any caller
+    /// pre-validating a batch must consult this same rule, so a widened
+    /// risk vocabulary cannot admit a tool in one place and reject it in
+    /// the other.
+    #[must_use]
+    pub fn extension_tool_rejection(
+        &self,
+        definition: &ToolDefinition,
+    ) -> Option<ToolRegistrationError> {
         if self.get(&definition.name).is_some() {
-            return Err(ToolRegistrationError::DuplicateToolName {
-                name: definition.name,
+            return Some(ToolRegistrationError::DuplicateToolName {
+                name: definition.name.clone(),
             });
         }
 
         if !matches!(&definition.owner, ToolOwner::Extension { .. }) {
-            return Err(ToolRegistrationError::UnsupportedOwner {
-                name: definition.name,
+            return Some(ToolRegistrationError::UnsupportedOwner {
+                name: definition.name.clone(),
             });
         }
 
-        if !matches!(
-            definition.risk,
-            ToolRisk::ReadsLocalMetadata
-                | ToolRisk::ReadsLocalContent
-                | ToolRisk::MutatesLocalState
-        ) {
-            return Err(ToolRegistrationError::UnsupportedRisk {
-                name: definition.name,
+        if !definition.risk.is_extension_declarable() {
+            return Some(ToolRegistrationError::UnsupportedRisk {
+                name: definition.name.clone(),
                 risk: definition.risk,
             });
+        }
+
+        None
+    }
+
+    pub fn register_extension_tool(
+        &mut self,
+        definition: ToolDefinition,
+    ) -> Result<(), ToolRegistrationError> {
+        if let Some(error) = self.extension_tool_rejection(&definition) {
+            return Err(error);
         }
 
         self.definitions.push(definition);
@@ -2715,6 +2754,12 @@ fn extension_host_error_label(error: &crate::ExtensionHostProtocolError) -> &'st
         crate::ExtensionHostProtocolError::ToolRegistration(_) => {
             "extension_host_tool_registration_failed"
         }
+        crate::ExtensionHostProtocolError::UndeclaredTool { .. } => {
+            "extension_host_undeclared_tool"
+        }
+        crate::ExtensionHostProtocolError::ToolRiskMismatch { .. } => {
+            "extension_host_tool_risk_mismatch"
+        }
     }
 }
 
@@ -2733,8 +2778,10 @@ fn resource_path_error_label(error: ResourcePathError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ToolPermissionPolicy, ToolRegistry, advertised_roster_bytes,
-        build_provider_tool_advertising_extension, search_result_notices,
+        ProviderToolAdvertisingError, ProviderToolVisibility, ToolDefinition, ToolInputSchema,
+        ToolPermissionPolicy, ToolPermissionState, ToolRegistry, ToolRisk, advertised_roster_bytes,
+        build_provider_tool_advertising_extension, project_provider_advertised_tool,
+        search_result_notices,
     };
 
     #[test]
@@ -2806,5 +2853,81 @@ mod tests {
         };
         assert_eq!(bytes, expected.len());
         assert!(expected.len() > 1000);
+    }
+
+    #[test]
+    fn network_risk_is_allowed_only_when_allowlisted() {
+        let definition = ToolDefinition::extension_tool_with_version(
+            "capability-fixture",
+            Some(String::from("1.0.0")),
+            String::from("fetch_url"),
+            String::from("Fetch a URL."),
+            ToolInputSchema::string_object(
+                std::iter::empty::<&str>(),
+                std::iter::empty::<&str>(),
+                512,
+            ),
+            ToolRisk::UsesNetwork,
+            ProviderToolVisibility::Visible,
+        );
+
+        let denied = ToolPermissionPolicy::deny_all();
+        assert_eq!(
+            denied.authorize(&definition),
+            ToolPermissionState::Denied,
+            "network risk must not be allowed by default"
+        );
+
+        let allowed = ToolPermissionPolicy::deny_all().with_network_execution(&["fetch_url"]);
+        assert_eq!(allowed.authorize(&definition), ToolPermissionState::Allowed);
+        assert!(allowed.allows_provider_advertising(&definition));
+    }
+
+    fn capability_fixture_tool(name: &str, risk: ToolRisk) -> ToolDefinition {
+        ToolDefinition::extension_tool_with_version(
+            "capability-fixture",
+            Some(String::from("1.0.0")),
+            String::from(name),
+            String::from("Fetch a URL."),
+            ToolInputSchema::string_object(["url"], Vec::<String>::new(), 1024),
+            risk,
+            ProviderToolVisibility::Visible,
+        )
+    }
+
+    #[test]
+    fn extension_network_and_process_risks_are_provider_advertisable() {
+        let network = project_provider_advertised_tool(&capability_fixture_tool(
+            "fetch_url",
+            ToolRisk::UsesNetwork,
+        ));
+        assert!(
+            network.is_ok(),
+            "allowlisted network risk must advertise: {network:?}"
+        );
+        let Ok(network) = network else {
+            return;
+        };
+        assert_eq!(network.name, "fetch_url");
+
+        let process = project_provider_advertised_tool(&capability_fixture_tool(
+            "run_helper",
+            ToolRisk::RunsProcess,
+        ));
+        assert!(
+            process.is_ok(),
+            "allowlisted process risk must advertise: {process:?}"
+        );
+
+        assert_eq!(
+            project_provider_advertised_tool(&capability_fixture_tool(
+                "fixture_echo",
+                ToolRisk::FixtureSafe,
+            )),
+            Err(ProviderToolAdvertisingError::UnsupportedRisk {
+                name: String::from("fixture_echo"),
+                risk: ToolRisk::FixtureSafe,
+            })
+        );
     }
 }

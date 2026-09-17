@@ -40,6 +40,8 @@ fn lifecycle_action_verb(action: ExtensionLifecycleAction) -> &'static str {
     match action {
         ExtensionLifecycleAction::Stop => "stopping",
         ExtensionLifecycleAction::Reload => "reloading",
+        ExtensionLifecycleAction::Trust => "granting",
+        ExtensionLifecycleAction::Revoke => "revoking",
     }
 }
 
@@ -102,6 +104,8 @@ fn render_extension_diagnostic_record(record: &ExtensionDiagnosticRecord) -> Str
         .unwrap_or(record.package_root.as_str());
     let provider_visible_tools = extension_tool_names_label(&record.provider_visible_tools);
     let registered_tools = extension_tool_names_label(&record.registered_tools);
+    let capabilities = extension_capability_names_label(record.capabilities.as_deref());
+    let capability_grant = extension_capability_names_label(record.capability_grant.as_deref());
     let error = record
         .last_error_kind
         .as_deref()
@@ -111,7 +115,7 @@ fn render_extension_diagnostic_record(record: &ExtensionDiagnosticRecord) -> Str
         })
         .unwrap_or_default();
     format!(
-        "{id} state={} generation={} version={} scope={} selector={} provider_visible_tools={} registered_tools={}{}",
+        "{id} state={} generation={} version={} scope={} selector={} provider_visible_tools={} registered_tools={} capabilities={} capability_grant={}{}",
         record.activation_state,
         record.generation,
         version,
@@ -119,6 +123,8 @@ fn render_extension_diagnostic_record(record: &ExtensionDiagnosticRecord) -> Str
         selector,
         provider_visible_tools,
         registered_tools,
+        capabilities,
+        capability_grant,
         error
     )
 }
@@ -128,6 +134,14 @@ fn extension_tool_names_label(names: &[String]) -> String {
         String::from("none")
     } else {
         names.join(",")
+    }
+}
+
+fn extension_capability_names_label(names: Option<&[String]>) -> String {
+    match names {
+        None => String::from("unknown"),
+        Some([]) => String::from("none"),
+        Some(names) => names.join(","),
     }
 }
 
@@ -3397,7 +3411,10 @@ impl App {
                 return;
             }
             SlashParseResult::Command(
-                SlashAction::ExtensionStop | SlashAction::ExtensionReload,
+                SlashAction::ExtensionStop
+                | SlashAction::ExtensionReload
+                | SlashAction::ExtensionTrust
+                | SlashAction::ExtensionRevoke,
             ) => {
                 self.clear_input();
                 self.status_message = String::from("extension selector required");
@@ -3433,6 +3450,20 @@ impl App {
                 args,
             } => {
                 self.submit_extension_lifecycle(ExtensionLifecycleAction::Reload, &args);
+                return;
+            }
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::ExtensionTrust,
+                args,
+            } => {
+                self.submit_extension_lifecycle(ExtensionLifecycleAction::Trust, &args);
+                return;
+            }
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::ExtensionRevoke,
+                args,
+            } => {
+                self.submit_extension_lifecycle(ExtensionLifecycleAction::Revoke, &args);
                 return;
             }
             SlashParseResult::CommandWithArgs {
@@ -7048,6 +7079,48 @@ mod tests {
     }
 
     #[test]
+    fn extension_trust_command_emits_lifecycle_request_when_supported() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(extension_lifecycle_connected_event());
+        app.set_prompt_text("/extension-trust example.toy-tools");
+
+        app.submit_input();
+
+        assert_eq!(app.status_message, "granting extension example.toy-tools");
+        assert!(app.prompt.is_empty());
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ExtensionLifecycleRequested {
+                request_id: String::from("extension-lifecycle-request-0"),
+                action: ExtensionLifecycleAction::Trust,
+                selector: String::from("example.toy-tools"),
+            })
+        );
+    }
+
+    #[test]
+    fn extension_revoke_command_emits_lifecycle_request_when_supported() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(extension_lifecycle_connected_event());
+        app.set_prompt_text("/extension-revoke example.toy-tools");
+
+        app.submit_input();
+
+        assert_eq!(app.status_message, "revoking extension example.toy-tools");
+        assert!(app.prompt.is_empty());
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::ExtensionLifecycleRequested {
+                request_id: String::from("extension-lifecycle-request-0"),
+                action: ExtensionLifecycleAction::Revoke,
+                selector: String::from("example.toy-tools"),
+            })
+        );
+    }
+
+    #[test]
     fn extension_lifecycle_finish_updates_status_for_pending_request() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
@@ -7126,6 +7199,8 @@ mod tests {
                 last_error_summary: None,
                 registered_tools: vec![String::from("toy_tool")],
                 provider_visible_tools: vec![String::from("toy_tool")],
+                capabilities: None,
+                capability_grant: None,
             }],
             message: None,
         });
@@ -7149,6 +7224,59 @@ mod tests {
             last_entry
                 .content
                 .contains("provider_visible_tools=toy_tool")
+        );
+    }
+
+    fn capability_diagnostic_record(
+        capabilities: Option<Vec<String>>,
+        capability_grant: Option<Vec<String>>,
+    ) -> ExtensionDiagnosticRecord {
+        ExtensionDiagnosticRecord {
+            id: Some(String::from("capability.network-fixture")),
+            version: Some(String::from("1.0.0")),
+            scope: String::from("user"),
+            package_root: String::from("/tmp/yach-capability-fixture"),
+            manifest_path: Some(String::from(
+                "/tmp/yach-capability-fixture/yach.extension.json",
+            )),
+            source_ref: Some(String::from("test-package-root")),
+            install_source: Some(String::from("./ext")),
+            activation_state: String::from("discovered"),
+            generation: 0,
+            last_error_kind: None,
+            last_error_summary: None,
+            registered_tools: Vec::new(),
+            provider_visible_tools: Vec::new(),
+            capabilities,
+            capability_grant,
+        }
+    }
+
+    #[test]
+    fn tui_diagnostics_report_declared_network_capability_and_grant_state() {
+        let line = super::render_extension_diagnostic_record(&capability_diagnostic_record(
+            Some(vec![String::from("uses_network")]),
+            Some(Vec::new()),
+        ));
+        assert!(
+            line.contains("capabilities=uses_network"),
+            "declared capabilities must be visible: {line}"
+        );
+        assert!(
+            line.contains("capability_grant=none"),
+            "grant state must be visible: {line}"
+        );
+    }
+
+    #[test]
+    fn tui_diagnostics_report_no_capabilities_for_a_file_scoped_extension() {
+        let line = super::render_extension_diagnostic_record(&capability_diagnostic_record(
+            Some(Vec::new()),
+            Some(Vec::new()),
+        ));
+        assert!(
+            line.contains("capabilities=none"),
+            "a file-scoped extension requests nothing: {line}"
         );
     }
 

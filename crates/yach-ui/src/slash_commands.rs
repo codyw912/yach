@@ -15,6 +15,8 @@ pub enum SlashAction {
     Edit,
     ExtensionStop,
     ExtensionReload,
+    ExtensionTrust,
+    ExtensionRevoke,
     ExtensionStatus,
     Help,
 }
@@ -99,6 +101,16 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/extension-reload",
         description: "Reload a discovered extension",
         action: SlashAction::ExtensionReload,
+    },
+    SlashCommand {
+        name: "/extension-trust",
+        description: "Approve an extension's declared capabilities",
+        action: SlashAction::ExtensionTrust,
+    },
+    SlashCommand {
+        name: "/extension-revoke",
+        description: "Remove an extension's capability grant",
+        action: SlashAction::ExtensionRevoke,
     },
     SlashCommand {
         name: "/extension-status",
@@ -201,6 +213,8 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
             command.action,
             SlashAction::ExtensionStop
                 | SlashAction::ExtensionReload
+                | SlashAction::ExtensionTrust
+                | SlashAction::ExtensionRevoke
                 | SlashAction::ExtensionStatus
                 | SlashAction::Compact
                 | SlashAction::Approval
@@ -244,6 +258,8 @@ mod tests {
             "/perf",
             "/debug-edit",
             "/extension-stop",
+            "/extension-trust",
+            "/extension-revoke",
             "/extension-reload",
             "/extension-status",
             "/help",
@@ -360,6 +376,28 @@ mod tests {
             parse_slash_command("/extension-reload example.toy-tools"),
             SlashParseResult::CommandWithArgs {
                 action: SlashAction::ExtensionReload,
+                args: String::from("example.toy-tools"),
+            }
+        );
+    }
+
+    #[test]
+    fn parser_accepts_extension_trust_selector_argument() {
+        assert_eq!(
+            parse_slash_command("/extension-trust example.toy-tools"),
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::ExtensionTrust,
+                args: String::from("example.toy-tools"),
+            }
+        );
+    }
+
+    #[test]
+    fn parser_accepts_extension_revoke_selector_argument() {
+        assert_eq!(
+            parse_slash_command("/extension-revoke example.toy-tools"),
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::ExtensionRevoke,
                 args: String::from("example.toy-tools"),
             }
         );

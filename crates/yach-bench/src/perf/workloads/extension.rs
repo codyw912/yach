@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use yach_backend::{
     DenyExtensionResources, ExtensionHostClientMessage, ExtensionHostProtocolError,
     ExtensionHostServerMessage, ExtensionHostSession, ExtensionHostTransport,
-    ExtensionToolResultStatus, ExtensionToolRisk, ToolInputSchema, ToolRegistry,
+    ExtensionToolContribution, ExtensionToolResultStatus, ExtensionToolRisk, ToolInputSchema,
+    ToolRegistry,
 };
 
 use crate::perf::registry::{Measured, Workload};
@@ -87,7 +88,17 @@ fn sample_extension_runtime_profile() -> io::Result<ExtensionRuntimeProfileSampl
 
     let activation_started = Instant::now();
     session
-        .initialize_and_register(&mut registry, None, 1, Duration::from_secs(1))
+        .initialize_and_register(
+            &mut registry,
+            None,
+            &[ExtensionToolContribution {
+                name: String::from("profile_toy_tool"),
+                description: String::from("Return static fixture metadata."),
+                risk: ExtensionToolRisk::ReadsLocalMetadata,
+                provider_visible: true,
+            }],
+            Duration::from_secs(1),
+        )
         .map_err(|error| extension_profile_io_error(&error))?;
     let host_activation = activation_started.elapsed();
 

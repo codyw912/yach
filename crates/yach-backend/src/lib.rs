@@ -22,6 +22,7 @@ mod edit_harness;
 pub mod edit_profile;
 mod error_dialect;
 mod extension;
+mod extension_capability;
 mod extension_install;
 mod permission;
 mod provider;
@@ -62,6 +63,7 @@ pub use error_dialect::{
     parse_retry_after_ms, select_error_dialect,
 };
 pub use extension::*;
+pub use extension_capability::*;
 pub use extension_install::*;
 pub use permission::*;
 pub use provider::*;
@@ -4416,33 +4418,10 @@ mod tests {
             ToolInputSchema::string_object(["label"], std::iter::empty::<&str>(), 512),
             ProviderToolVisibility::Hidden,
         );
-        let unsupported = ToolDefinition {
-            name: String::from("process_tool"),
-            description: String::from("Attempts to run a process."),
-            input_schema: ToolInputSchema::string_object(
-                ["label"],
-                std::iter::empty::<&str>(),
-                512,
-            ),
-            risk: ToolRisk::RunsProcess,
-            owner: ToolOwner::Extension {
-                extension_id: String::from("example.toy-tools"),
-                extension_version: None,
-            },
-            provider_visibility: ProviderToolVisibility::Hidden,
-        };
-
         assert_eq!(
             registry.register_extension_tool(colliding),
             Err(ToolRegistrationError::DuplicateToolName {
                 name: String::from("project_path_info")
-            })
-        );
-        assert_eq!(
-            registry.register_extension_tool(unsupported),
-            Err(ToolRegistrationError::UnsupportedRisk {
-                name: String::from("process_tool"),
-                risk: ToolRisk::RunsProcess,
             })
         );
     }

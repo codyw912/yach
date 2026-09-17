@@ -17,6 +17,9 @@ use std::os::unix::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::extension_capability::{
+    ExtensionCapability, ExtensionCapabilityGrantStatus, load_grant, requested_capabilities,
+};
 use crate::extension_install::ExtensionInstallRecord;
 use crate::{
     ExtensionStaticContextFile, ProviderToolVisibility, ResolvedToolCatalog,
@@ -81,6 +84,12 @@ pub enum ExtensionToolRisk {
     ReadsLocalMetadata,
     ReadsLocalContent,
     MutatesLocalState,
+    /// Declares that the tool contacts the network. A declaration the user
+    /// grants at activation; it is not enforced. See
+    /// docs/project/specs/2026-09-16-extension-capability-contract-design.md.
+    UsesNetwork,
+    /// Declares that the tool runs a process.
+    RunsProcess,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionToolReplacementContract {
@@ -171,6 +180,8 @@ impl From<ExtensionToolRisk> for ToolRisk {
             ExtensionToolRisk::ReadsLocalMetadata => Self::ReadsLocalMetadata,
             ExtensionToolRisk::ReadsLocalContent => Self::ReadsLocalContent,
             ExtensionToolRisk::MutatesLocalState => Self::MutatesLocalState,
+            ExtensionToolRisk::UsesNetwork => Self::UsesNetwork,
+            ExtensionToolRisk::RunsProcess => Self::RunsProcess,
         }
     }
 }
@@ -197,10 +208,22 @@ pub enum ExtensionHostProtocolError {
     UnsupportedRisk,
     UnsupportedSchema,
     SpawnFailed,
-    HostExited { status: Option<i32> },
+    HostExited {
+        status: Option<i32>,
+    },
     TimedOut,
-    OutputTooLarge { max_bytes: usize },
+    OutputTooLarge {
+        max_bytes: usize,
+    },
     ToolRegistration(ToolRegistrationError),
+    UndeclaredTool {
+        name: String,
+    },
+    ToolRiskMismatch {
+        name: String,
+        declared: ExtensionToolRisk,
+        registered: ExtensionToolRisk,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -617,6 +640,11 @@ pub struct ExtensionActivationDiagnostic {
     pub last_error_summary: Option<String>,
     pub registered_tools: Vec<String>,
     pub provider_visible_tools: Vec<String>,
+    /// `None` means the manifest was not available, so capabilities are
+    /// unknown. `Some` is the set derived from declared tool contributions;
+    /// empty means the extension requests none.
+    pub requested_capabilities: Option<BTreeSet<ExtensionCapability>>,
+    pub capability_grant: ExtensionCapabilityGrantStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -855,6 +883,11 @@ impl ExtensionActivationSnapshot {
             self.diagnostics.push(diagnostic.clone());
             return diagnostic;
         }
+        if let Some(reason) = capability_block_reason(&record.manifest) {
+            diagnostic.mark_blocked(ExtensionActivationErrorKind::PolicyBlocked, &reason);
+            self.diagnostics.push(diagnostic.clone());
+            return diagnostic;
+        }
 
         self.host_start_count = self.host_start_count.saturating_add(1);
         let mut registry = self.registry.clone();
@@ -1002,6 +1035,12 @@ impl ExtensionActivationDiagnostic {
             last_error_summary,
             registered_tools: Vec::new(),
             provider_visible_tools: Vec::new(),
+            requested_capabilities: Some(requested_capabilities(
+                &record.manifest.contributes.tools,
+            )),
+            capability_grant: ExtensionCapabilityGrantStatus::from_loaded(load_grant(
+                &record.manifest.id.0,
+            )),
         }
     }
 
@@ -1031,6 +1070,8 @@ impl ExtensionActivationDiagnostic {
             last_error_summary,
             registered_tools: Vec::new(),
             provider_visible_tools: Vec::new(),
+            requested_capabilities: None,
+            capability_grant: ExtensionCapabilityGrantStatus::Unknown,
         }
     }
 
@@ -1113,6 +1154,43 @@ impl ExtensionActivationDiagnostic {
     }
 }
 
+/// The reason activation must be refused, or `None` when the manifest's
+/// requested capabilities are covered by a recorded grant.
+///
+/// Both activation entry points call this before spawning a host. Keeping
+/// it in one place is the point: a second copy is how `/extension-reload`
+/// would drift into bypassing the contract.
+fn capability_block_reason(manifest: &ExtensionManifest) -> Option<String> {
+    capability_block_reason_with_grant(
+        manifest,
+        crate::extension_capability::load_grant(&manifest.id.0).as_ref(),
+    )
+}
+
+fn capability_block_reason_with_grant(
+    manifest: &ExtensionManifest,
+    grant: Option<&crate::extension_capability::ExtensionCapabilityGrant>,
+) -> Option<String> {
+    let requested =
+        crate::extension_capability::requested_capabilities(&manifest.contributes.tools);
+    if requested.is_empty() {
+        return None;
+    }
+    let missing = crate::extension_capability::missing_capabilities(&requested, grant);
+    if missing.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = missing
+        .iter()
+        .map(crate::extension_capability::ExtensionCapability::as_str)
+        .collect();
+    Some(format!(
+        "extension requests ungranted capabilities: {}. Grant with `/extension-trust {}`.",
+        names.join(", "),
+        manifest.id.0
+    ))
+}
+
 pub fn activate_background_metadata_extensions(
     package_records: &[ExtensionPackageRecord],
     config: ExtensionBackgroundActivationConfig,
@@ -1141,6 +1219,11 @@ pub fn activate_background_metadata_extensions(
             continue;
         }
         if record.manifest.contributes.tools.is_empty() {
+            snapshot.diagnostics.push(diagnostic);
+            continue;
+        }
+        if let Some(reason) = capability_block_reason(&record.manifest) {
+            diagnostic.mark_blocked(ExtensionActivationErrorKind::PolicyBlocked, &reason);
             snapshot.diagnostics.push(diagnostic);
             continue;
         }
@@ -1221,11 +1304,10 @@ fn activate_extension_host_record(
         transport,
         config.max_result_bytes,
     );
-    let expected_tool_count = record.manifest.contributes.tools.len();
     let registered_tools = session.initialize_and_register(
         registry,
         Some(&record.manifest.version),
-        expected_tool_count,
+        &record.manifest.contributes.tools,
         config.registration_timeout,
     )?;
     mark_extension_host(trace, "extension_host_ready", extension_id);
@@ -1259,7 +1341,9 @@ fn extension_host_activation_error(
         | ExtensionHostProtocolError::ExtensionIdMismatch
         | ExtensionHostProtocolError::RequestIdMismatch
         | ExtensionHostProtocolError::UnsupportedRisk
-        | ExtensionHostProtocolError::UnsupportedSchema => {
+        | ExtensionHostProtocolError::UnsupportedSchema
+        | ExtensionHostProtocolError::UndeclaredTool { .. }
+        | ExtensionHostProtocolError::ToolRiskMismatch { .. } => {
             ExtensionActivationErrorKind::ProtocolError
         }
     };
@@ -1280,6 +1364,8 @@ fn extension_host_protocol_error_label(error: &ExtensionHostProtocolError) -> &'
         ExtensionHostProtocolError::TimedOut => "timed_out",
         ExtensionHostProtocolError::OutputTooLarge { .. } => "output_too_large",
         ExtensionHostProtocolError::ToolRegistration(_) => "tool_registration",
+        ExtensionHostProtocolError::UndeclaredTool { .. } => "undeclared_tool",
+        ExtensionHostProtocolError::ToolRiskMismatch { .. } => "tool_risk_mismatch",
     }
 }
 
@@ -1677,9 +1763,28 @@ pub fn parse_extension_host_server_message(
     }
 }
 
+fn bind_registration_to_manifest(
+    declared_tools: &[ExtensionToolContribution],
+    name: String,
+    risk: ExtensionToolRisk,
+) -> Result<String, ExtensionHostProtocolError> {
+    let Some(declared) = declared_tools.iter().find(|tool| tool.name == name) else {
+        return Err(ExtensionHostProtocolError::UndeclaredTool { name });
+    };
+    if declared.risk != risk {
+        return Err(ExtensionHostProtocolError::ToolRiskMismatch {
+            name,
+            declared: declared.risk,
+            registered: risk,
+        });
+    }
+    Ok(name)
+}
+
 pub fn process_extension_registration_messages(
     expected_extension_id: &str,
     messages: Vec<serde_json::Value>,
+    declared_tools: &[ExtensionToolContribution],
     registry: &mut ToolRegistry,
 ) -> Result<Vec<String>, ExtensionHostProtocolError> {
     let mut ready = false;
@@ -1711,6 +1816,7 @@ pub fn process_extension_registration_messages(
                 if !ready {
                     return Err(ExtensionHostProtocolError::MissingReady);
                 }
+                let name = bind_registration_to_manifest(declared_tools, name, risk)?;
                 let definition = ToolDefinition::extension_tool_with_version(
                     expected_extension_id,
                     None::<String>,
@@ -1741,12 +1847,15 @@ pub fn process_extension_registration_messages(
 
     let mut staged_names = BTreeSet::new();
     for definition in &staged_definitions {
-        if registry.get(&definition.name).is_some() || !staged_names.insert(&definition.name) {
+        if !staged_names.insert(&definition.name) {
             return Err(ExtensionHostProtocolError::ToolRegistration(
                 ToolRegistrationError::DuplicateToolName {
                     name: definition.name.clone(),
                 },
             ));
+        }
+        if let Some(error) = registry.extension_tool_rejection(definition) {
+            return Err(ExtensionHostProtocolError::ToolRegistration(error));
         }
     }
 
@@ -1767,7 +1876,7 @@ where
         &mut self,
         registry: &mut ToolRegistry,
         extension_version: Option<&str>,
-        expected_tool_count: usize,
+        declared_tools: &[ExtensionToolContribution],
         timeout: Duration,
     ) -> Result<Vec<String>, ExtensionHostProtocolError> {
         self.transport
@@ -1797,7 +1906,8 @@ where
         }
 
         let mut registered_tools = Vec::new();
-        for _ in 0..expected_tool_count {
+        let mut staged_definitions = Vec::new();
+        for _ in 0..declared_tools.len() {
             let ExtensionHostServerMessage::ToolRegister {
                 name,
                 description,
@@ -1808,22 +1918,42 @@ where
             else {
                 return Err(ExtensionHostProtocolError::Malformed);
             };
-            registry
-                .register_extension_tool(ToolDefinition::extension_tool_with_version(
-                    &self.extension_id,
-                    extension_version.map(String::from),
-                    name.clone(),
-                    description,
-                    input_schema,
-                    risk.into(),
-                    if provider_visible {
-                        ProviderToolVisibility::Visible
-                    } else {
-                        ProviderToolVisibility::Hidden
-                    },
-                ))
-                .map_err(ExtensionHostProtocolError::ToolRegistration)?;
+            let name = bind_registration_to_manifest(declared_tools, name, risk)?;
+            let definition = ToolDefinition::extension_tool_with_version(
+                &self.extension_id,
+                extension_version.map(String::from),
+                name.clone(),
+                description,
+                input_schema,
+                risk.into(),
+                if provider_visible {
+                    ProviderToolVisibility::Visible
+                } else {
+                    ProviderToolVisibility::Hidden
+                },
+            );
+            staged_definitions.push(definition);
             registered_tools.push(name);
+        }
+
+        let mut staged_names = BTreeSet::new();
+        for definition in &staged_definitions {
+            if !staged_names.insert(&definition.name) {
+                return Err(ExtensionHostProtocolError::ToolRegistration(
+                    ToolRegistrationError::DuplicateToolName {
+                        name: definition.name.clone(),
+                    },
+                ));
+            }
+            if let Some(error) = registry.extension_tool_rejection(definition) {
+                return Err(ExtensionHostProtocolError::ToolRegistration(error));
+            }
+        }
+
+        for definition in staged_definitions {
+            registry
+                .register_extension_tool(definition)
+                .map_err(ExtensionHostProtocolError::ToolRegistration)?;
         }
 
         Ok(registered_tools)
@@ -1933,6 +2063,7 @@ where
 pub fn run_extension_host_registration_command(
     extension_id: &str,
     command: &ExtensionHostCommand,
+    declared_tools: &[ExtensionToolContribution],
     registry: &mut ToolRegistry,
 ) -> Result<Vec<String>, ExtensionHostProtocolError> {
     let max_stdout_bytes = command.max_stdout_bytes;
@@ -2000,7 +2131,12 @@ pub fn run_extension_host_registration_command(
         if exited_successfully && let Some(bytes) = stdout_bytes {
             join_stdout_reader(stdout_reader);
             let messages = parse_extension_host_stdout_jsonl(bytes)?;
-            return process_extension_registration_messages(extension_id, messages, registry);
+            return process_extension_registration_messages(
+                extension_id,
+                messages,
+                declared_tools,
+                registry,
+            );
         }
 
         if started_at.elapsed() >= timeout {
@@ -2462,6 +2598,8 @@ fn parse_tool_risk(risk: String) -> Result<ExtensionToolRisk, ExtensionManifestE
         "reads_local_metadata" => Ok(ExtensionToolRisk::ReadsLocalMetadata),
         "reads_local_content" => Ok(ExtensionToolRisk::ReadsLocalContent),
         "mutates_local_state" => Ok(ExtensionToolRisk::MutatesLocalState),
+        "uses_network" => Ok(ExtensionToolRisk::UsesNetwork),
+        "runs_process" => Ok(ExtensionToolRisk::RunsProcess),
         _ => Err(ExtensionManifestError::UnsupportedToolRisk { risk }),
     }
 }
@@ -2558,7 +2696,7 @@ fn is_valid_process_command(command: &str) -> bool {
     !command.is_empty() && !command.chars().any(char::is_whitespace)
 }
 
-fn is_valid_extension_id(id: &str) -> bool {
+pub(crate) fn is_valid_extension_id(id: &str) -> bool {
     !id.is_empty()
         && id.split('.').all(|part| {
             !part.is_empty()
@@ -2667,6 +2805,35 @@ mod tests {
                     "provider_visible": true
                 }]
             }
+        })
+    }
+
+    fn unique_capability_gate_id(label: &str) -> Result<String, String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(format!(
+            "test.capability-gate.{label}-{}-{}",
+            std::process::id(),
+            now.as_nanos()
+        ))
+    }
+
+    fn post_first_paint_record_with_risk(
+        extension_id: &str,
+        risk: &str,
+    ) -> Result<ExtensionPackageRecord, String> {
+        let mut value = post_first_paint_toy_tool_manifest_json();
+        value["id"] = serde_json::json!(extension_id);
+        value["contributes"]["tools"][0]["risk"] = serde_json::json!(risk);
+        let manifest = parse_valid_manifest(value)?;
+        let package_root = PathBuf::from("/tmp/yach-capability-gate");
+        Ok(ExtensionPackageRecord {
+            manifest,
+            scope: ExtensionInstallScope::User,
+            package_root: package_root.clone(),
+            manifest_path: package_root.join("yach.extension.json"),
+            source_ref: Some(String::from("./extension")),
         })
     }
 
@@ -2910,6 +3077,33 @@ done
             provider_visible: true,
             input_schema: ToolInputSchema::string_object(
                 ["label"],
+                std::iter::empty::<&str>(),
+                512,
+            ),
+        }
+    }
+
+    fn declared_tool(name: &str, risk: ExtensionToolRisk) -> ExtensionToolContribution {
+        ExtensionToolContribution {
+            name: String::from(name),
+            description: String::from("fixture"),
+            risk,
+            provider_visible: true,
+        }
+    }
+
+    fn toy_tool_declared() -> ExtensionToolContribution {
+        declared_tool("toy_tool", ExtensionToolRisk::ReadsLocalMetadata)
+    }
+
+    fn register_message(name: &str, risk: ExtensionToolRisk) -> ExtensionHostServerMessage {
+        ExtensionHostServerMessage::ToolRegister {
+            name: String::from(name),
+            description: String::from("fixture"),
+            risk,
+            provider_visible: true,
+            input_schema: ToolInputSchema::string_object(
+                std::iter::empty::<&str>(),
                 std::iter::empty::<&str>(),
                 512,
             ),
@@ -3211,6 +3405,51 @@ done
                 risk: String::from("writes_local_files")
             })
         );
+    }
+
+    #[test]
+    fn manifest_parses_network_and_process_tool_risks() {
+        let manifest = serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "capability-fixture",
+            "version": "1.0.0",
+            "main": { "command": "fixture-host" },
+            "contributes": {
+                "tools": [
+                    {
+                        "name": "fetch_url",
+                        "description": "Fetch a URL.",
+                        "risk": "uses_network",
+                        "provider_visible": true
+                    },
+                    {
+                        "name": "run_helper",
+                        "description": "Run a helper process.",
+                        "risk": "runs_process",
+                        "provider_visible": true
+                    }
+                ]
+            }
+        });
+
+        let parsed = parse_extension_manifest(manifest);
+        assert!(parsed.is_ok(), "manifest should parse: {parsed:?}");
+        let Ok(manifest) = parsed else { return };
+        let risks: Vec<ExtensionToolRisk> = manifest
+            .contributes
+            .tools
+            .iter()
+            .map(|tool| tool.risk)
+            .collect();
+        assert_eq!(
+            risks,
+            vec![
+                ExtensionToolRisk::UsesNetwork,
+                ExtensionToolRisk::RunsProcess
+            ]
+        );
+        assert_eq!(ToolRisk::from(risks[0]), ToolRisk::UsesNetwork);
+        assert_eq!(ToolRisk::from(risks[1]), ToolRisk::RunsProcess);
     }
 
     #[test]
@@ -3717,7 +3956,12 @@ done
         let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registered = session
-            .initialize_and_register(&mut registry, Some("0.1.0"), 1, Duration::from_secs(1))
+            .initialize_and_register(
+                &mut registry,
+                Some("0.1.0"),
+                &[toy_tool_declared()],
+                Duration::from_secs(1),
+            )
             .map_err(|error| format!("{error:?}"))?;
         let response = session
             .invoke_tool(
@@ -3764,6 +4008,127 @@ done
                 "arguments": {"label":"fixture"}
             }),
         )
+    }
+
+    #[test]
+    fn a_host_cannot_register_a_tool_its_manifest_does_not_declare() {
+        // Consent is computed from the manifest, so a registration outside
+        // it would spend approval obtained for a different surface.
+        let declared = vec![declared_tool(
+            "read_thing",
+            ExtensionToolRisk::ReadsLocalContent,
+        )];
+        let transport = FakeExtensionHostTransport::new([
+            Ok(ready_message("capability-fixture")),
+            Ok(register_message(
+                "fetch_url",
+                ExtensionToolRisk::UsesNetwork,
+            )),
+        ]);
+        let mut session = ExtensionHostSession::new("capability-fixture", transport, 64 * 1024);
+        let mut registry = ToolRegistry::with_project_read_only_tools();
+
+        let result = session.initialize_and_register(
+            &mut registry,
+            Some("1.0.0"),
+            &declared,
+            Duration::from_secs(1),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ExtensionHostProtocolError::UndeclaredTool { ref name })
+                    if name == "fetch_url"
+            ),
+            "expected UndeclaredTool, got {result:?}"
+        );
+        assert!(
+            registry.get("fetch_url").is_none(),
+            "an undeclared tool must not reach the registry"
+        );
+    }
+
+    #[test]
+    fn a_host_cannot_register_a_declared_tool_with_a_different_risk() {
+        // The manifest says metadata; the host claims network. Accepting
+        // this would let an extension take a silent file-scoped activation
+        // and then hold network capability.
+        let declared = vec![declared_tool("peek", ExtensionToolRisk::ReadsLocalMetadata)];
+        let transport = FakeExtensionHostTransport::new([
+            Ok(ready_message("capability-fixture")),
+            Ok(register_message("peek", ExtensionToolRisk::UsesNetwork)),
+        ]);
+        let mut session = ExtensionHostSession::new("capability-fixture", transport, 64 * 1024);
+        let mut registry = ToolRegistry::with_project_read_only_tools();
+
+        let result = session.initialize_and_register(
+            &mut registry,
+            Some("1.0.0"),
+            &declared,
+            Duration::from_secs(1),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ExtensionHostProtocolError::ToolRiskMismatch {
+                    ref name,
+                    declared: ExtensionToolRisk::ReadsLocalMetadata,
+                    registered: ExtensionToolRisk::UsesNetwork,
+                }) if name == "peek"
+            ),
+            "expected ToolRiskMismatch, got {result:?}"
+        );
+        assert!(
+            registry.get("peek").is_none(),
+            "a risk-mismatched tool must not reach the registry"
+        );
+    }
+
+    #[test]
+    fn initialize_and_register_is_atomic_when_a_later_tool_mismatches_the_manifest() {
+        // UndeclaredTool and ToolRiskMismatch fail after parse, so they can
+        // reject mid-batch. Earlier tools from the same host must not remain
+        // registered.
+        let declared = vec![
+            declared_tool("read_thing", ExtensionToolRisk::ReadsLocalContent),
+            declared_tool("peek", ExtensionToolRisk::ReadsLocalMetadata),
+        ];
+        let transport = FakeExtensionHostTransport::new([
+            Ok(ready_message("capability-fixture")),
+            Ok(register_message(
+                "read_thing",
+                ExtensionToolRisk::ReadsLocalContent,
+            )),
+            Ok(register_message("peek", ExtensionToolRisk::UsesNetwork)),
+        ]);
+        let mut session = ExtensionHostSession::new("capability-fixture", transport, 64 * 1024);
+        let mut registry = ToolRegistry::with_project_read_only_tools();
+
+        let result = session.initialize_and_register(
+            &mut registry,
+            Some("1.0.0"),
+            &declared,
+            Duration::from_secs(1),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ExtensionHostProtocolError::ToolRiskMismatch { ref name, .. })
+                    if name == "peek"
+            ),
+            "expected ToolRiskMismatch, got {result:?}"
+        );
+        assert!(
+            registry.get("read_thing").is_none(),
+            "a later mismatch must not leave earlier tools registered"
+        );
+        assert!(
+            registry.get("peek").is_none(),
+            "a mismatched tool must not reach the registry"
+        );
     }
 
     #[test]
@@ -3892,7 +4257,12 @@ done
         let mut registry = ToolRegistry::with_project_read_only_tools();
 
         let registered = session
-            .initialize_and_register(&mut registry, None, 1, Duration::from_secs(1))
+            .initialize_and_register(
+                &mut registry,
+                None,
+                &[toy_tool_declared()],
+                Duration::from_secs(1),
+            )
             .map_err(|error| format!("{error:?}"))?;
         let response = session
             .invoke_tool(
@@ -4120,6 +4490,155 @@ done
     }
 
     #[test]
+    fn an_extension_requesting_network_without_a_grant_is_policy_blocked() -> Result<(), String> {
+        // The id is generated per run, so no grant for it can exist under any HOME.
+        let record = post_first_paint_record_with_risk(
+            &unique_capability_gate_id("network")?,
+            "uses_network",
+        )?;
+        let snapshot = activate_background_metadata_extensions(
+            std::slice::from_ref(&record),
+            ExtensionBackgroundActivationConfig::conservative(),
+            None,
+        );
+
+        if snapshot.host_start_count != 0 {
+            return Err(String::from(
+                "consent is checked before spawn, so no host may start",
+            ));
+        }
+        if snapshot.diagnostics.is_empty() {
+            return Err(String::from("expected an activation diagnostic"));
+        }
+        let Some(diagnostic) = snapshot.diagnostics.first() else {
+            return Ok(());
+        };
+        expect_equal(
+            &diagnostic.last_error_kind,
+            &Some(ExtensionActivationErrorKind::PolicyBlocked),
+        )?;
+        let Some(summary) = diagnostic.last_error_summary.as_deref() else {
+            return Err(format!(
+                "the diagnostic must name the missing capability: {diagnostic:?}"
+            ));
+        };
+        if !summary.contains("uses_network") {
+            return Err(format!(
+                "the diagnostic must name the missing capability: {diagnostic:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reloading_an_extension_cannot_bypass_the_capability_gate() -> Result<(), String> {
+        let record = post_first_paint_record_with_risk(
+            &unique_capability_gate_id("reload")?,
+            "uses_network",
+        )?;
+        let mut snapshot = ExtensionActivationSnapshot::default();
+        let before = snapshot.host_start_count;
+
+        let diagnostic = snapshot.reload_extension_from_record(
+            &record,
+            ExtensionBackgroundActivationConfig::conservative(),
+            None,
+        );
+
+        if snapshot.host_start_count != before {
+            return Err(String::from(
+                "reload must check consent before spawning a host",
+            ));
+        }
+        expect_equal(
+            &diagnostic.last_error_kind,
+            &Some(ExtensionActivationErrorKind::PolicyBlocked),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn capability_block_reason_clears_after_a_covering_grant() -> Result<(), String> {
+        let record = post_first_paint_record_with_risk(
+            &unique_capability_gate_id("grant-loop")?,
+            "uses_network",
+        )?;
+        let before = capability_block_reason_with_grant(&record.manifest, None);
+        if before.is_none() {
+            return Err(String::from(
+                "ungranted network tool must produce a block reason",
+            ));
+        }
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("{error:?}"))?;
+        let path = std::env::temp_dir().join(format!(
+            "yach-cap-block-{}-{}.json",
+            std::process::id(),
+            stamp.as_nanos()
+        ));
+        let stored = crate::extension_capability::grant_requested_at(
+            &path,
+            &record.manifest.version,
+            &record.manifest.contributes.tools,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        let Some(grant) = stored else {
+            let _ = fs::remove_file(&path);
+            return Err(String::from("network tool should produce a grant"));
+        };
+        let after = capability_block_reason_with_grant(&record.manifest, Some(&grant));
+        let revoked = crate::extension_capability::revoke_grant_at(&path);
+        let _ = fs::remove_file(&path);
+        revoked.map_err(|error| format!("{error:?}"))?;
+        if after.is_some() {
+            return Err(format!("covering grant must clear the block: {after:?}"));
+        }
+        let uncovered = capability_block_reason_with_grant(&record.manifest, None);
+        if uncovered.is_none() {
+            return Err(String::from("revoking must restore the block"));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_scoped_extension_activates_without_a_grant() -> Result<(), String> {
+        let package = TestPackageRoot::new("capability-gate-file-scoped")?;
+        package.write_json_file(
+            "yach.extension.json",
+            &post_first_paint_toy_tool_manifest_json(),
+        )?;
+        package.write_file("host.sh", &toy_extension_host_script())?;
+        let index = ExtensionManifestIndex::from_package_roots([ExtensionPackageRoot {
+            root: package.path.clone(),
+            scope: ExtensionInstallScope::User,
+            source_ref: Some(String::from("test-package-root")),
+        }])
+        .map_err(|error| format!("{error:?}"))?;
+
+        let snapshot = activate_background_metadata_extensions(
+            index.records(),
+            ExtensionBackgroundActivationConfig {
+                registration_timeout: Duration::from_secs(1),
+                invocation_timeout: Duration::from_secs(1),
+                max_stdout_line_bytes: 4096,
+                max_result_bytes: 4096,
+            },
+            None,
+        );
+        expect_equal(&snapshot.host_start_count, &1)?;
+        expect_equal(&snapshot.diagnostics.len(), &1)?;
+        expect_equal(
+            &snapshot.diagnostics[0].activation_state,
+            &ExtensionActivationState::Active,
+        )?;
+        expect_equal(&snapshot.diagnostics[0].last_error_kind, &None)?;
+        Ok(())
+    }
+
+    #[test]
     fn extension_host_session_categorizes_transport_failures() -> Result<(), String> {
         let mut timed_out = ExtensionHostSession::new(
             "example.toy-tools",
@@ -4152,11 +4671,21 @@ done
         let mut registry = ToolRegistry::with_project_read_only_tools();
 
         expect_equal(
-            &timed_out.initialize_and_register(&mut registry, None, 1, Duration::from_millis(1)),
+            &timed_out.initialize_and_register(
+                &mut registry,
+                None,
+                &[toy_tool_declared()],
+                Duration::from_millis(1),
+            ),
             &Err(ExtensionHostProtocolError::TimedOut),
         )?;
         expect_equal(
-            &exited.initialize_and_register(&mut registry, None, 1, Duration::from_millis(1)),
+            &exited.initialize_and_register(
+                &mut registry,
+                None,
+                &[toy_tool_declared()],
+                Duration::from_millis(1),
+            ),
             &Err(ExtensionHostProtocolError::HostExited { status: Some(7) }),
         )?;
         expect_equal(
@@ -4210,6 +4739,7 @@ done
                     }
                 }),
             ],
+            &[toy_tool_declared()],
             &mut registry,
         )
         .map_err(|error| format!("{error:?}"))?;
@@ -4270,6 +4800,7 @@ done
                 timeout: Duration::from_secs(1),
                 max_stdout_bytes: 4096,
             },
+            &[toy_tool_declared()],
             &mut registry,
         )
         .map_err(|error| format!("{error:?}"))?;
@@ -4340,6 +4871,7 @@ done
                     timeout: Duration::from_secs(1),
                     max_stdout_bytes: 4096,
                 },
+                &[toy_tool_declared()],
                 &mut registry,
             )
             .map_err(|error| format!("{error:?}"))?;
@@ -4364,6 +4896,7 @@ done
                 timeout: Duration::from_secs(1),
                 max_stdout_bytes: 4096,
             },
+            &[toy_tool_declared()],
             &mut exited_registry,
         );
         assert_eq!(
@@ -4380,6 +4913,7 @@ done
                 timeout: Duration::from_millis(20),
                 max_stdout_bytes: 4096,
             },
+            &[toy_tool_declared()],
             &mut timed_out_registry,
         );
         assert_eq!(timed_out, Err(ExtensionHostProtocolError::TimedOut));
@@ -4393,6 +4927,7 @@ done
                 timeout: Duration::from_secs(1),
                 max_stdout_bytes: 4096,
             },
+            &[toy_tool_declared()],
             &mut malformed_registry,
         );
         assert_eq!(malformed, Err(ExtensionHostProtocolError::Malformed));
@@ -4414,6 +4949,7 @@ done
                 timeout: Duration::from_millis(200),
                 max_stdout_bytes: 4096,
             },
+            &[toy_tool_declared()],
             &mut registry,
         );
 
@@ -4440,6 +4976,7 @@ done
                 timeout: Duration::from_millis(50),
                 max_stdout_bytes: 4096,
             },
+            &[toy_tool_declared()],
             &mut registry,
         );
 
@@ -4464,6 +5001,7 @@ done
                 timeout: Duration::from_millis(100),
                 max_stdout_bytes: 4,
             },
+            &[toy_tool_declared()],
             &mut registry,
         );
 
@@ -4503,6 +5041,7 @@ done
                     }
                 }),
             ],
+            &[toy_tool_declared()],
             &mut registry,
         );
 
@@ -4545,7 +5084,7 @@ done
                     "type": "tool.register",
                     "name": "unsafe_tool",
                     "description": "Attempts unsupported access.",
-                    "risk": "uses_network",
+                    "risk": "writes_local_files",
                     "provider_visible": false,
                     "input_schema": {
                         "type": "object",
@@ -4558,6 +5097,7 @@ done
                     }
                 }),
             ],
+            &[toy_tool_declared()],
             &mut registry,
         );
 
@@ -4567,6 +5107,71 @@ done
         );
         assert!(registry.get("toy_tool").is_none());
     }
+
+    #[test]
+    fn extension_host_registration_is_atomic_when_a_later_tool_mismatches_the_manifest() {
+        // UndeclaredTool and ToolRiskMismatch fail after parse, so they can
+        // reject mid-batch. Earlier tools from the same host must not remain
+        // registered.
+        let mut registry = ToolRegistry::with_project_read_only_tools();
+        let declared = vec![
+            declared_tool("read_thing", ExtensionToolRisk::ReadsLocalContent),
+            declared_tool("peek", ExtensionToolRisk::ReadsLocalMetadata),
+        ];
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["label"],
+            "properties": { "label": { "type": "string" } },
+            "maxSerializedBytes": 512
+        });
+        let registration = process_extension_registration_messages(
+            "capability-fixture",
+            vec![
+                serde_json::json!({
+                    "type": "extension.ready",
+                    "protocol": "yach.extension-host.v2",
+                    "extension_id": "capability-fixture"
+                }),
+                serde_json::json!({
+                    "type": "tool.register",
+                    "name": "read_thing",
+                    "description": "fixture",
+                    "risk": "reads_local_content",
+                    "provider_visible": true,
+                    "input_schema": schema
+                }),
+                serde_json::json!({
+                    "type": "tool.register",
+                    "name": "peek",
+                    "description": "fixture",
+                    "risk": "uses_network",
+                    "provider_visible": true,
+                    "input_schema": schema
+                }),
+            ],
+            &declared,
+            &mut registry,
+        );
+
+        assert!(
+            matches!(
+                registration,
+                Err(ExtensionHostProtocolError::ToolRiskMismatch { ref name, .. })
+                    if name == "peek"
+            ),
+            "expected ToolRiskMismatch, got {registration:?}"
+        );
+        assert!(
+            registry.get("read_thing").is_none(),
+            "a later mismatch must not leave earlier tools registered"
+        );
+        assert!(
+            registry.get("peek").is_none(),
+            "a mismatched tool must not reach the registry"
+        );
+    }
+
     #[test]
     fn extension_host_registration_accepts_read_and_mutating_tools() -> Result<(), String> {
         let mut registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
@@ -4603,6 +5208,10 @@ done
                     "provider_visible": true,
                     "input_schema": schema("patch")
                 }),
+            ],
+            &[
+                declared_tool("hashline_read", ExtensionToolRisk::ReadsLocalContent),
+                declared_tool("hashline_edit", ExtensionToolRisk::MutatesLocalState),
             ],
             &mut registry,
         )
@@ -4644,6 +5253,7 @@ done
                     "maxSerializedBytes": 512
                 }
             })],
+            &[toy_tool_declared()],
             &mut registry,
         );
 
@@ -4662,6 +5272,7 @@ done
                 "protocol": "yach.extension-host.v1",
                 "extension_id": "example.toy-tools"
             })],
+            &[toy_tool_declared()],
             &mut registry,
         );
 
@@ -4682,6 +5293,7 @@ done
                 "protocol": "yach.extension-host.v2",
                 "extension_id": "example.other-tools"
             })],
+            &[toy_tool_declared()],
             &mut registry,
         );
 
@@ -4707,7 +5319,7 @@ done
                     "type": "tool.register",
                     "name": "toy_tool",
                     "description": "Return static fixture metadata.",
-                    "risk": "uses_network",
+                    "risk": "writes_local_files",
                     "provider_visible": false,
                     "input_schema": {
                         "type": "object",
@@ -4720,6 +5332,7 @@ done
                     }
                 }),
             ],
+            &[toy_tool_declared()],
             &mut registry,
         );
 

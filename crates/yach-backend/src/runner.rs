@@ -4810,6 +4810,58 @@ struct ProviderContinuationTraceInput<'a> {
 /// 3-strike circuit breaker for the same summarize-refill loop).
 const MID_TURN_COMPACTIONS_MAX: u32 = 3;
 
+/// Build the turn's permission policy from the built-in tools plus whatever
+/// extension tools are active.
+///
+/// An extension tool only appears in `active_extension_tool_names` when its
+/// activation diagnostic is `Active`, and activation refuses an extension
+/// whose declared capabilities are not granted. The user's consent is
+/// therefore already established for every name reaching this function.
+/// Omitting a risk here would leave a granted tool registered but hidden from
+/// the model and denied on call.
+fn turn_permission_policy(
+    registry: &ToolRegistry,
+    active_extension_tool_names: &[&str],
+) -> ToolPermissionPolicy {
+    let mut metadata_tool_names = vec![String::from("project_path_info")];
+    let mut content_tool_names = vec![
+        String::from("read_text_file"),
+        String::from("search_project"),
+        String::from("list_project_paths"),
+    ];
+    let mut edit_tool_names = vec![
+        String::from("edit_text_file"),
+        String::from("create_text_file"),
+    ];
+    let mut network_tool_names: Vec<String> = Vec::new();
+    let mut process_tool_names = vec![String::from("bash")];
+    for name in active_extension_tool_names {
+        let Some(definition) = registry.get(name) else {
+            continue;
+        };
+        match definition.risk {
+            ToolRisk::ReadsLocalMetadata => metadata_tool_names.push((*name).to_owned()),
+            ToolRisk::ReadsLocalContent => content_tool_names.push((*name).to_owned()),
+            ToolRisk::MutatesLocalState => edit_tool_names.push((*name).to_owned()),
+            ToolRisk::UsesNetwork => network_tool_names.push((*name).to_owned()),
+            ToolRisk::RunsProcess => process_tool_names.push((*name).to_owned()),
+            ToolRisk::FixtureSafe => {}
+        }
+    }
+    ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+        metadata_tool_names,
+        content_tool_names,
+        edit_tool_names,
+    )
+    .with_process_tools(process_tool_names)
+    .with_network_execution(
+        &network_tool_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    )
+}
+
 async fn run_native_provider_one_agent_tool_round(
     requester: &mut impl ProviderRequester,
     round: ProviderAgentToolRound<'_>,
@@ -4839,34 +4891,7 @@ async fn run_native_provider_one_agent_tool_round(
     } = round;
     let registry = extension_activation_snapshot.registry.clone();
     let active_extension_tool_names = extension_activation_snapshot.active_tool_names();
-    let mut metadata_tool_names = vec![String::from("project_path_info")];
-    let mut content_tool_names = vec![
-        String::from("read_text_file"),
-        String::from("search_project"),
-        String::from("list_project_paths"),
-    ];
-    let mut edit_tool_names = vec![
-        String::from("edit_text_file"),
-        String::from("create_text_file"),
-    ];
-    for name in &active_extension_tool_names {
-        let Some(definition) = registry.get(name) else {
-            continue;
-        };
-        match definition.risk {
-            ToolRisk::ReadsLocalMetadata => metadata_tool_names.push((*name).to_owned()),
-            ToolRisk::ReadsLocalContent => content_tool_names.push((*name).to_owned()),
-            ToolRisk::MutatesLocalState => edit_tool_names.push((*name).to_owned()),
-            ToolRisk::FixtureSafe | ToolRisk::UsesNetwork | ToolRisk::RunsProcess => {}
-        }
-    }
-    let permission_policy =
-        ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
-            metadata_tool_names,
-            content_tool_names,
-            edit_tool_names,
-        )
-        .with_process_tools(["bash"]);
+    let permission_policy = turn_permission_policy(&registry, &active_extension_tool_names);
     let mut routable_tool_names = vec![
         String::from("project_path_info"),
         String::from("read_text_file"),
@@ -9653,7 +9678,7 @@ mod tests {
         run_native_provider_one_tool_round_with_registry, send_native_initial_state,
         send_native_model_state, send_native_models, send_native_models_with_catalog,
         send_native_session_messages_from_log, send_native_session_stats_from_log,
-        switch_native_session, wait_for_command_review_decision,
+        switch_native_session, turn_permission_policy, wait_for_command_review_decision,
     };
 
     fn model_activation(
@@ -9695,8 +9720,8 @@ mod tests {
         StaticContextItem, StaticContextPlacement, StaticContextPriority, StaticContextSource,
         ToolContinuationPolicy, ToolDefinition, ToolInputSchema, ToolOutcome, ToolPayloadSummary,
         ToolPermissionPolicy, ToolPermissionState, ToolRegistry, ToolReplacementPolicy,
-        ToolReplacementRule, ToolReplacementSource, ToolRequestId, ToolResolutionMode, TurnId,
-        TurnOutcome, completed_text_exchange, parse_provider_tool_advertising_extensions,
+        ToolReplacementRule, ToolReplacementSource, ToolRequestId, ToolResolutionMode, ToolRisk,
+        TurnId, TurnOutcome, completed_text_exchange, parse_provider_tool_advertising_extensions,
         sha256_hex_for_test,
     };
 
@@ -10041,6 +10066,8 @@ mod tests {
                     last_error_summary: None,
                     registered_tools: vec![String::from("toy_tool")],
                     provider_visible_tools: vec![String::from("toy_tool")],
+                    requested_capabilities: None,
+                    capability_grant: crate::ExtensionCapabilityGrantStatus::Unknown,
                 }],
                 replacement_bundles: Vec::new(),
                 host_start_count: 1,
@@ -10103,6 +10130,8 @@ mod tests {
                     last_error_summary: None,
                     registered_tools: Vec::new(),
                     provider_visible_tools: Vec::new(),
+                    requested_capabilities: None,
+                    capability_grant: crate::ExtensionCapabilityGrantStatus::Unknown,
                 }],
                 replacement_bundles: Vec::new(),
                 host_start_count: 1,
@@ -18433,6 +18462,8 @@ mod tests {
                 last_error_summary: None,
                 registered_tools: vec![String::from("toy_tool")],
                 provider_visible_tools: vec![String::from("toy_tool")],
+                requested_capabilities: None,
+                capability_grant: crate::ExtensionCapabilityGrantStatus::Unknown,
             }],
             replacement_bundles: Vec::new(),
             host_start_count: 1,
@@ -32336,5 +32367,46 @@ manual anchored summary"
                 ..
             }) if *finished_turn == turn_id
         ));
+    }
+
+    #[test]
+    fn a_granted_network_extension_tool_is_advertised_and_allowed_in_a_turn() {
+        // A granted network tool used to be registered and then dropped when
+        // the turn policy was built, so the model never saw it and a call was
+        // denied. Consent was collected and then silently discarded.
+        let mut registry = ToolRegistry::with_project_read_only_tools();
+        let fetch = ToolDefinition::extension_tool_with_version(
+            "example.net",
+            Some(String::from("1.0.0")),
+            String::from("fetch_url"),
+            String::from("Fetch a URL."),
+            ToolInputSchema::string_object(["url"], Vec::<String>::new(), 1024),
+            ToolRisk::UsesNetwork,
+            ProviderToolVisibility::Visible,
+        );
+        let spawn = ToolDefinition::extension_tool_with_version(
+            "example.net",
+            Some(String::from("1.0.0")),
+            String::from("run_helper"),
+            String::from("Run a helper."),
+            ToolInputSchema::string_object(["cmd"], Vec::<String>::new(), 1024),
+            ToolRisk::RunsProcess,
+            ProviderToolVisibility::Visible,
+        );
+        assert!(registry.register_extension_tool(fetch.clone()).is_ok());
+        assert!(registry.register_extension_tool(spawn.clone()).is_ok());
+
+        let policy = turn_permission_policy(&registry, &["fetch_url", "run_helper"]);
+
+        assert_eq!(policy.authorize(&fetch), ToolPermissionState::Allowed);
+        assert!(policy.allows_provider_advertising(&fetch));
+        assert_eq!(policy.authorize(&spawn), ToolPermissionState::Allowed);
+        assert!(policy.allows_provider_advertising(&spawn));
+
+        // An extension tool absent from the active list stays unauthorized:
+        // the policy follows activation, not the registry.
+        let inactive = turn_permission_policy(&registry, &[]);
+        assert_eq!(inactive.authorize(&fetch), ToolPermissionState::Denied);
+        assert!(!inactive.allows_provider_advertising(&fetch));
     }
 }

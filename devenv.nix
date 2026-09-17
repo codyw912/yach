@@ -1,14 +1,6 @@
-{ pkgs, lib, config, inputs, ... }:
+{ pkgs, lib, config, ... }:
 
 {
-  imports = [
-    (inputs.nix-config + "/devenv/modules/devcontainer-sandbox.nix")
-  ];
-
-  devenv.root = lib.mkDefault (
-    if builtins.pathExists "/workspace" then "/workspace" else builtins.getEnv "PWD"
-  );
-
   # https://devenv.sh/basics/
   env = {
     CARGO_HOME = "${config.env.DEVENV_STATE}/cargo";
@@ -37,11 +29,16 @@
     samply
   ];
 
-  # Rust environment
+  # Rust environment.
+  #
+  # The toolchain version lives in `rust-toolchain.toml` so the contributor
+  # shell and CI resolve the same compiler from one file. `channel =
+  # "stable"` would instead resolve against whatever rust-overlay revision
+  # `devenv.yaml` happens to pin, which drifts from CI's floating `@stable`
+  # as the lock ages — this repository sat four releases behind that way.
   languages.rust = {
     enable = true;
-    channel = "stable";
-    components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ];
+    toolchainFile = ./rust-toolchain.toml;
     targets = [ ];
   };
 
@@ -51,13 +48,18 @@
 
   # https://devenv.sh/scripts/
   scripts = {
-    test.exec = "cargo test";
+    test-project.exec = "cargo test --workspace --locked";
     check.exec = "cargo check";
     build.exec = "cargo build";
     run.exec = "cargo run";
     fmt.exec = "cargo fmt";
     lint.exec = "cargo clippy";
   };
+
+  enterTest = "test-project";
+
+  # Keep the generated configuration regular and tracked for linked worktrees.
+  files.".pre-commit-config.yaml".copyMode = "copy";
 
   # https://devenv.sh/tasks/
   tasks = {
@@ -102,7 +104,7 @@
     echo "  - just      # list common recipes"
     echo "  - run      # cargo run"
     echo "  - build    # cargo build"
-    echo "  - test     # cargo test"
+    echo "  - test-project # cargo test --workspace --locked"
     echo "  - check    # cargo check"
     echo "  - fmt      # cargo fmt"
     echo "  - lint     # cargo clippy"

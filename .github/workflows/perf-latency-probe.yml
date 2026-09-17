@@ -47,9 +47,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      # toolchain-check: ignore
       # Pinned, not `@stable`: the development machine and the CCX23 pilot
-      # both measured with rust-stable-1.94.0, and `@stable` is now 1.98.1.
-      # Comparing hosts on different toolchains would confound the result.
+      # both measured with rust-stable-1.94.0. Comparing hosts on different
+      # toolchains would confound the result, so this pin must NOT track the
+      # repository toolchain and is exempt from `just toolchain-check`.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.94.0
 

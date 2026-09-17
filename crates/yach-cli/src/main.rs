@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -14,14 +14,16 @@ use yach_connections::{ConnectionId, CredentialError, CredentialStore, ProviderS
 
 use yach_backend::{
     BackendMetadata, CatalogModelEntry, DialectSelection, ExtensionActivationDiagnostic,
-    ExtensionActivationErrorKind, ExtensionActivationState, ExtensionInstallError,
-    ExtensionInstallRecord, ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore,
-    ExtensionManifestIndex, ExtensionPackageRoot, ExtensionPackageRootLoader, ModelDiscoveryFuture,
+    ExtensionActivationErrorKind, ExtensionActivationState, ExtensionCapability,
+    ExtensionCapabilityGrantStatus, ExtensionInstallError, ExtensionInstallRecord,
+    ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex,
+    ExtensionPackageRecord, ExtensionPackageRoot, ExtensionPackageRootLoader, ModelDiscoveryFuture,
     ModelDiscoveryOutcome, ProviderConfig, ProviderError, ProviderErrorKind, ProviderMessage,
     ProviderModel, ProviderRequest, Role, RunnerConfig, TurnId, fresh_session_id,
+    grant_confirmation_message, grant_id_from_selector, grant_requested,
     latest_session_log_path_in,
     model_discovery::DiscoveredProviderModel,
-    project_session_log_dir,
+    nothing_to_grant_message, project_session_log_dir, revoke_confirmation_message, revoke_grant,
     rig_adapter::{
         MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
     },
@@ -192,6 +194,12 @@ enum Command {
     ExtensionDoctor {
         extension_id: Option<String>,
     },
+    ExtensionTrust {
+        selector: String,
+    },
+    ExtensionRevoke {
+        selector: String,
+    },
     Rpc {
         args: Vec<String>,
     },
@@ -221,6 +229,12 @@ fn extension_command_from_args(args: &[String]) -> Command {
         }
         Some("doctor") => Command::ExtensionDoctor {
             extension_id: args.get(1).cloned(),
+        },
+        Some("trust") => Command::ExtensionTrust {
+            selector: args.get(1).cloned().unwrap_or_default(),
+        },
+        Some("revoke") => Command::ExtensionRevoke {
+            selector: args.get(1).cloned().unwrap_or_default(),
         },
         _ => Command::ExtensionList,
     }
@@ -372,6 +386,8 @@ impl Command {
             Self::ExtensionDoctor { extension_id } => {
                 run_extension_doctor_command(extension_id.as_deref())
             }
+            Self::ExtensionTrust { selector } => run_extension_trust_command(selector),
+            Self::ExtensionRevoke { selector } => run_extension_revoke_command(selector),
             Self::Tui { backend, resume } => run_tui_command(*backend, *resume, trace),
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
             Self::TuiProviderConnectionSmoke => run_tui_provider_connection_smoke_command(),
@@ -495,6 +511,8 @@ enum ExtensionManagementAction {
     Remove,
     Enable,
     Disable,
+    Trust,
+    Revoke,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,6 +538,8 @@ struct ExtensionDiagnosticRecord {
     last_error_summary: Option<String>,
     registered_tools: Vec<String>,
     provider_visible_tools: Vec<String>,
+    requested_capabilities: Option<BTreeSet<ExtensionCapability>>,
+    capability_grant: ExtensionCapabilityGrantStatus,
 }
 
 impl CommandResult {
@@ -856,6 +876,8 @@ impl ExtensionDiagnosticRecord {
             last_error_summary: diagnostic.last_error_summary,
             registered_tools: diagnostic.registered_tools,
             provider_visible_tools: diagnostic.provider_visible_tools,
+            requested_capabilities: diagnostic.requested_capabilities,
+            capability_grant: diagnostic.capability_grant,
         }
     }
 
@@ -873,7 +895,7 @@ impl ExtensionDiagnosticRecord {
             .map_or("none", ExtensionActivationErrorKind::as_str);
         let last_error_summary = self.last_error_summary.as_deref().unwrap_or("none");
         format!(
-            "extension id={} version={} scope={} package_root={} manifest_path={} source_ref={} install_source={} install_enabled={} discovered={} activation_state={} generation={} last_error_kind={} last_error_summary={} registered_tool_count={} registered_tools={} provider_visible_tools={}",
+            "extension id={} version={} scope={} package_root={} manifest_path={} source_ref={} install_source={} install_enabled={} discovered={} activation_state={} generation={} last_error_kind={} last_error_summary={} registered_tool_count={} registered_tools={} provider_visible_tools={} capabilities={} capability_grant={}",
             id,
             version,
             extension_install_scope_label(self.scope),
@@ -889,7 +911,9 @@ impl ExtensionDiagnosticRecord {
             last_error_summary,
             self.registered_tools.len(),
             extension_tool_names_label(&self.registered_tools),
-            extension_tool_names_label(&self.provider_visible_tools)
+            extension_tool_names_label(&self.provider_visible_tools),
+            extension_requested_capabilities_label(self.requested_capabilities.as_ref()),
+            extension_capability_grant_label(&self.capability_grant)
         )
     }
 }
@@ -899,6 +923,35 @@ fn extension_tool_names_label(names: &[String]) -> String {
         String::from("none")
     } else {
         names.join(",")
+    }
+}
+
+fn extension_capability_set_label(capabilities: &BTreeSet<ExtensionCapability>) -> String {
+    if capabilities.is_empty() {
+        String::from("none")
+    } else {
+        capabilities
+            .iter()
+            .map(ExtensionCapability::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn extension_requested_capabilities_label(
+    capabilities: Option<&BTreeSet<ExtensionCapability>>,
+) -> String {
+    match capabilities {
+        None => String::from("unknown"),
+        Some(set) => extension_capability_set_label(set),
+    }
+}
+
+fn extension_capability_grant_label(grant: &ExtensionCapabilityGrantStatus) -> String {
+    match grant {
+        ExtensionCapabilityGrantStatus::Unknown => String::from("unknown"),
+        ExtensionCapabilityGrantStatus::Absent => String::from("none"),
+        ExtensionCapabilityGrantStatus::Approved(set) => extension_capability_set_label(set),
     }
 }
 
@@ -923,6 +976,8 @@ const fn extension_management_action_label(action: ExtensionManagementAction) ->
         ExtensionManagementAction::Remove => "remove",
         ExtensionManagementAction::Enable => "enable",
         ExtensionManagementAction::Disable => "disable",
+        ExtensionManagementAction::Trust => "trust",
+        ExtensionManagementAction::Revoke => "revoke",
     }
 }
 
@@ -4350,6 +4405,169 @@ fn run_extension_doctor_command(extension_id: Option<&str>) -> CommandResult {
     extension_diagnostics_result(ExtensionDiagnosticsCommand::Doctor, extension_id)
 }
 
+fn run_extension_trust_command(selector: &str) -> CommandResult {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return extension_capability_management_result(
+            ExtensionManagementAction::Trust,
+            ExtensionManagementOutcome::Failed,
+            None,
+            Some(String::from("extension selector is required")),
+        );
+    }
+    match loaded_extension_package_record(selector) {
+        Ok(None) => extension_capability_management_result(
+            ExtensionManagementAction::Trust,
+            ExtensionManagementOutcome::Failed,
+            None,
+            Some(format!("extension {selector} not found")),
+        ),
+        Ok(Some(record)) => {
+            let extension_id = record.manifest.id.0.as_str();
+            match grant_requested(
+                extension_id,
+                &record.manifest.version,
+                &record.manifest.contributes.tools,
+            ) {
+                Ok(None) => extension_capability_management_result(
+                    ExtensionManagementAction::Trust,
+                    ExtensionManagementOutcome::Completed,
+                    Some(extension_id),
+                    Some(nothing_to_grant_message(extension_id)),
+                ),
+                Ok(Some(grant)) => extension_capability_management_result(
+                    ExtensionManagementAction::Trust,
+                    ExtensionManagementOutcome::Completed,
+                    Some(extension_id),
+                    Some(grant_confirmation_message(
+                        extension_id,
+                        &record.manifest.contributes.tools,
+                        &grant.approved,
+                    )),
+                ),
+                Err(error) => extension_capability_management_result(
+                    ExtensionManagementAction::Trust,
+                    ExtensionManagementOutcome::Failed,
+                    Some(extension_id),
+                    Some(format!("failed to write capability grant: {error}")),
+                ),
+            }
+        }
+        Err(message) => extension_capability_management_result(
+            ExtensionManagementAction::Trust,
+            ExtensionManagementOutcome::Failed,
+            None,
+            Some(message),
+        ),
+    }
+}
+
+fn run_extension_revoke_command(selector: &str) -> CommandResult {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return extension_capability_management_result(
+            ExtensionManagementAction::Revoke,
+            ExtensionManagementOutcome::Failed,
+            None,
+            Some(String::from("extension selector is required")),
+        );
+    }
+    let discovered = match loaded_extension_package_record(selector) {
+        Ok(record) => record,
+        Err(message) => {
+            return extension_capability_management_result(
+                ExtensionManagementAction::Revoke,
+                ExtensionManagementOutcome::Failed,
+                None,
+                Some(message),
+            );
+        }
+    };
+    let extension_id = match grant_id_from_selector(
+        discovered
+            .as_ref()
+            .map(|record| record.manifest.id.0.as_str()),
+        selector,
+    ) {
+        Ok(id) => id,
+        Err(message) => {
+            return extension_capability_management_result(
+                ExtensionManagementAction::Revoke,
+                ExtensionManagementOutcome::Failed,
+                None,
+                Some(message),
+            );
+        }
+    };
+    match revoke_grant(&extension_id) {
+        Ok(had_grant) => extension_capability_management_result(
+            ExtensionManagementAction::Revoke,
+            ExtensionManagementOutcome::Completed,
+            Some(&extension_id),
+            Some(revoke_confirmation_message(&extension_id, had_grant)),
+        ),
+        Err(error) => extension_capability_management_result(
+            ExtensionManagementAction::Revoke,
+            ExtensionManagementOutcome::Failed,
+            Some(&extension_id),
+            Some(format!("failed to remove capability grant: {error}")),
+        ),
+    }
+}
+
+fn loaded_extension_package_record(
+    selector: &str,
+) -> Result<Option<ExtensionPackageRecord>, String> {
+    #[cfg(not(test))]
+    if let Err(error) = ensure_bundled_hashline_install_record() {
+        return Err(format!(
+            "failed to prepare bundled hashline extension: {error}"
+        ));
+    }
+    let install_records = loaded_extension_install_records()?;
+    let index = ExtensionManifestIndex::from_package_roots(
+        extension_package_roots_from_env_and_install_records(&install_records),
+    )
+    .map_err(|error| {
+        format!(
+            "extension lookup failed: {}",
+            extension_package_index_error_label(&error)
+        )
+    })?;
+    Ok(index
+        .records()
+        .iter()
+        .find(|record| extension_package_record_matches(record, selector))
+        .cloned())
+}
+
+fn extension_package_record_matches(record: &ExtensionPackageRecord, selector: &str) -> bool {
+    record.manifest.id.0 == selector
+        || record.source_ref.as_deref() == Some(selector)
+        || record.package_root.to_string_lossy() == selector
+        || record.manifest_path.to_string_lossy() == selector
+}
+
+fn extension_capability_management_result(
+    action: ExtensionManagementAction,
+    outcome: ExtensionManagementOutcome,
+    extension_id: Option<&str>,
+    message: Option<String>,
+) -> CommandResult {
+    let message = match (extension_id, message) {
+        (Some(extension_id), Some(message)) if !message.contains(extension_id) => {
+            Some(format!("{message} ({extension_id})"))
+        }
+        (_, message) => message,
+    };
+    CommandResult::ExtensionManagement {
+        action,
+        outcome,
+        scope: ExtensionInstallScope::User,
+        message,
+    }
+}
+
 fn extension_diagnostics_result(
     command: ExtensionDiagnosticsCommand,
     extension_id: Option<&str>,
@@ -5088,7 +5306,7 @@ mod tests {
         run_extension_set_enabled_command, runner_config, tui_session_path_from_latest,
         tui_theme_path, unconfigured_launch_setup_error,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
@@ -5100,8 +5318,9 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
     use yach_backend::{
-        BackendMetadata, ExtensionActivationState, ExtensionInstallScope, RunnerConfig,
-        run_native_loop, session_log_path_in, start_backend_session,
+        BackendMetadata, ExtensionActivationState, ExtensionCapability,
+        ExtensionCapabilityGrantStatus, ExtensionInstallScope, RunnerConfig, run_native_loop,
+        session_log_path_in, start_backend_session,
     };
     use yach_connections::{
         ConnectionId, CredentialError, CredentialStore, JsonConnectionMetadataStore,
@@ -5461,6 +5680,32 @@ mod tests {
             extension_doctor.command,
             Command::ExtensionDoctor {
                 extension_id: Some(String::from("example.scan-toy-tools")),
+            }
+        );
+    }
+
+    #[test]
+    fn extension_cli_parses_trust_and_revoke_commands() {
+        assert_eq!(
+            CliArgs::from_args(
+                ["extension", "trust", "example.network-tools"]
+                    .into_iter()
+                    .map(String::from)
+            )
+            .command,
+            Command::ExtensionTrust {
+                selector: String::from("example.network-tools"),
+            }
+        );
+        assert_eq!(
+            CliArgs::from_args(
+                ["extension", "revoke", "example.network-tools"]
+                    .into_iter()
+                    .map(String::from)
+            )
+            .command,
+            Command::ExtensionRevoke {
+                selector: String::from("example.network-tools"),
             }
         );
     }
@@ -7394,6 +7639,8 @@ mod tests {
                 last_error_summary: None,
                 registered_tools: Vec::new(),
                 provider_visible_tools: Vec::new(),
+                requested_capabilities: None,
+                capability_grant: ExtensionCapabilityGrantStatus::Unknown,
             }],
             message: None,
             host_start_count: 0,
@@ -7407,7 +7654,88 @@ mod tests {
         assert_eq!(lines[3], "host_start_count=0");
         assert_eq!(
             lines[4],
-            "extension id=example.scan-toy-tools version=0.1.0 scope=project package_root=/tmp/yach-extension manifest_path=/tmp/yach-extension/yach.extension.json source_ref=test-package-root install_source=./ext install_enabled=true discovered=true activation_state=discovered generation=0 last_error_kind=none last_error_summary=none registered_tool_count=0 registered_tools=none provider_visible_tools=none"
+            "extension id=example.scan-toy-tools version=0.1.0 scope=project package_root=/tmp/yach-extension manifest_path=/tmp/yach-extension/yach.extension.json source_ref=test-package-root install_source=./ext install_enabled=true discovered=true activation_state=discovered generation=0 last_error_kind=none last_error_summary=none registered_tool_count=0 registered_tools=none provider_visible_tools=none capabilities=unknown capability_grant=unknown"
+        );
+    }
+
+    fn capability_diagnostic_fixture() -> ExtensionDiagnosticRecord {
+        ExtensionDiagnosticRecord {
+            id: Some(String::from("capability.network-fixture")),
+            version: Some(String::from("1.0.0")),
+            scope: ExtensionInstallScope::User,
+            package_root: PathBuf::from("/tmp/yach-capability-fixture"),
+            manifest_path: Some(PathBuf::from(
+                "/tmp/yach-capability-fixture/yach.extension.json",
+            )),
+            source_ref: Some(String::from("test-package-root")),
+            install_source: Some(String::from("./ext")),
+            install_enabled: true,
+            discovered: true,
+            activation_state: ExtensionActivationState::Discovered,
+            generation: 0,
+            last_error_kind: None,
+            last_error_summary: None,
+            registered_tools: Vec::new(),
+            provider_visible_tools: Vec::new(),
+            requested_capabilities: Some(BTreeSet::from([ExtensionCapability::UsesNetwork])),
+            capability_grant: ExtensionCapabilityGrantStatus::Absent,
+        }
+    }
+
+    fn file_scoped_diagnostic_fixture() -> ExtensionDiagnosticRecord {
+        ExtensionDiagnosticRecord {
+            requested_capabilities: Some(BTreeSet::new()),
+            ..capability_diagnostic_fixture()
+        }
+    }
+
+    #[test]
+    fn diagnostics_report_declared_capabilities_and_grant_state() {
+        // Activation is the only authority point, so a user who cannot see
+        // what an extension may do has not meaningfully consented.
+        let record = ExtensionDiagnosticRecord {
+            // Build from the neighbouring test's fixture if one exists;
+            // otherwise fill every field explicitly. Declare one
+            // uses_network tool and leave the grant absent.
+            ..capability_diagnostic_fixture()
+        };
+
+        let line = record.render_line();
+        assert!(
+            line.contains("capabilities=uses_network"),
+            "declared capabilities must be visible: {line}"
+        );
+        assert!(
+            line.contains("capability_grant=none"),
+            "grant state must be visible: {line}"
+        );
+    }
+
+    #[test]
+    fn a_file_scoped_extension_reports_no_capabilities() {
+        let record = ExtensionDiagnosticRecord {
+            ..file_scoped_diagnostic_fixture()
+        };
+        let line = record.render_line();
+        assert!(
+            line.contains("capabilities=none"),
+            "a file-scoped extension requests nothing: {line}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_report_network_and_process_capabilities_deterministically() {
+        let record = ExtensionDiagnosticRecord {
+            requested_capabilities: Some(BTreeSet::from([
+                ExtensionCapability::RunsProcess,
+                ExtensionCapability::UsesNetwork,
+            ])),
+            ..capability_diagnostic_fixture()
+        };
+        let line = record.render_line();
+        assert!(
+            line.contains("capabilities=uses_network,runs_process"),
+            "multiple capabilities must render in BTreeSet order: {line}"
         );
     }
 

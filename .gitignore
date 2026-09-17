@@ -20,7 +20,8 @@ Thumbs.db
 # Development environments
 .direnv/
 .devenv/
-.devcontainer.json
+devenv.local.nix
+devenv.local.yaml
 result
 result-*
 

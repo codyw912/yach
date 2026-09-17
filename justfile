@@ -7,21 +7,17 @@ default:
   just --list
 
 @dev +args:
-  if [[ -n "${DEVENV_PROFILE:-}" || -n "${IN_NIX_SHELL:-}" ]]; then \
+  if [[ -n "${DEVENV_PROFILE:-}" ]]; then \
     {{args}}; \
-  elif command -v direnv >/dev/null 2>&1 && [[ -f .envrc ]]; then \
-    direnv exec . {{args}}; \
   else \
-    nix develop --no-pure-eval -c {{args}}; \
+    devenv shell -- {{args}}; \
   fi
 
 @dev-shell command:
-  if [[ -n "${DEVENV_PROFILE:-}" || -n "${IN_NIX_SHELL:-}" ]]; then \
-    bash -lc {{quote(command)}}; \
-  elif command -v direnv >/dev/null 2>&1 && [[ -f .envrc ]]; then \
-    direnv exec . bash -lc {{quote(command)}}; \
+  if [[ -n "${DEVENV_PROFILE:-}" ]]; then \
+    bash -c {{quote(command)}}; \
   else \
-    nix develop --no-pure-eval -c bash -lc {{quote(command)}}; \
+    devenv shell -- bash -c {{quote(command)}}; \
   fi
 
 # One-shot sync: move onto merged main and rebuild that binary.
@@ -50,7 +46,7 @@ check:
   just --justfile "{{justfile()}}" dev cargo check
 
 test:
-  just --justfile "{{justfile()}}" dev cargo test
+  just --justfile "{{justfile()}}" dev test-project
 
 fmt:
   just --justfile "{{justfile()}}" dev cargo fmt --all
@@ -59,7 +55,88 @@ fmt-check:
   just --justfile "{{justfile()}}" dev cargo fmt --all --check
 
 lint:
+  just --justfile "{{justfile()}}" toolchain-check
   just --justfile "{{justfile()}}" dev cargo clippy --all-targets --all-features -- -D warnings
+
+# Fail if the toolchain the workflows pin has drifted from
+# rust-toolchain.toml. The two are separate pins that must be bumped
+# together; when they disagree, a lint can pass locally and fail in CI, which
+# is the failure this arrangement exists to stop.
+#
+# A workflow that pins a different toolchain on purpose -- a one-off
+# experiment reproducing an older measurement, say -- opts out with a
+# `toolchain-check: ignore` comment, so the exemption is visible in the
+# workflow rather than hidden in this scan.
+toolchain-check:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  file_version="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+  ci_versions="$(
+    for wf in .github/workflows/*.yml; do
+      grep -q 'toolchain-check: ignore' "$wf" && continue
+      sed -n 's|.*dtolnay/rust-toolchain@\(.*\)|\1|p' "$wf"
+    done | sort -u
+  )"
+  if [[ -z "$file_version" ]]; then
+    echo "toolchain-check: no channel in rust-toolchain.toml" >&2
+    exit 1
+  fi
+  if [[ -z "$ci_versions" ]]; then
+    echo "toolchain-check: no dtolnay/rust-toolchain pin in .github/workflows/" >&2
+    exit 1
+  fi
+  if [[ "$ci_versions" != "$file_version" ]]; then
+    echo "toolchain drift: rust-toolchain.toml has '$file_version', workflows have:" >&2
+    echo "$ci_versions" | sed 's/^/  /' >&2
+    exit 1
+  fi
+  echo "toolchain: $file_version (rust-toolchain.toml and workflows agree)"
+
+# Reproduce CI's clippy with the exact toolchain the workflows pin, outside
+# the devenv shell. Use when a CI lint does not reproduce locally, or while a
+# toolchain bump is in flight.
+#
+# The version comes from the workflows, not rust-toolchain.toml. Those two
+# disagree during a partial bump, which is one of the situations this recipe
+# exists for: reading the local file would then lint a compiler CI is not
+# running and report a clean result. Multiple differing workflow pins are
+# rejected rather than guessed at.
+lint-ci:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  # Scalar rather than `mapfile`: this recipe runs outside the devenv shell,
+  # and macOS still ships bash 3.2, which has no `mapfile`.
+  ci_versions="$(
+    for wf in .github/workflows/*.yml; do
+      grep -q 'toolchain-check: ignore' "$wf" && continue
+      sed -n 's|.*dtolnay/rust-toolchain@\(.*\)|\1|p' "$wf"
+    done | sort -u
+  )"
+  if [[ -z "$ci_versions" ]]; then
+    echo "lint-ci: no dtolnay/rust-toolchain pin found in .github/workflows/" >&2
+    exit 1
+  fi
+  if [[ "$(printf '%s\n' "$ci_versions" | wc -l | tr -d ' ')" -gt 1 ]]; then
+    echo "lint-ci: workflows pin more than one toolchain; fix the drift first:" >&2
+    printf '%s\n' "$ci_versions" | sed 's/^/  /' >&2
+    exit 1
+  fi
+  version="$ci_versions"
+  if [[ "$version" == "stable" || "$version" == "beta" || "$version" == "nightly" ]]; then
+    echo "lint-ci: workflows track the floating '$version' channel, so there is" >&2
+    echo "  no pinned version to reproduce. Pin an explicit version instead." >&2
+    exit 1
+  fi
+  file_version="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+  if [[ "$file_version" != "$version" ]]; then
+    echo "note: rust-toolchain.toml is on '$file_version'; using CI's '$version'." >&2
+  fi
+  echo "reproducing CI clippy with $version"
+  nix shell nixpkgs#rustup nixpkgs#pkg-config nixpkgs#openssl --command bash -c "
+    set -euo pipefail
+    rustup toolchain install '$version' --component clippy --profile minimal
+    cargo '+$version' clippy --all-targets --all-features -- -D warnings
+  "
 
 
 # Paired regression gate: build main and @ through the dev shell, run
@@ -75,12 +152,10 @@ perf *args:
   printf 'perf ab extra argv:' >&2
   printf ' %q' "$@" >&2
   printf '\n' >&2
-  if [[ -n "${DEVENV_PROFILE:-}" || -n "${IN_NIX_SHELL:-}" ]]; then
+  if [[ -n "${DEVENV_PROFILE:-}" ]]; then
     cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
-  elif command -v direnv >/dev/null 2>&1 && [[ -f .envrc ]]; then
-    direnv exec . cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
   else
-    nix develop --no-pure-eval -c cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
+    devenv shell -- cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
   fi
 
 # Record @ only (trend evidence, never a gate input).

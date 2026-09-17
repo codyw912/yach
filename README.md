@@ -256,9 +256,41 @@ context and these logs. Logs never leave your machine.
 
 ## Development
 
-Dev commands run through `just` (nix/devenv shell): `just run tui`,
-`just test`, `just lint`. Contributor conventions, including the strict
-clippy policy, live in [AGENTS.md](AGENTS.md).
+Install Nix and devenv CLI **2.3.1**. The contributor environment is owned by
+`devenv.nix`, `devenv.yaml`, and `devenv.lock`; no private workstation configuration
+or `dev-init` installation is required. From the repository root:
+
+```sh
+devenv shell -- just test
+devenv shell -- just lint
+devenv shell -- just build
+```
+
+`devenv test` runs the same locked workspace tests as `just test`. Inside an
+activated environment, use the existing `just` commands normally. For optional
+automatic activation, install direnv, review `.envrc`, and run `direnv allow`.
+After environment changes, reload it with `direnv reload`.
+
+The shell retains Rust **1.94.0**, the project's tools and custom Cargo hooks.
+Shell entry does not initialize a Cargo project. Keep personal changes in ignored
+`devenv.local.nix` or `devenv.local.yaml`; required contributor settings belong in
+the shared configuration. Update inputs deliberately with `devenv update <name>`.
+
+Packaging still uses `nix build`. Its retained `flake.lock` pins those builds
+independently of the contributor environment's `devenv.lock`.
+
+Hook definitions live in `devenv.nix`. Shell entry regenerates
+`.pre-commit-config.yaml` as a regular file; keep that generated file tracked so
+shared hooks also work in linked worktrees. Change the Nix definitions rather than
+editing the generated file, and commit both when hook behavior changes.
+
+The runtime image in `containers/yach-runtime/` and evaluation containers remain
+supported. The old
+template-generated devcontainer and `devc` helper are no longer provided.
+
+Contributor conventions, including the strict Clippy policy, live in
+[AGENTS.md](AGENTS.md). CI deliberately uses its own explicit Rust toolchain;
+a local check does not establish a passing GitHub Actions run.
 
 Design decisions are recorded: the original product direction is
 [PRD-v0.1.md](PRD-v0.1.md), nontrivial features get a design doc in
