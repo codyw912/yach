@@ -50,6 +50,9 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - widget cleared
 - thinking level selected
 - tool review decision submitted
+- extension lifecycle requested (`extension_lifecycle_requested`)
+- extension diagnostic snapshot requested (`extension_diagnostic_snapshot_requested`)
+
 
 ## Currently modeled server events
 
@@ -73,6 +76,9 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - notification raised
 - widget updated
 - title changed
+- extension lifecycle finished (`extension_lifecycle_finished`)
+- extension diagnostic snapshot updated (`extension_diagnostic_snapshot_updated`)
+
 
 ## Structured tool review
 
@@ -84,6 +90,52 @@ that payload. After durably recording the decision or interruption, the backend 
 than issuing an actionable review when the capability was not negotiated. `ToolCallFinished`
 replaces the same transcript row with its terminal output and may include a structured
 `HarnessOutcomeKind` plus `ToolResultMetadata` (`byte_count`, `truncated`, and optional reason).
+
+## Extension lifecycle and diagnostics
+
+`Capability::ExtensionLifecycle` negotiation gates whether a client should expose and send these events. Negotiation only establishes that both peers understand the surface; it does not grant extension capabilities and does not replace the backend's authority check before activation.
+
+The lifecycle messages are:
+
+| Wire event | Fields |
+| --- | --- |
+| `extension_lifecycle_requested` | `request_id: String`, `action` (`stop`, `reload`, `trust`, or `revoke`), `selector: String` |
+| `extension_lifecycle_finished` | `request_id: String`, `action` (`stop`, `reload`, `trust`, or `revoke`), `selector: String`, `outcome` (`completed`, `not_found`, `not_active`, or `failed`), required `message: String` |
+
+Lifecycle selectors are trimmed and must not be empty. Stop matches the live snapshot by id, source reference, install source, or package root. Reload and trust match the current manifest scan by id, source reference, package root, or manifest path. Revoke resolves a discovered selector to its manifest id, but also accepts a valid extension id after uninstall; an unmatched path or other non-id selector fails. Consequently the precise non-success outcome depends on the action: for example, an unknown selector is `not_found`, stopping a known but inactive extension is `not_active`, and invalid input or storage failure is `failed`.
+
+The diagnostic messages are:
+
+| Wire event | Fields |
+| --- | --- |
+| `extension_diagnostic_snapshot_requested` | `request_id: String`, optional/nullable `selector: String` |
+| `extension_diagnostic_snapshot_updated` | `request_id: String`, `outcome` (`completed`, `not_found`, or `failed`), `records: ExtensionDiagnosticRecord[]`, optional/nullable `message: String` |
+
+For both optional fields, an omitted field or explicit `null` decodes as `None`. Yach's serializer emits the field as either its value or `null`. A selector string is trimmed; an empty or whitespace-only string also becomes unfiltered. A nonempty selector with no match produces `not_found`, an empty `records` array, and a message. An unfiltered empty snapshot is `completed` with an empty array.
+
+`ExtensionDiagnosticRecord` has this exact current shape:
+
+| Field | Rust / JSON value |
+| --- | --- |
+| `id` | `Option<String>` / string, `null`, or omitted |
+| `version` | `Option<String>` / string, `null`, or omitted |
+| `scope` | `String` |
+| `package_root` | `String` |
+| `manifest_path` | `Option<String>` / string, `null`, or omitted |
+| `source_ref` | `Option<String>` / string, `null`, or omitted |
+| `install_source` | `Option<String>` / string, `null`, or omitted |
+| `activation_state` | `String` |
+| `generation` | `u64` / non-negative JSON integer |
+| `last_error_kind` | `Option<String>` / string, `null`, or omitted |
+| `last_error_summary` | `Option<String>` / string, `null`, or omitted |
+| `registered_tools` | `Vec<String>` / string array |
+| `provider_visible_tools` | `Vec<String>` / string array |
+| `capabilities` | `Option<Vec<String>>` / string array, `null`, or omitted |
+| `capability_grant` | `Option<Vec<String>>` / string array, `null`, or omitted |
+
+For both capability fields, missing or `null` means unknown: the producer did not have enough information to make the claim. An empty `capabilities` array means the known manifest requests no grant-requiring capabilities. An empty `capability_grant` array means there is no current approval; that remains true when a revoked authority document is retained on disk for its history. A nonempty array contains the current snake_case capability names.
+
+Yach's native backend sorts records by id (using `none` for a missing id), then package root. Its capability arrays are produced from ordered sets. These are properties of records produced by the current native implementation, not general wire-order guarantees: external adapters may emit records or capability arrays in another order, and consumers must not attach meaning to array order.
 
 ## Dialog model
 

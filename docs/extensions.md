@@ -68,17 +68,30 @@ The same check runs at startup and on `/extension-reload`. Reloading does
 not bypass it.
 
 Grants live only in user home, at `~/.yach/extensions/<extension-id>.json`.
-That private JSON document is the inspectable audit artifact: current
-authority, any imported legacy grant (`legacy_baseline`), and ordered
-grant/revoke decisions. A project checkout cannot grant capability.
+That private JSON document is the inspectable audit artifact; it is not a
+project-controlled file. The versioned `yach.extension-authority.v1` shape
+contains `extension_id`, nullable `current` authority, nullable
+`legacy_baseline`, and an ordered `history`. Each history decision records a
+unique `operation_id`, `recorded_at`, `action` (`grant` or `revoke`), a fixed
+reason, its originating `surface` (`cli` or `lifecycle`), and nullable `before`
+and `after` grant snapshots. A grant snapshot contains the approved capability
+set plus `version_at_grant` and `granted_at` provenance. These fields describe
+the decision Yach recorded; they do not identify or authenticate a particular
+human.
 
-Older three-field grant files still authorize until the next trust or revoke,
-which imports them as `legacy_baseline` in the same replacement. A write that
-fails before the new file is renamed leaves the previous document unchanged.
-If the new file is already visible but directory durability cannot be
-confirmed, the command reports that uncertainty instead of success or
-rollback. On platforms that cannot sync directories, crash durability of the
-directory entry is weaker than the file contents.
+Older three-field grant files (`approved`, `version_at_grant`, `granted_at`)
+still authorize. They have no decision history, so Yach does not invent one.
+The next explicit trust or revoke preserves that imported grant as
+`legacy_baseline` and writes the versioned document with the new decision.
+Revoke sets `current` to null and appends a revoke decision; it deliberately
+does not delete the document or its prior evidence.
+
+A failure before replacement leaves the previous document authoritative and
+unchanged. If replacement has become visible but Yach cannot confirm directory
+durability, the command reports that the update occurred with unknown storage
+durability; it does not claim success or rollback. On platforms that cannot
+sync directories, crash durability of the directory entry is weaker than the
+file contents.
 
 ## Granting and revoking
 
@@ -127,24 +140,30 @@ nothing is discovered:
 yach extension revoke example.network-tools
 ```
 
-## Reading diagnostics
+In the TUI, `/extension-status` and `/extension-status <selector>` report the
+live native activation snapshot. Its records reflect the current session's
+activation state, generation, errors, and registered/provider-visible tools.
+The optional selector can match id, source reference, install source, package
+root, or manifest path; an empty or whitespace-only selector is unfiltered.
 
-In the TUI, `/extension-status` and `/extension-status <id>` print live
-records. From the CLI, `yach extension list` and `yach extension doctor`
-(`yach extension doctor <id>` to filter) print the same fields.
+From the CLI, `yach extension list` and `yach extension doctor`
+(`yach extension doctor <id>` to filter) perform a fresh package and install
+scan. They do not start extension hosts and do not claim to be the TUI's live
+snapshot. Both surfaces expose the capability fields, but their other state is
+obtained differently.
 
 Look at `capabilities=` and `capability_grant=`:
 
 | Value | Meaning |
 | --- | --- |
-| `unknown` | The manifest is not yet known. This is not the same as `none`. |
-| `none` on `capabilities=` | The tools request no grant (file-scoped only). |
-| `none` on `capability_grant=` | No grant file is recorded. |
-| `uses_network`, `runs_process`, or both, comma-separated | The derived or approved set. |
+| `unknown` | The manifest or authority was not consulted. This is not the same as `none`. |
+| `none` on `capabilities=` | The known manifest's tools request no grant-requiring capabilities. |
+| `none` on `capability_grant=` | There is no current approval, including after revoke when the authority document and history remain. |
+| `uses_network`, `runs_process`, or both, comma-separated | The derived request or current approved set. |
 
-Treat `unknown` as "not consulted," not as "requests nothing" or "ungranted."
-A record whose package has not been scanned still renders `unknown` rather
-than inventing `none`.
+Treat `unknown` as “not known here,” not as “requests nothing” or “ungranted.”
+A record whose package or authority has not been consulted renders `unknown`
+rather than inventing `none`.
 
 ## Registration follows the manifest
 
