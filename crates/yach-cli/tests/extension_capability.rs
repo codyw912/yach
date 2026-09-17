@@ -73,15 +73,16 @@ fn run_cli(
     home: &Path,
     user_store: &Path,
     project_store: &Path,
-    package_root: &Path,
+    cwd: &Path,
     args: &[&str],
 ) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_yach"))
         .args(args)
+        .current_dir(cwd)
         .env("HOME", home)
         .env("YACH_EXTENSION_USER_STORE", user_store)
         .env("YACH_EXTENSION_PROJECT_STORE", project_store)
-        .env("YACH_EXTENSION_PACKAGE_ROOTS", package_root)
+        .env_remove("YACH_EXTENSION_PACKAGE_ROOTS")
         .output()
         .test_unwrap()
 }
@@ -96,17 +97,35 @@ fn cli_trust_revoke_persists_across_isolated_child_restarts() {
     let stores = TempPackage::new().test_unwrap();
     let home = stores.root.join("home");
     let package_root = stores.root.join("package");
+    let cwd = stores.root.join("cwd");
     let user_store = stores.root.join("user-extensions.json");
     let project_store = stores.root.join("project-extensions.json");
     fs::create_dir_all(&home).test_unwrap();
+    fs::create_dir_all(&cwd).test_unwrap();
     copy_fixture(&package_root);
+
+    let package_arg = package_root.to_string_lossy();
+    let installed = run_cli(
+        &home,
+        &user_store,
+        &project_store,
+        &cwd,
+        &["extension", "install", &package_arg],
+    );
+    assert!(installed.status.success());
+    let installed_out = stdout(&installed);
+    assert!(
+        installed_out.contains("extension_action=install")
+            && installed_out.contains("extension_outcome=Completed"),
+        "fixture install must complete: {installed_out}"
+    );
 
     let doctor = |home: &Path| {
         run_cli(
             home,
             &user_store,
             &project_store,
-            &package_root,
+            &cwd,
             &["extension", "doctor", "example.capability-network"],
         )
     };
@@ -127,7 +146,7 @@ fn cli_trust_revoke_persists_across_isolated_child_restarts() {
         &home,
         &user_store,
         &project_store,
-        &package_root,
+        &cwd,
         &["extension", "trust", "example.capability-network"],
     );
     assert!(
@@ -137,8 +156,11 @@ fn cli_trust_revoke_persists_across_isolated_child_restarts() {
     );
     let trust_out = stdout(&trust);
     assert!(
-        trust_out.contains("uses_network") && trust_out.contains("example.capability-network"),
-        "trust must name the approved capability: {trust_out}"
+        trust_out.contains("extension_action=trust")
+            && trust_out.contains("extension_outcome=Completed")
+            && trust_out.contains("uses_network")
+            && trust_out.contains("example.capability-network"),
+        "trust output must correlate completed approval: {trust_out}"
     );
 
     let granted = doctor(&home);
@@ -161,13 +183,19 @@ fn cli_trust_revoke_persists_across_isolated_child_restarts() {
         &home,
         &user_store,
         &project_store,
-        &package_root,
+        &cwd,
         &["extension", "revoke", "example.capability-network"],
     );
     assert!(
         revoke.status.success(),
         "revoke should succeed: {}",
         String::from_utf8_lossy(&revoke.stderr)
+    );
+    let revoke_out = stdout(&revoke);
+    assert!(
+        revoke_out.contains("extension_action=revoke")
+            && revoke_out.contains("extension_outcome=Completed"),
+        "revoke output must correlate completed removal: {revoke_out}"
     );
 
     let after_revoke = doctor(&home);
@@ -189,10 +217,67 @@ fn cli_trust_revoke_persists_across_isolated_child_restarts() {
     let bytes = fs::read(&document).test_unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&bytes).test_unwrap();
     assert!(doc["current"].is_null());
-    assert!(
-        doc["history"]
-            .as_array()
-            .is_some_and(|history| !history.is_empty()),
-        "retained document must keep decision history: {doc}"
+    let history = doc["history"].as_array().test_unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["action"], "grant");
+    assert_eq!(history[0]["surface"], "cli");
+    assert_eq!(history[1]["action"], "revoke");
+    assert_eq!(history[1]["surface"], "cli");
+    assert_eq!(history[1]["before"], history[0]["after"]);
+    assert!(history[1]["after"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_mutations_preserve_corrupt_and_unknown_authority_bytes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let stores = TempPackage::new().test_unwrap();
+    let home = stores.root.join("home");
+    let package_root = stores.root.join("package");
+    let cwd = stores.root.join("cwd");
+    let user_store = stores.root.join("user-extensions.json");
+    let project_store = stores.root.join("project-extensions.json");
+    fs::create_dir_all(&home).test_unwrap();
+    fs::create_dir_all(&cwd).test_unwrap();
+    copy_fixture(&package_root);
+    let package_arg = package_root.to_string_lossy();
+    let installed = run_cli(
+        &home,
+        &user_store,
+        &project_store,
+        &cwd,
+        &["extension", "install", &package_arg],
     );
+    assert!(stdout(&installed).contains("extension_outcome=Completed"));
+
+    let extensions = home.join(".yach/extensions");
+    fs::create_dir_all(&extensions).test_unwrap();
+    fs::set_permissions(&home.join(".yach"), fs::Permissions::from_mode(0o700)).test_unwrap();
+    fs::set_permissions(&extensions, fs::Permissions::from_mode(0o700)).test_unwrap();
+    let authority = extensions.join("example.capability-network.json");
+
+    for (bytes, action) in [
+        (b"{not json".as_slice(), "trust"),
+        (
+            br#"{"schema":"yach.extension-authority.v0","current":null}"#.as_slice(),
+            "revoke",
+        ),
+    ] {
+        fs::write(&authority, bytes).test_unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o600)).test_unwrap();
+        let output = run_cli(
+            &home,
+            &user_store,
+            &project_store,
+            &cwd,
+            &["extension", action, "example.capability-network"],
+        );
+        let out = stdout(&output);
+        assert!(
+            out.contains("extension_outcome=Failed"),
+            "{action} must report failed for planted state: {out}"
+        );
+        assert_eq!(fs::read(&authority).test_unwrap(), bytes);
+    }
 }

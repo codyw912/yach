@@ -1,4 +1,5 @@
 use std::path::Path;
+
 use std::sync::Arc;
 
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -320,30 +321,13 @@ pub(super) async fn handle_native_extension_lifecycle_request(
                 return;
             }
         };
-        let (outcome, message) =
-            match crate::revoke_grant(&extension_id, crate::ExtensionDecisionSurface::Lifecycle) {
-                Ok(had_grant) => {
-                    let mut snapshot = activation_state.lock().await;
-                    let _ = snapshot.stop_extension(&selector);
-                    (
-                        ExtensionLifecycleOutcome::Completed,
-                        crate::revoke_confirmation_message(&extension_id, had_grant),
-                    )
-                }
-                Err(error) => (
-                    ExtensionLifecycleOutcome::Failed,
-                    format!("failed to remove capability grant: {error}"),
-                ),
-            };
-        let _ = tx.send(BackendEvent::Server(
-            ServerEvent::ExtensionLifecycleFinished {
-                request_id,
-                action,
-                selector,
-                outcome,
-                message,
-            },
-        ));
+        schedule_native_extension_revoke(
+            tx.clone(),
+            activation_state.clone(),
+            request_id,
+            selector,
+            extension_id,
+        );
         return;
     }
 
@@ -504,6 +488,48 @@ fn schedule_native_extension_reload(
     });
 }
 
+fn schedule_native_extension_revoke(
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    activation_state: ExtensionActivationSnapshotState,
+    request_id: String,
+    selector: String,
+    extension_id: String,
+) {
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let mut snapshot = lifecycle_test_seam::blocking_lock_after_probe(&activation_state);
+        #[cfg(not(test))]
+        let mut snapshot = activation_state.blocking_lock();
+        let (outcome, message) =
+            match crate::revoke_grant(&extension_id, crate::ExtensionDecisionSurface::Lifecycle) {
+                Ok(had_grant) => {
+                    let _ = snapshot.stop_extension(&selector);
+                    (
+                        ExtensionLifecycleOutcome::Completed,
+                        crate::revoke_confirmation_message(&extension_id, had_grant),
+                    )
+                }
+                Err(crate::ExtensionAuthorityError::DurabilityUnknown) => (
+                    ExtensionLifecycleOutcome::Failed,
+                    crate::ExtensionAuthorityError::DurabilityUnknown.to_string(),
+                ),
+                Err(error) => (
+                    ExtensionLifecycleOutcome::Failed,
+                    format!("failed to remove capability grant: {error}"),
+                ),
+            };
+        let _ = tx.send(BackendEvent::Server(
+            ServerEvent::ExtensionLifecycleFinished {
+                request_id,
+                action: ExtensionLifecycleAction::Revoke,
+                selector,
+                outcome,
+                message,
+            },
+        ));
+    });
+}
+
 fn schedule_native_extension_trust(
     tx: mpsc::UnboundedSender<BackendEvent>,
     activation_state: ExtensionActivationSnapshotState,
@@ -513,6 +539,7 @@ fn schedule_native_extension_trust(
 ) {
     tokio::task::spawn_blocking(move || {
         let extension_id = record.manifest.id.0.as_str();
+        let mut snapshot = activation_state.blocking_lock();
         let (outcome, message) = match crate::grant_requested(
             extension_id,
             &record.manifest.version,
@@ -524,12 +551,13 @@ fn schedule_native_extension_trust(
                 crate::nothing_to_grant_message(extension_id),
             ),
             Ok(Some(grant)) => {
+                #[cfg(test)]
+                lifecycle_test_seam::wait_after_durable_write();
                 let grant_message = crate::grant_confirmation_message(
                     extension_id,
                     &record.manifest.contributes.tools,
                     &grant.approved,
                 );
-                let mut snapshot = activation_state.blocking_lock();
                 let (reload_outcome, reload_message) = extension_reload_lifecycle_outcome(
                     &snapshot.reload_extension_from_record(
                         &record,
@@ -545,6 +573,10 @@ fn schedule_native_extension_trust(
                     _ => (reload_outcome, format!("{grant_message}; {reload_message}")),
                 }
             }
+            Err(crate::ExtensionAuthorityError::DurabilityUnknown) => (
+                ExtensionLifecycleOutcome::Failed,
+                crate::ExtensionAuthorityError::DurabilityUnknown.to_string(),
+            ),
             Err(error) => (
                 ExtensionLifecycleOutcome::Failed,
                 format!("failed to write capability grant: {error}"),
@@ -670,5 +702,433 @@ fn extension_manifest_scan_error_label(error: &crate::ExtensionPackageIndexError
         }
         crate::ExtensionPackageIndexError::Manifest { .. } => "invalid_manifest",
         crate::ExtensionPackageIndexError::Catalog(_) => "catalog_error",
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_test_seam {
+    use Future as _;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::task::{Context, Poll};
+
+    struct Hold {
+        arrived: Sender<()>,
+        resume: Receiver<()>,
+    }
+
+    static HOLD: Mutex<Option<Hold>> = Mutex::new(None);
+    static REVOKE_ACQUIRE_PROBED: Mutex<Option<Sender<bool>>> = Mutex::new(None);
+
+    pub fn arm(arrived: Sender<()>, resume: Receiver<()>) {
+        let Ok(mut guard) = HOLD.lock() else {
+            return;
+        };
+        *guard = Some(Hold { arrived, resume });
+    }
+
+    pub fn arm_revoke(acquire_probed: Sender<bool>) {
+        let Ok(mut guard) = REVOKE_ACQUIRE_PROBED.lock() else {
+            return;
+        };
+        *guard = Some(acquire_probed);
+    }
+
+    pub fn blocking_lock_after_probe(
+        activation_state: &super::ExtensionActivationSnapshotState,
+    ) -> tokio::sync::MutexGuard<'_, crate::ExtensionActivationSnapshot> {
+        let mut lock = Box::pin(activation_state.lock());
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        let first_poll = lock.as_mut().poll(&mut context);
+        let was_pending = matches!(first_poll, Poll::Pending);
+        let acquire_probed = match REVOKE_ACQUIRE_PROBED.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        if let Some(acquire_probed) = acquire_probed {
+            let _ = acquire_probed.send(was_pending);
+        }
+        match first_poll {
+            Poll::Ready(snapshot) => snapshot,
+            Poll::Pending => futures::executor::block_on(lock),
+        }
+    }
+
+    pub fn wait_after_durable_write() {
+        let hold = match HOLD.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        let Some(hold) = hold else {
+            return;
+        };
+        let _ = hold.arrived.send(());
+        let _ = hold.resume.recv();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::Duration;
+
+    const HELPER_HOME_ENV: &str = "YACH_LIFECYCLE_SNAPSHOT_TEST_HOME";
+    const EXTENSION_ID: &str = "example.lifecycle-race";
+    const SEQUENCE_HELPER_HOME_ENV: &str = "YACH_LIFECYCLE_SEQUENCE_TEST_HOME";
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "yach-{prefix}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            assert!(
+                fs::create_dir_all(&path).is_ok(),
+                "temporary directory should be created: {path:?}"
+            );
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_network_package(root: &Path) {
+        assert!(
+            fs::create_dir_all(root).is_ok(),
+            "package root should be created: {root:?}"
+        );
+        let manifest = format!(
+            r#"{{
+  "schema": "yach.extension.v1",
+  "id": "{EXTENSION_ID}",
+  "version": "0.1.0",
+  "main": {{
+    "command": "sh",
+    "args": ["host.sh"]
+  }},
+  "activation": {{
+    "events": ["postFirstPaint"]
+  }},
+  "contributes": {{
+    "tools": [{{
+      "name": "fetch_url",
+      "description": "Return a static fixture payload for a URL.",
+      "risk": "uses_network",
+      "provider_visible": true
+    }}]
+  }}
+}}"#
+        );
+        assert!(
+            fs::write(root.join("yach.extension.json"), manifest).is_ok(),
+            "manifest should write"
+        );
+        let host = format!(
+            r#"while IFS= read -r line; do
+case "$line" in
+  *extension.initialize*)
+    printf '%s\n' \
+      '{{"type":"extension.ready","protocol":"yach.extension-host.v2","extension_id":"{EXTENSION_ID}"}}' \
+      '{{"type":"tool.register","name":"fetch_url","description":"Return a static fixture payload for a URL.","risk":"uses_network","provider_visible":true,"input_schema":{{"type":"object","additionalProperties":false,"required":["url"],"properties":{{"url":{{"type":"string"}}}},"maxSerializedBytes":1024}}}}'
+    ;;
+esac
+done
+"#
+        );
+        assert!(
+            fs::write(root.join("host.sh"), host).is_ok(),
+            "host script should write"
+        );
+    }
+
+    fn run_snapshot_hold_helper() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok(), "helper runtime should build: {runtime:?}");
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let package = TestDir::new("lifecycle-package");
+            write_network_package(package.path());
+            let index =
+                crate::ExtensionManifestIndex::from_package_roots([crate::ExtensionPackageRoot {
+                    root: package.path().to_path_buf(),
+                    scope: crate::ExtensionInstallScope::User,
+                    source_ref: Some(String::from("lifecycle-test")),
+                }]);
+            assert!(index.is_ok(), "fixture package should scan: {index:?}");
+            let Ok(index) = index else {
+                return;
+            };
+
+            let scan_state = Arc::new(AsyncMutex::new(Some(index)));
+            let activation_state = Arc::new(AsyncMutex::new(
+                crate::ExtensionActivationSnapshot::default(),
+            ));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            super::lifecycle_test_seam::arm(arrived_tx, resume_rx);
+
+            handle_native_extension_lifecycle_request(
+                &tx,
+                &scan_state,
+                &activation_state,
+                String::from("audit-trust"),
+                ExtensionLifecycleAction::Trust,
+                EXTENSION_ID,
+            )
+            .await;
+
+            let arrived = arrived_rx.recv_timeout(Duration::from_secs(30));
+            assert!(
+                arrived.is_ok(),
+                "trust should reach the post-write seam: {arrived:?}"
+            );
+            let snapshot_held = activation_state.try_lock().is_err();
+            let external_store = crate::ExtensionAuthorityStore::in_home(Path::new(
+                &std::env::var_os("HOME").unwrap_or_default(),
+            ));
+            let revoked =
+                external_store.revoke_grant(EXTENSION_ID, crate::ExtensionDecisionSurface::Cli);
+            assert_eq!(revoked, Ok(true));
+            let _ = resume_tx.send(());
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let mut trust_outcome = None;
+            while tokio::time::Instant::now() < deadline {
+                let event = tokio::time::timeout_at(deadline, rx.recv()).await;
+                if let Ok(Some(BackendEvent::Server(ServerEvent::ExtensionLifecycleFinished {
+                    request_id,
+                    outcome,
+                    ..
+                }))) = event
+                    && request_id == "audit-trust"
+                {
+                    trust_outcome = Some(outcome);
+                    break;
+                }
+            }
+            assert_eq!(trust_outcome, Some(ExtensionLifecycleOutcome::Failed));
+            assert!(
+                snapshot_held,
+                "trust must hold the activation snapshot across the durable write until reload"
+            );
+            let snapshot = activation_state.lock().await;
+            assert_eq!(snapshot.active_tool_names(), Vec::<&str>::new());
+            assert_eq!(snapshot.diagnostics.len(), 1);
+            assert_eq!(
+                snapshot.diagnostics[0].activation_state,
+                crate::ExtensionActivationState::Blocked
+            );
+            assert_eq!(
+                snapshot.diagnostics[0].capability_grant,
+                crate::ExtensionCapabilityGrantStatus::Absent
+            );
+        });
+    }
+
+    #[test]
+    fn trust_holds_activation_snapshot_after_durable_write_before_reload() {
+        if std::env::var(HELPER_HOME_ENV).is_ok() {
+            run_snapshot_hold_helper();
+            return;
+        }
+
+        let home = TestDir::new("lifecycle-home");
+        let executable = std::env::current_exe();
+        assert!(
+            executable.is_ok(),
+            "test executable should resolve: {executable:?}"
+        );
+        let Ok(executable) = executable else {
+            return;
+        };
+        let current_thread = std::thread::current();
+        let Some(test_name) = current_thread.name() else {
+            return;
+        };
+        let output = Command::new(&executable)
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env("HOME", home.path())
+            .env(HELPER_HOME_ENV, home.path())
+            .output();
+        assert!(output.is_ok(), "snapshot helper should spawn: {output:?}");
+        let Ok(output) = output else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "snapshot helper failed: status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fn run_same_runner_sequence_helper() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        assert!(runtime.is_ok(), "helper runtime should build: {runtime:?}");
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            let package = TestDir::new("lifecycle-sequence-package");
+            write_network_package(package.path());
+            let index =
+                crate::ExtensionManifestIndex::from_package_roots([crate::ExtensionPackageRoot {
+                    root: package.path().to_path_buf(),
+                    scope: crate::ExtensionInstallScope::User,
+                    source_ref: Some(String::from("lifecycle-sequence-test")),
+                }]);
+            assert!(index.is_ok(), "fixture package should scan: {index:?}");
+            let Ok(index) = index else {
+                return;
+            };
+            let scan_state = Arc::new(AsyncMutex::new(Some(index)));
+            let activation_state = Arc::new(AsyncMutex::new(
+                crate::ExtensionActivationSnapshot::default(),
+            ));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (trust_arrived_tx, trust_arrived_rx) = std::sync::mpsc::channel();
+            let (trust_resume_tx, trust_resume_rx) = std::sync::mpsc::channel();
+            let (revoke_probed_tx, revoke_probed_rx) = std::sync::mpsc::channel();
+            super::lifecycle_test_seam::arm(trust_arrived_tx, trust_resume_rx);
+            super::lifecycle_test_seam::arm_revoke(revoke_probed_tx);
+
+            handle_native_extension_lifecycle_request(
+                &tx,
+                &scan_state,
+                &activation_state,
+                String::from("queued-trust"),
+                ExtensionLifecycleAction::Trust,
+                EXTENSION_ID,
+            )
+            .await;
+            assert!(
+                trust_arrived_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .is_ok(),
+                "trust should reach the post-write seam"
+            );
+            handle_native_extension_lifecycle_request(
+                &tx,
+                &scan_state,
+                &activation_state,
+                String::from("queued-revoke"),
+                ExtensionLifecycleAction::Revoke,
+                EXTENSION_ID,
+            )
+            .await;
+            assert_eq!(
+                revoke_probed_rx.recv_timeout(Duration::from_secs(30)),
+                Ok(true),
+                "revoke's actual snapshot acquisition must be pending while trust owns it"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "queued revoke must not finish while trust owns the snapshot"
+            );
+            let _ = trust_resume_tx.send(());
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let mut finished = Vec::new();
+            while finished.len() < 2 && tokio::time::Instant::now() < deadline {
+                let event = tokio::time::timeout_at(deadline, rx.recv()).await;
+                if let Ok(Some(BackendEvent::Server(ServerEvent::ExtensionLifecycleFinished {
+                    request_id,
+                    outcome,
+                    ..
+                }))) = event
+                {
+                    finished.push((request_id, outcome));
+                }
+            }
+            assert_eq!(
+                finished,
+                vec![
+                    (
+                        String::from("queued-trust"),
+                        ExtensionLifecycleOutcome::Completed
+                    ),
+                    (
+                        String::from("queued-revoke"),
+                        ExtensionLifecycleOutcome::Completed
+                    ),
+                ]
+            );
+            let snapshot = activation_state.lock().await;
+            assert_eq!(snapshot.active_tool_names(), Vec::<&str>::new());
+            assert_eq!(snapshot.diagnostics.len(), 1);
+            assert_eq!(
+                snapshot.diagnostics[0].activation_state,
+                crate::ExtensionActivationState::Stopped
+            );
+            let store = crate::ExtensionAuthorityStore::in_home(Path::new(
+                &std::env::var_os("HOME").unwrap_or_default(),
+            ));
+            assert_eq!(store.load_grant(EXTENSION_ID), Ok(None));
+        });
+    }
+
+    #[test]
+    fn queued_revoke_runs_after_trust_reload_and_stops_the_host() {
+        if std::env::var(SEQUENCE_HELPER_HOME_ENV).is_ok() {
+            run_same_runner_sequence_helper();
+            return;
+        }
+        let home = TestDir::new("lifecycle-sequence-home");
+        let executable = std::env::current_exe();
+        assert!(
+            executable.is_ok(),
+            "test executable should resolve: {executable:?}"
+        );
+        let Ok(executable) = executable else {
+            return;
+        };
+        let current_thread = std::thread::current();
+        let Some(test_name) = current_thread.name() else {
+            return;
+        };
+        let output = Command::new(&executable)
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env("HOME", home.path())
+            .env(SEQUENCE_HELPER_HOME_ENV, home.path())
+            .output();
+        assert!(output.is_ok(), "sequence helper should spawn: {output:?}");
+        let Ok(output) = output else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "sequence helper failed: status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

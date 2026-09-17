@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use yach_proto::{
-    Capability, ClientEvent, DialogResponse, Handshake, ModelInfo, NegotiatedCapabilities,
-    PromptOutcome, ServerEvent, SubmittedSecret,
+    Capability, ClientEvent, DialogResponse, ExtensionLifecycleAction, ExtensionLifecycleOutcome,
+    Handshake, ModelInfo, NegotiatedCapabilities, PromptOutcome, ServerEvent, SubmittedSecret,
 };
 use yach_ui::alpha_handshake;
 trait TestUnwrap {
@@ -91,24 +91,40 @@ struct RpcChild {
     /// while repeated waits consume repeated frames one occurrence at a time.
     pending: VecDeque<ServerEvent>,
     raw_transcript: Vec<String>,
-    home: TempDir,
+    home: Option<TempDir>,
 }
 
 impl RpcChild {
     fn spawn(backend: Option<&str>, project_root: &Path, session_path: &Path) -> Self {
-        Self::spawn_with_session_path(backend, project_root, Some(session_path))
+        Self::spawn_inner(backend, project_root, Some(session_path), None, None)
     }
 
     fn spawn_with_default_session(backend: Option<&str>, project_root: &Path) -> Self {
-        Self::spawn_with_session_path(backend, project_root, None)
+        Self::spawn_inner(backend, project_root, None, None, None)
     }
 
-    fn spawn_with_session_path(
+    fn spawn_with_fixture_package_root(
+        project_root: &Path,
+        session_path: &Path,
+        package_root: &Path,
+    ) -> Self {
+        Self::spawn_inner(
+            None,
+            project_root,
+            Some(session_path),
+            Some(package_root),
+            None,
+        )
+    }
+
+    fn spawn_inner(
         backend: Option<&str>,
         project_root: &Path,
         session_path: Option<&Path>,
+        package_root: Option<&Path>,
+        home: Option<TempDir>,
     ) -> Self {
-        let home = TempDir::new("home");
+        let home = home.unwrap_or_else(|| TempDir::new("home"));
         let mut command = Command::new(env!("CARGO_BIN_EXE_yach"));
         command
             .arg("rpc")
@@ -141,6 +157,9 @@ impl RpcChild {
             {
                 command.env_remove(&*key);
             }
+        }
+        if let Some(package_root) = package_root {
+            command.env("YACH_EXTENSION_PACKAGE_ROOTS", package_root);
         }
         if let Some(backend) = backend {
             command.arg("--backend").arg(backend);
@@ -198,10 +217,31 @@ impl RpcChild {
             pending: VecDeque::new(),
             last_arrival_ms: 0,
             raw_transcript: Vec::new(),
-            home,
+            home: Some(home),
         };
         rpc.wait_ready();
         rpc
+    }
+
+    fn home_path(&self) -> &Path {
+        self.home.as_ref().test_unwrap().path()
+    }
+
+    fn restart_with_fixture_package_root(
+        mut self,
+        project_root: &Path,
+        session_path: &Path,
+        package_root: &Path,
+    ) -> Self {
+        self.shutdown();
+        let home = self.home.take();
+        Self::spawn_inner(
+            None,
+            project_root,
+            Some(session_path),
+            Some(package_root),
+            home,
+        )
     }
 
     fn send(&mut self, event: &ClientEvent) {
@@ -502,6 +542,181 @@ fn rpc_capability_drift_is_explicit() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn rpc_extension_trust_revoke_retains_evidence_and_blocks_restart() {
+    let workspace = TempDir::new("extension-lifecycle");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/capability-network");
+    let session_path = workspace.path().join("extension-lifecycle.jsonl");
+    let mut child =
+        RpcChild::spawn_with_fixture_package_root(workspace.path(), &session_path, &fixture);
+
+    child.send(&ClientEvent::FirstRenderCompleted);
+    child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::StatusUpdated { message }
+                if message.starts_with("extension_background_activation_finished")
+        )
+    });
+    child.send(&ClientEvent::ExtensionDiagnosticSnapshotRequested {
+        request_id: String::from("before-trust"),
+        selector: Some(String::from("example.capability-network")),
+    });
+    let blocked = child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+                request_id,
+                records,
+                ..
+            } if request_id == "before-trust"
+                && records.iter().any(|record|
+                    record.activation_state == "blocked"
+                        && record.id.as_deref() == Some("example.capability-network"))
+        )
+    });
+    let ServerEvent::ExtensionDiagnosticSnapshotUpdated { records, .. } = blocked else {
+        unreachable!("diagnostic predicate returned a different event")
+    };
+    assert_eq!(records.len(), 1, "blocked snapshot must name one fixture");
+    assert_eq!(records[0].capability_grant, Some(Vec::new()));
+
+    child.send(&ClientEvent::ExtensionLifecycleRequested {
+        request_id: String::from("audit-trust"),
+        action: ExtensionLifecycleAction::Trust,
+        selector: String::from("example.capability-network"),
+    });
+    child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::ExtensionLifecycleFinished {
+                request_id,
+                outcome: ExtensionLifecycleOutcome::Completed,
+                ..
+            } if request_id == "audit-trust"
+        )
+    });
+    child.send(&ClientEvent::ExtensionDiagnosticSnapshotRequested {
+        request_id: String::from("after-trust"),
+        selector: Some(String::from("example.capability-network")),
+    });
+    let active = child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+                request_id,
+                records,
+                ..
+            } if request_id == "after-trust"
+                && records.iter().any(|record| record.activation_state == "active")
+        )
+    });
+    let ServerEvent::ExtensionDiagnosticSnapshotUpdated { records, .. } = active else {
+        unreachable!("diagnostic predicate returned a different event")
+    };
+    assert_eq!(records.len(), 1, "active snapshot must name one fixture");
+    assert_eq!(records[0].registered_tools, vec![String::from("fetch_url")]);
+    assert_eq!(
+        records[0].capabilities,
+        Some(vec![String::from("uses_network")])
+    );
+    assert_eq!(
+        records[0].capability_grant,
+        Some(vec![String::from("uses_network")])
+    );
+
+    let authority_path = child
+        .home_path()
+        .join(".yach/extensions/example.capability-network.json");
+    let granted_bytes = fs::read(&authority_path).test_unwrap();
+    let granted: serde_json::Value = serde_json::from_slice(&granted_bytes).test_unwrap();
+    let history = granted["history"].as_array().test_unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["action"], "grant");
+    assert_eq!(history[0]["surface"], "lifecycle");
+    assert!(granted.get("session_id").is_none());
+    assert!(granted.get("turn_id").is_none());
+    assert!(history[0].get("session_id").is_none());
+    assert!(history[0].get("turn_id").is_none());
+    let prior_grant = granted["current"].clone();
+
+    child.send(&ClientEvent::ExtensionLifecycleRequested {
+        request_id: String::from("audit-revoke"),
+        action: ExtensionLifecycleAction::Revoke,
+        selector: String::from("example.capability-network"),
+    });
+    child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::ExtensionLifecycleFinished {
+                request_id,
+                outcome: ExtensionLifecycleOutcome::Completed,
+                ..
+            } if request_id == "audit-revoke"
+        )
+    });
+    child.send(&ClientEvent::ExtensionDiagnosticSnapshotRequested {
+        request_id: String::from("after-revoke"),
+        selector: Some(String::from("example.capability-network")),
+    });
+    let stopped = child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+                request_id,
+                records,
+                ..
+            } if request_id == "after-revoke"
+                && records.iter().any(|record| record.activation_state == "stopped")
+        )
+    });
+    let ServerEvent::ExtensionDiagnosticSnapshotUpdated { records, .. } = stopped else {
+        unreachable!("diagnostic predicate returned a different event")
+    };
+    assert!(records[0].registered_tools.is_empty());
+
+    let revoked_bytes = fs::read(&authority_path).test_unwrap();
+    let revoked: serde_json::Value = serde_json::from_slice(&revoked_bytes).test_unwrap();
+    assert!(revoked["current"].is_null());
+    let history = revoked["history"].as_array().test_unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1]["action"], "revoke");
+    assert_eq!(history[1]["surface"], "lifecycle");
+    assert_eq!(history[1]["before"], prior_grant);
+    assert!(history[1]["after"].is_null());
+
+    let restart_path = workspace.path().join("extension-restart.jsonl");
+    let mut child =
+        child.restart_with_fixture_package_root(workspace.path(), &restart_path, &fixture);
+    child.send(&ClientEvent::FirstRenderCompleted);
+    child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::StatusUpdated { message }
+                if message.starts_with("extension_background_activation_finished")
+        )
+    });
+    child.send(&ClientEvent::ExtensionDiagnosticSnapshotRequested {
+        request_id: String::from("after-restart"),
+        selector: Some(String::from("example.capability-network")),
+    });
+    child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::ExtensionDiagnosticSnapshotUpdated {
+                request_id,
+                records,
+                ..
+            } if request_id == "after-restart"
+                && records.iter().any(|record|
+                    record.activation_state == "blocked"
+                        && record.registered_tools.is_empty()
+                        && record.capability_grant == Some(Vec::new()))
+        )
+    });
+}
+
 #[test]
 fn default_rpc_sessions_live_in_project_keyed_user_state() {
     let workspace = TempDir::new("user-state-session");
@@ -528,7 +743,7 @@ fn default_rpc_sessions_live_in_project_keyed_user_state() {
     child.shutdown();
 
     assert!(!workspace.path().join(".yach").exists());
-    let sessions_root = child.home.path().join(".yach/sessions");
+    let sessions_root = child.home_path().join(".yach/sessions");
     let project_dirs = fs::read_dir(&sessions_root)
         .test_unwrap()
         .filter_map(Result::ok)
@@ -551,7 +766,7 @@ fn default_rpc_sessions_live_in_project_keyed_user_state() {
         use std::os::unix::fs::PermissionsExt as _;
 
         for directory in [
-            child.home.path().join(".yach"),
+            child.home_path().join(".yach"),
             sessions_root,
             project_dirs[0].clone(),
         ] {
@@ -586,7 +801,7 @@ fn rpc_approval_mode_change_is_correlated_persisted_and_auditable() {
     });
     child.shutdown();
 
-    let permission_files = fs::read_dir(child.home.path().join(".yach/permissions"))
+    let permission_files = fs::read_dir(child.home_path().join(".yach/permissions"))
         .test_unwrap()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -598,7 +813,7 @@ fn rpc_approval_mode_change_is_correlated_persisted_and_auditable() {
             .contains("\"mode\":\"accept-edits\"")
     );
 
-    let session_root = child.home.path().join(".yach/sessions");
+    let session_root = child.home_path().join(".yach/sessions");
     let session_file = fs::read_dir(session_root)
         .test_unwrap()
         .filter_map(Result::ok)
@@ -636,9 +851,9 @@ fn rpc_full_access_is_correlated_auditable_and_not_persisted() {
     });
     child.shutdown();
 
-    let permissions = child.home.path().join(".yach/permissions");
+    let permissions = child.home_path().join(".yach/permissions");
     assert!(!permissions.exists() || fs::read_dir(permissions).test_unwrap().next().is_none());
-    let session_file = fs::read_dir(child.home.path().join(".yach/sessions"))
+    let session_file = fs::read_dir(child.home_path().join(".yach/sessions"))
         .test_unwrap()
         .filter_map(Result::ok)
         .flat_map(|entry| fs::read_dir(entry.path()).into_iter().flatten())
