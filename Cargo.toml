@@ -45,3 +45,12 @@ too_many_lines = "allow"
 
 [patch.crates-io]
 rig-core = { path = "vendor/rig-core" }
+
+# Keep backtrace locations without full debugger data in routine builds and tests.
+[profile.dev]
+debug = "line-tables-only"
+
+# Opt in with `just dev cargo build --profile debug-full` (or `cargo test`).
+[profile.debug-full]
+inherits = "dev"
+debug = 2
