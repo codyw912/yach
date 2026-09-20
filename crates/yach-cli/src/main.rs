@@ -15,13 +15,13 @@ use yach_connections::{ConnectionId, CredentialError, CredentialStore, ProviderS
 use yach_backend::{
     BackendMetadata, CatalogModelEntry, DialectSelection, ExtensionActivationDiagnostic,
     ExtensionActivationErrorKind, ExtensionActivationState, ExtensionCapability,
-    ExtensionCapabilityGrantStatus, ExtensionInstallError, ExtensionInstallRecord,
-    ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore, ExtensionManifestIndex,
-    ExtensionPackageRecord, ExtensionPackageRoot, ExtensionPackageRootLoader, ModelDiscoveryFuture,
-    ModelDiscoveryOutcome, ProviderConfig, ProviderError, ProviderErrorKind, ProviderMessage,
-    ProviderModel, ProviderRequest, Role, RunnerConfig, TurnId, fresh_session_id,
-    grant_confirmation_message, grant_id_from_selector, grant_requested,
-    latest_session_log_path_in,
+    ExtensionCapabilityGrantStatus, ExtensionDecisionSurface, ExtensionInstallError,
+    ExtensionInstallRecord, ExtensionInstallRefKind, ExtensionInstallScope, ExtensionInstallStore,
+    ExtensionManifestIndex, ExtensionPackageRecord, ExtensionPackageRoot,
+    ExtensionPackageRootLoader, ModelDiscoveryFuture, ModelDiscoveryOutcome, ProviderConfig,
+    ProviderError, ProviderErrorKind, ProviderMessage, ProviderModel, ProviderRequest, Role,
+    RunnerConfig, TurnId, fresh_session_id, grant_confirmation_message, grant_id_from_selector,
+    grant_requested, latest_session_log_path_in,
     model_discovery::DiscoveredProviderModel,
     nothing_to_grant_message, project_session_log_dir, revoke_confirmation_message, revoke_grant,
     rig_adapter::{
@@ -553,6 +553,14 @@ impl CommandResult {
                     1
                 }
             }
+            Self::ExtensionDiagnostics {
+                outcome: ExtensionDiagnosticsOutcome::Failed,
+                ..
+            }
+            | Self::ExtensionManagement {
+                outcome: ExtensionManagementOutcome::Failed,
+                ..
+            } => 1,
             Self::HeadlessRun { exit_code } | Self::Rpc { exit_code } => *exit_code,
             Self::Version
             | Self::Usage
@@ -4428,6 +4436,7 @@ fn run_extension_trust_command(selector: &str) -> CommandResult {
                 extension_id,
                 &record.manifest.version,
                 &record.manifest.contributes.tools,
+                ExtensionDecisionSurface::Cli,
             ) {
                 Ok(None) => extension_capability_management_result(
                     ExtensionManagementAction::Trust,
@@ -4499,7 +4508,7 @@ fn run_extension_revoke_command(selector: &str) -> CommandResult {
             );
         }
     };
-    match revoke_grant(&extension_id) {
+    match revoke_grant(&extension_id, ExtensionDecisionSurface::Cli) {
         Ok(had_grant) => extension_capability_management_result(
             ExtensionManagementAction::Revoke,
             ExtensionManagementOutcome::Completed,
@@ -4646,17 +4655,65 @@ fn installed_extension_records() -> Vec<ExtensionInstallRecord> {
 }
 
 fn loaded_extension_install_records() -> Result<Vec<ExtensionInstallRecord>, String> {
-    let mut records = load_extension_install_store_for_scope(ExtensionInstallScope::User)?.records;
-    records.extend(load_extension_install_store_for_scope(ExtensionInstallScope::Project)?.records);
+    let user = extension_store_path(ExtensionInstallScope::User)
+        .map_err(|_| String::from("store_path"))?;
+    let project = extension_store_path(ExtensionInstallScope::Project)
+        .map_err(|_| String::from("store_path"))?;
+    loaded_extension_install_records_from_paths(&user, &project)
+}
+
+fn loaded_extension_install_records_from_paths(
+    user: &Path,
+    project: &Path,
+) -> Result<Vec<ExtensionInstallRecord>, String> {
+    let mut records = load_install_records_at(user)?;
+    if !same_install_store(user, project)? {
+        records.extend(load_install_records_at(project)?);
+    }
     Ok(records)
 }
 
-fn load_extension_install_store_for_scope(
-    scope: ExtensionInstallScope,
-) -> Result<ExtensionInstallStore, String> {
-    let path = extension_store_path(scope).map_err(|_| String::from("store_path"))?;
-    ExtensionInstallStore::load_from_path(&path)
+fn load_install_records_at(path: &Path) -> Result<Vec<ExtensionInstallRecord>, String> {
+    ExtensionInstallStore::load_from_path(path)
+        .map(|store| store.records)
         .map_err(|error| extension_install_error_label(&error).to_owned())
+}
+
+fn same_install_store(first: &Path, second: &Path) -> Result<bool, String> {
+    if first == second {
+        return Ok(true);
+    }
+
+    let first_canonical = canonicalize_store_for_identity(first)?;
+    let second_canonical = canonicalize_store_for_identity(second)?;
+    let (Some(first_canonical), Some(second_canonical)) = (first_canonical, second_canonical)
+    else {
+        return Ok(false);
+    };
+    if first_canonical == second_canonical {
+        return Ok(true);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let first_metadata = std::fs::metadata(first).map_err(|_| String::from("store_io"))?;
+        let second_metadata = std::fs::metadata(second).map_err(|_| String::from("store_io"))?;
+        Ok(first_metadata.dev() == second_metadata.dev()
+            && first_metadata.ino() == second_metadata.ino())
+    }
+
+    #[cfg(not(unix))]
+    Ok(false)
+}
+
+fn canonicalize_store_for_identity(path: &Path) -> Result<Option<PathBuf>, String> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(String::from("store_io")),
+    }
 }
 
 fn extension_diagnostic_records_from_index(

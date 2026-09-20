@@ -7,14 +7,14 @@
 //! `docs/project/specs/2026-09-16-extension-capability-contract-design.md`.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::extension::{ExtensionToolContribution, ExtensionToolRisk};
+
+mod store;
+pub use store::{ExtensionAuthorityError, ExtensionAuthorityStore, ExtensionDecisionSurface};
 
 /// A capability an extension may request. Only risks that reach outside the
 /// project require a grant; the file-scoped risks do not.
@@ -101,25 +101,6 @@ pub fn missing_capabilities(
     }
 }
 
-/// Grants live in user home only: repository content may restrict authority
-/// but must never grant it. The file name is only built from a validated
-/// extension id, so `PathBuf::join` cannot be pointed at an arbitrary path.
-#[must_use]
-pub fn grant_path(extension_id: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    grant_path_in(
-        &PathBuf::from(home).join(".yach").join("extensions"),
-        extension_id,
-    )
-}
-
-pub(crate) fn grant_path_in(grants_dir: &Path, extension_id: &str) -> Option<PathBuf> {
-    if !crate::is_valid_extension_id(extension_id) {
-        return None;
-    }
-    Some(grants_dir.join(format!("{extension_id}.json")))
-}
-
 /// Resolve the extension id that owns a grant file.
 ///
 /// A discovered package's manifest id wins, including when the user passed a
@@ -145,74 +126,10 @@ pub fn grant_id_from_selector(
 /// are treated as no grant so they cannot be used as approval.
 #[must_use]
 pub fn load_grant(extension_id: &str) -> Option<ExtensionCapabilityGrant> {
-    load_grant_at(&grant_path(extension_id)?)
-}
-
-pub(crate) fn load_grant_at(path: &Path) -> Option<ExtensionCapabilityGrant> {
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-/// Persist a grant under `~/.yach/extensions/<id>.json`.
-pub fn store_grant(extension_id: &str, grant: &ExtensionCapabilityGrant) -> io::Result<()> {
-    let Some(path) = grant_path(extension_id) else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "HOME and USERPROFILE are unset",
-        ));
-    };
-    store_grant_at(&path, grant)
-}
-
-pub(crate) fn store_grant_at(path: &Path, grant: &ExtensionCapabilityGrant) -> io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "grant path has no parent directory",
-        ));
-    };
-    if !parent.as_os_str().is_empty() && !parent.exists() {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(parent)?;
-    }
-    let encoded = serde_json::to_vec_pretty(grant)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    let mut options = OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(&encoded)?;
-    file.flush()?;
-    Ok(())
-}
-
-/// Remove a grant. A missing file is success.
-pub fn remove_grant(extension_id: &str) -> io::Result<()> {
-    let Some(path) = grant_path(extension_id) else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "HOME and USERPROFILE are unset",
-        ));
-    };
-    remove_grant_at(&path)
-}
-
-pub(crate) fn remove_grant_at(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
+    ExtensionAuthorityStore::for_current_user()
+        .ok()?
+        .load_grant(extension_id)
+        .ok()?
 }
 
 /// Approve the capabilities requested by `tools`. Writes nothing when the
@@ -221,49 +138,22 @@ pub fn grant_requested(
     extension_id: &str,
     version: &str,
     tools: &[ExtensionToolContribution],
-) -> io::Result<Option<ExtensionCapabilityGrant>> {
-    let Some(path) = grant_path(extension_id) else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "HOME and USERPROFILE are unset",
-        ));
-    };
-    grant_requested_at(&path, version, tools)
+    surface: ExtensionDecisionSurface,
+) -> Result<Option<ExtensionCapabilityGrant>, ExtensionAuthorityError> {
+    ExtensionAuthorityStore::for_current_user()?.grant_requested(
+        extension_id,
+        version,
+        tools,
+        surface,
+    )
 }
 
-pub(crate) fn grant_requested_at(
-    path: &Path,
-    version: &str,
-    tools: &[ExtensionToolContribution],
-) -> io::Result<Option<ExtensionCapabilityGrant>> {
-    let approved = requested_capabilities(tools);
-    if approved.is_empty() {
-        return Ok(None);
-    }
-    let grant = ExtensionCapabilityGrant {
-        approved,
-        version_at_grant: version.to_owned(),
-        granted_at: utc_timestamp_now(),
-    };
-    store_grant_at(path, &grant)?;
-    Ok(Some(grant))
-}
-
-/// Remove a grant. Returns whether a file was present. Missing is success.
-pub fn revoke_grant(extension_id: &str) -> io::Result<bool> {
-    let Some(path) = grant_path(extension_id) else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "HOME and USERPROFILE are unset",
-        ));
-    };
-    revoke_grant_at(&path)
-}
-
-pub(crate) fn revoke_grant_at(path: &Path) -> io::Result<bool> {
-    let had_grant = path.is_file();
-    remove_grant_at(path)?;
-    Ok(had_grant)
+/// Revoke current authority. Returns whether an active grant existed.
+pub fn revoke_grant(
+    extension_id: &str,
+    surface: ExtensionDecisionSurface,
+) -> Result<bool, ExtensionAuthorityError> {
+    ExtensionAuthorityStore::for_current_user()?.revoke_grant(extension_id, surface)
 }
 
 /// Human-readable approved set, naming the tools that requested each
@@ -330,7 +220,7 @@ const fn capability_for_risk(risk: ExtensionToolRisk) -> Option<ExtensionCapabil
     }
 }
 
-fn utc_timestamp_now() -> String {
+pub(super) fn utc_timestamp_now() -> String {
     let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
         return String::from("1970-01-01T00:00:00Z");
     };
@@ -367,10 +257,9 @@ fn civil_date_from_unix_days(days: u64) -> Option<(i32, u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtensionCapability, ExtensionCapabilityGrant, capability_approval_label,
-        grant_confirmation_message, grant_id_from_selector, grant_path_in, grant_requested_at,
-        load_grant_at, missing_capabilities, requested_capabilities, revoke_grant_at,
-        store_grant_at,
+        ExtensionAuthorityStore, ExtensionCapability, ExtensionCapabilityGrant,
+        ExtensionDecisionSurface, capability_approval_label, grant_confirmation_message,
+        grant_id_from_selector, missing_capabilities, requested_capabilities,
     };
     use crate::extension::{ExtensionToolContribution, ExtensionToolRisk};
     use std::collections::BTreeSet;
@@ -391,13 +280,6 @@ mod tests {
             version_at_grant: String::from("1.0.0"),
             granted_at: String::from("2026-09-16T00:00:00Z"),
         }
-    }
-
-    fn temp_grant_path(name: &str) -> std::path::PathBuf {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        std::env::temp_dir().join(format!("yach-cap-grant-{name}-{stamp}.json"))
     }
 
     #[test]
@@ -470,107 +352,6 @@ mod tests {
         assert!(decoded.is_ok(), "grant should deserialize: {decoded:?}");
         let Ok(decoded) = decoded else { return };
         assert_eq!(decoded.approved, original.approved);
-
-        let path = temp_grant_path("roundtrip");
-        let stored = store_grant_at(&path, &original);
-        assert!(stored.is_ok(), "grant should store: {stored:?}");
-        let loaded = load_grant_at(&path);
-        let _ = fs::remove_file(&path);
-        assert!(loaded.is_some(), "stored grant should load");
-        let Some(loaded) = loaded else { return };
-        assert_eq!(loaded.approved, original.approved);
-    }
-
-    #[test]
-    fn a_corrupt_grant_file_loads_as_none() {
-        let path = temp_grant_path("corrupt");
-        let write = fs::write(&path, "{not-json");
-        assert!(write.is_ok(), "corrupt grant should write: {write:?}");
-        let exists = path.is_file();
-        let loaded = load_grant_at(&path);
-        let _ = fs::remove_file(&path);
-        assert!(
-            exists,
-            "corrupt grant file must exist so None is not a missing-path miss"
-        );
-        assert!(
-            loaded.is_none(),
-            "corrupt grant must not be treated as approval"
-        );
-    }
-
-    #[test]
-    fn granting_requested_capabilities_covers_them_and_revoking_uncovers() {
-        let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
-        let requested = requested_capabilities(&tools);
-        assert_eq!(
-            requested,
-            BTreeSet::from([ExtensionCapability::UsesNetwork])
-        );
-        assert_eq!(missing_capabilities(&requested, None), requested);
-
-        let path = temp_grant_path("grant-revoke");
-        let stored = grant_requested_at(&path, "1.2.0", &tools);
-        assert!(stored.is_ok(), "grant should store: {stored:?}");
-        let Ok(stored) = stored else { return };
-        assert!(stored.is_some(), "network tool must produce a grant");
-        let Some(stored) = stored else { return };
-        assert_eq!(stored.approved, requested);
-        assert_eq!(stored.version_at_grant, "1.2.0");
-
-        let loaded = load_grant_at(&path);
-        assert!(
-            missing_capabilities(&requested, loaded.as_ref()).is_empty(),
-            "approved set must cover the request"
-        );
-
-        let revoked = revoke_grant_at(&path);
-        let leftover = load_grant_at(&path);
-        let _ = fs::remove_file(&path);
-        assert!(revoked.is_ok(), "revoke should succeed: {revoked:?}");
-        let Ok(had_grant) = revoked else { return };
-        assert!(had_grant, "revoke must report that a grant was present");
-        assert!(leftover.is_none(), "revoked grant must not load");
-        assert_eq!(
-            missing_capabilities(&requested, leftover.as_ref()),
-            requested,
-            "revoking must make the request missing again"
-        );
-    }
-
-    #[test]
-    fn granting_writes_nothing_when_no_capabilities_are_requested() {
-        let tools = vec![tool("read", ExtensionToolRisk::ReadsLocalContent)];
-        let path = temp_grant_path("empty-grant");
-        let stored = grant_requested_at(&path, "1.0.0", &tools);
-        let exists = path.is_file();
-        let _ = fs::remove_file(&path);
-        assert!(stored.is_ok(), "empty request should not error: {stored:?}");
-        let Ok(stored) = stored else { return };
-        assert!(
-            stored.is_none(),
-            "an extension that requests nothing must not get an approved grant"
-        );
-        assert!(
-            !exists,
-            "skip writing so diagnostics can keep absent distinct from an empty approved set"
-        );
-    }
-
-    #[test]
-    fn revoking_a_missing_grant_is_success() {
-        let path = temp_grant_path("missing-revoke");
-        let _ = fs::remove_file(&path);
-        let revoked = revoke_grant_at(&path);
-        assert!(
-            revoked.is_ok(),
-            "missing grant must not fail revoke: {revoked:?}"
-        );
-        let Ok(had_grant) = revoked else { return };
-        assert!(
-            !had_grant,
-            "missing grant must report that none was present"
-        );
     }
 
     #[test]
@@ -608,14 +389,12 @@ mod tests {
 
     #[test]
     fn revoking_an_undiscovered_absolute_path_does_not_delete_outside_the_grant_dir() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let grants_dir =
-            std::env::temp_dir().join(format!("yach-cap-grants-{}-{}", std::process::id(), stamp));
-        let selector_stem =
-            std::env::temp_dir().join(format!("yach-cap-escape-{}-{}", std::process::id(), stamp));
+        let home =
+            std::env::temp_dir().join(format!("yach-cap-escape-home-{}", uuid::Uuid::new_v4()));
+        assert!(fs::create_dir_all(&home).is_ok());
+        let selector_stem = home.join("outside");
         let Some(selector) = selector_stem.to_str() else {
+            let _ = fs::remove_dir_all(&home);
             return;
         };
         let sentinel = std::path::PathBuf::from(format!("{selector}.json"));
@@ -623,14 +402,13 @@ mod tests {
         assert!(write.is_ok(), "sentinel should write: {write:?}");
 
         let resolved = grant_id_from_selector(None, selector);
-        if let Ok(id) = &resolved
-            && let Some(path) = grant_path_in(&grants_dir, id)
-        {
-            let _ = revoke_grant_at(&path);
+        if let Ok(id) = &resolved {
+            let store = ExtensionAuthorityStore::in_home(&home);
+            let _ = store.revoke_grant(id, ExtensionDecisionSurface::Cli);
         }
         let still_there = sentinel.is_file();
         let _ = fs::remove_file(&sentinel);
-        let _ = fs::remove_dir_all(&grants_dir);
+        let _ = fs::remove_dir_all(&home);
 
         assert!(
             resolved.is_err(),

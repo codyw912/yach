@@ -68,7 +68,30 @@ The same check runs at startup and on `/extension-reload`. Reloading does
 not bypass it.
 
 Grants live only in user home, at `~/.yach/extensions/<extension-id>.json`.
-A project checkout cannot grant capability.
+That private JSON document is the inspectable audit artifact; it is not a
+project-controlled file. The versioned `yach.extension-authority.v1` shape
+contains `extension_id`, nullable `current` authority, nullable
+`legacy_baseline`, and an ordered `history`. Each history decision records a
+unique `operation_id`, `recorded_at`, `action` (`grant` or `revoke`), a fixed
+reason, its originating `surface` (`cli` or `lifecycle`), and nullable `before`
+and `after` grant snapshots. A grant snapshot contains the approved capability
+set plus `version_at_grant` and `granted_at` provenance. These fields describe
+the decision Yach recorded; they do not identify or authenticate a particular
+human.
+
+Older three-field grant files (`approved`, `version_at_grant`, `granted_at`)
+still authorize. They have no decision history, so Yach does not invent one.
+The next explicit trust or revoke preserves that imported grant as
+`legacy_baseline` and writes the versioned document with the new decision.
+Revoke sets `current` to null and appends a revoke decision; it deliberately
+does not delete the document or its prior evidence.
+
+A failure before replacement leaves the previous document authoritative and
+unchanged. If replacement has become visible but Yach cannot confirm directory
+durability, the command reports that the update occurred with unknown storage
+durability; it does not claim success or rollback. On platforms that cannot
+sync directories, crash durability of the directory entry is weaker than the
+file contents.
 
 ## Granting and revoking
 
@@ -92,6 +115,11 @@ reloads the extension so activation can proceed. The CLI command writes the
 grant only; the host starts on the next session, or after
 `/extension-reload` in a running TUI.
 
+Extension commands that report `extension_outcome=Failed` exit with status 1.
+Successful commands and diagnostic no-ops exit with status 0; malformed command
+usage exits with status 2. This lets scripts distinguish a printed diagnostic
+failure from a completed command without parsing its human-readable message.
+
 A successful grant prints the approved capabilities and the tools that
 requested each, then:
 
@@ -102,8 +130,9 @@ The extension may activate; Yach does not observe whether the host uses those ca
 An extension that requests no capabilities prints that nothing needed a
 grant, and writes no file.
 
-Revoke deletes the grant. If the package is still loaded, the TUI also
-stops the host. After you have already uninstalled the package, pass the
+Revoke keeps the document and clears current authority, so activation stays
+denied even though history remains. If the package is still loaded, the TUI
+also stops the host. After you have already uninstalled the package, pass the
 extension id from the manifest — a path or other selector is rejected when
 nothing is discovered:
 
@@ -111,24 +140,30 @@ nothing is discovered:
 yach extension revoke example.network-tools
 ```
 
-## Reading diagnostics
+In the TUI, `/extension-status` and `/extension-status <selector>` report the
+live native activation snapshot. Its records reflect the current session's
+activation state, generation, errors, and registered/provider-visible tools.
+The optional selector can match id, source reference, install source, package
+root, or manifest path; an empty or whitespace-only selector is unfiltered.
 
-In the TUI, `/extension-status` and `/extension-status <id>` print live
-records. From the CLI, `yach extension list` and `yach extension doctor`
-(`yach extension doctor <id>` to filter) print the same fields.
+From the CLI, `yach extension list` and `yach extension doctor`
+(`yach extension doctor <id>` to filter) perform a fresh package and install
+scan. They do not start extension hosts and do not claim to be the TUI's live
+snapshot. Both surfaces expose the capability fields, but their other state is
+obtained differently.
 
 Look at `capabilities=` and `capability_grant=`:
 
 | Value | Meaning |
 | --- | --- |
-| `unknown` | The manifest is not yet known. This is not the same as `none`. |
-| `none` on `capabilities=` | The tools request no grant (file-scoped only). |
-| `none` on `capability_grant=` | No grant file is recorded. |
-| `uses_network`, `runs_process`, or both, comma-separated | The derived or approved set. |
+| `unknown` | The manifest or authority was not consulted. This is not the same as `none`. |
+| `none` on `capabilities=` | The known manifest's tools request no grant-requiring capabilities. |
+| `none` on `capability_grant=` | There is no current approval, including after revoke when the authority document and history remain. |
+| `uses_network`, `runs_process`, or both, comma-separated | The derived request or current approved set. |
 
-Treat `unknown` as "not consulted," not as "requests nothing" or "ungranted."
-A record whose package has not been scanned still renders `unknown` rather
-than inventing `none`.
+Treat `unknown` as “not known here,” not as “requests nothing” or “ungranted.”
+A record whose package or authority has not been consulted renders `unknown`
+rather than inventing `none`.
 
 ## Registration follows the manifest
 
