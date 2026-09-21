@@ -124,8 +124,11 @@ impl EditAccess {
         log: &mut SessionLog,
     ) -> Result<EditAccessPrepareOutcome, Box<EditAccessPrepareError>> {
         let permission_request = permission_request_from_edit(&request);
-        let decision =
-            PermissionDecisionEngine::decide(&permission_request, &context.permission_policy);
+        let decision = PermissionDecisionEngine::decide(
+            &permission_request,
+            &context.permission_policy,
+            &crate::ReviewPolicy::empty(),
+        );
         let permission_summary = decision.summary(&permission_request, false);
         log.record_permission_decision(
             context.session_id.clone(),
@@ -437,6 +440,7 @@ fn permission_request_from_edit(request: &EditTransactionRequest) -> PermissionR
         },
         risk: PermissionRisk::WorkspaceWrite,
         requested_reviewer: None,
+        command: None,
     }
 }
 
@@ -848,6 +852,7 @@ mod tests {
         let decision = crate::PermissionDecisionEngine::decide(
             &permission_request,
             &PermissionPolicy::for_edit_mode(PermissionMode::Ask),
+            &crate::ReviewPolicy::empty(),
         );
 
         let crate::PermissionDecision::NeedsUserReview { prompt, .. } = decision else {
@@ -884,6 +889,7 @@ mod tests {
             let decision = crate::PermissionDecisionEngine::decide(
                 &permission_request,
                 &PermissionPolicy::for_edit_mode(PermissionMode::Ask),
+                &crate::ReviewPolicy::empty(),
             );
 
             let crate::PermissionDecision::NeedsUserReview { prompt, .. } = decision else {

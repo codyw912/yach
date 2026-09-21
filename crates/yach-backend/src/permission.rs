@@ -5,7 +5,18 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use yach_proto::ApprovalMode;
 
+use crate::review::{
+    ActionClass, PolicyRevision, RestrictionMatcher, ReviewPolicy, ReviewRestriction,
+};
+
 static PERMISSION_DECISION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub const RESTRICTION_ASK_FIRST_REASON: &str = "restriction_ask_first";
+pub const RESTRICTION_HUMAN_PERFORMS_REASON: &str = "restriction_human_performs";
+pub const REVIEWER_HOLD_RISK_REASON: &str = "reviewer_hold_risk";
+pub const REVIEWER_HOLD_EVIDENCE_REASON: &str = "reviewer_hold_evidence";
+pub const REVIEWER_ERROR_REASON: &str = "reviewer_error";
+pub const REVIEWER_UNAVAILABLE_REASON: &str = "reviewer_unavailable";
 
 const APPROVAL_SETTINGS_SCHEMA: &str = "yach.approval-settings.v1";
 
@@ -188,6 +199,10 @@ pub struct PermissionRequest {
     pub target: PermissionTargetSummary,
     pub risk: PermissionRisk,
     pub requested_reviewer: Option<PermissionReviewer>,
+    /// Argv-normalized command when the request has a shell surface.
+    /// Restriction matchers read this; absent means match `target.operation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +233,8 @@ pub enum PermissionDecision {
         mode: PermissionMode,
         reason: String,
         rationale: Option<String>,
+        #[serde(default)]
+        policy_revision: PolicyRevision,
     },
     Denied {
         decision_id: PermissionDecisionId,
@@ -225,6 +242,8 @@ pub enum PermissionDecision {
         mode: PermissionMode,
         reason: String,
         rationale: Option<String>,
+        #[serde(default)]
+        policy_revision: PolicyRevision,
     },
     NeedsUserReview {
         decision_id: PermissionDecisionId,
@@ -232,6 +251,8 @@ pub enum PermissionDecision {
         mode: PermissionMode,
         reason: String,
         prompt: PermissionPrompt,
+        #[serde(default)]
+        policy_revision: PolicyRevision,
     },
 }
 
@@ -257,6 +278,13 @@ pub struct PermissionDecisionSummary {
     pub reason: String,
     pub rationale: Option<String>,
     pub user_override: bool,
+    /// Restriction-set revision copied into evidence. Absent in logs written
+    /// before intent-aware review, which replay as revision 0.
+    #[serde(default)]
+    pub policy_revision: PolicyRevision,
+    /// Authorization generation copied into evidence. Absent old logs replay as 0.
+    #[serde(default)]
+    pub authorization_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,6 +318,7 @@ impl PermissionDecision {
                 mode,
                 reason,
                 rationale,
+                policy_revision,
             } => PermissionDecisionSummary {
                 request_id: request.request_id.clone(),
                 decision_id: decision_id.clone(),
@@ -304,6 +333,8 @@ impl PermissionDecision {
                 reason: reason.clone(),
                 rationale: sanitized_rationale(rationale.as_deref()),
                 user_override,
+                policy_revision: *policy_revision,
+                authorization_revision: 0,
             },
             Self::Denied {
                 decision_id,
@@ -311,6 +342,7 @@ impl PermissionDecision {
                 mode,
                 reason,
                 rationale,
+                policy_revision,
             } => PermissionDecisionSummary {
                 request_id: request.request_id.clone(),
                 decision_id: decision_id.clone(),
@@ -325,12 +357,15 @@ impl PermissionDecision {
                 reason: reason.clone(),
                 rationale: sanitized_rationale(rationale.as_deref()),
                 user_override,
+                policy_revision: *policy_revision,
+                authorization_revision: 0,
             },
             Self::NeedsUserReview {
                 decision_id,
                 reviewer,
                 mode,
                 reason,
+                policy_revision,
                 ..
             } => PermissionDecisionSummary {
                 request_id: request.request_id.clone(),
@@ -346,6 +381,8 @@ impl PermissionDecision {
                 reason: reason.clone(),
                 rationale: None,
                 user_override,
+                policy_revision: *policy_revision,
+                authorization_revision: 0,
             },
         }
     }
@@ -355,7 +392,15 @@ pub struct PermissionDecisionEngine;
 
 impl PermissionDecisionEngine {
     #[must_use]
-    pub fn decide(request: &PermissionRequest, policy: &PermissionPolicy) -> PermissionDecision {
+    pub fn decide(
+        request: &PermissionRequest,
+        policy: &PermissionPolicy,
+        review_policy: &ReviewPolicy,
+    ) -> PermissionDecision {
+        let restriction_decision = Self::check_restrictions(request, review_policy);
+        if let Some(decision) = restriction_decision {
+            return decision;
+        }
         if extension_self_approval_requested(request) {
             return PermissionDecision::Denied {
                 decision_id: next_permission_decision_id(),
@@ -363,6 +408,7 @@ impl PermissionDecisionEngine {
                 mode: policy.edit_mode,
                 reason: String::from("extension_self_approval_denied"),
                 rationale: None,
+                policy_revision: review_policy.revision,
             };
         }
 
@@ -379,6 +425,7 @@ impl PermissionDecisionEngine {
                     mode: policy.edit_mode,
                     reason: String::from("permission_risk_denied"),
                     rationale: None,
+                    policy_revision: review_policy.revision,
                 };
             }
             PermissionCapability::ShellCommand
@@ -395,6 +442,7 @@ impl PermissionDecisionEngine {
                 mode,
                 reason: String::from("permission_mode_allowed"),
                 rationale: None,
+                policy_revision: review_policy.revision,
             },
             PermissionMode::Ask => PermissionDecision::NeedsUserReview {
                 decision_id: next_permission_decision_id(),
@@ -402,6 +450,7 @@ impl PermissionDecisionEngine {
                 mode,
                 reason: String::from("permission_mode_ask"),
                 prompt: permission_prompt(request),
+                policy_revision: review_policy.revision,
             },
             PermissionMode::Deny => PermissionDecision::Denied {
                 decision_id: next_permission_decision_id(),
@@ -409,6 +458,7 @@ impl PermissionDecisionEngine {
                 mode,
                 reason: String::from("permission_mode_denied"),
                 rationale: None,
+                policy_revision: review_policy.revision,
             },
             PermissionMode::AutoReview => PermissionDecision::NeedsUserReview {
                 decision_id: next_permission_decision_id(),
@@ -416,6 +466,7 @@ impl PermissionDecisionEngine {
                 mode,
                 reason: String::from("auto_review_unavailable_fallback_ask"),
                 prompt: permission_prompt(request),
+                policy_revision: review_policy.revision,
             },
         }
     }
@@ -428,11 +479,16 @@ impl PermissionDecisionEngine {
         approval_mode: ApprovalMode,
         user_allowlisted: bool,
         session_granted: bool,
+        review_policy: &ReviewPolicy,
     ) -> PermissionDecision {
+        let restriction_decision = Self::check_restrictions(request, review_policy);
+        if let Some(decision) = restriction_decision {
+            return decision;
+        }
         if request.capability != PermissionCapability::ShellCommand
             || request.risk != PermissionRisk::ProcessExecution
         {
-            return Self::deny_shell(request, "permission_risk_denied");
+            return Self::deny_shell_at(request, "permission_risk_denied", review_policy.revision);
         }
         if user_allowlisted {
             return PermissionDecision::Allowed {
@@ -441,6 +497,7 @@ impl PermissionDecisionEngine {
                 mode: PermissionMode::Allow,
                 reason: String::from("shell_user_allowlist"),
                 rationale: None,
+                policy_revision: review_policy.revision,
             };
         }
         // A session grant is the user's own prior review of this exact
@@ -453,6 +510,7 @@ impl PermissionDecisionEngine {
                 mode: PermissionMode::Allow,
                 reason: String::from("shell_session_grant"),
                 rationale: None,
+                policy_revision: review_policy.revision,
             };
         }
         match approval_mode {
@@ -463,6 +521,7 @@ impl PermissionDecisionEngine {
                     mode: PermissionMode::Ask,
                     reason: String::from("approval_mode_requires_review"),
                     prompt: permission_prompt(request),
+                    policy_revision: review_policy.revision,
                 }
             }
             ApprovalMode::FullAccess => PermissionDecision::Allowed {
@@ -471,12 +530,21 @@ impl PermissionDecisionEngine {
                 mode: PermissionMode::Allow,
                 reason: String::from("approval_mode_full_access"),
                 rationale: None,
+                policy_revision: review_policy.revision,
             },
         }
     }
 
     #[must_use]
     pub fn deny_shell(request: &PermissionRequest, reason: &str) -> PermissionDecision {
+        Self::deny_shell_at(request, reason, PolicyRevision(0))
+    }
+
+    fn deny_shell_at(
+        request: &PermissionRequest,
+        reason: &str,
+        policy_revision: PolicyRevision,
+    ) -> PermissionDecision {
         debug_assert_eq!(request.capability, PermissionCapability::ShellCommand);
         PermissionDecision::Denied {
             decision_id: next_permission_decision_id(),
@@ -484,7 +552,162 @@ impl PermissionDecisionEngine {
             mode: PermissionMode::Deny,
             reason: reason.to_owned(),
             rationale: None,
+            policy_revision,
         }
+    }
+
+    /// Standing user restrictions. `None` means no restriction matches.
+    /// Global matches are considered before project matches; a project entry
+    /// can add a hold but cannot relax a global `HumanPerforms`.
+    #[must_use]
+    pub fn check_restrictions(
+        request: &PermissionRequest,
+        policy: &ReviewPolicy,
+    ) -> Option<PermissionDecision> {
+        let restriction = selected_restriction(policy, request)?;
+        let reason = match restriction {
+            ReviewRestriction::AskFirst { .. } => String::from(RESTRICTION_ASK_FIRST_REASON),
+            ReviewRestriction::HumanPerforms { .. } => {
+                String::from(RESTRICTION_HUMAN_PERFORMS_REASON)
+            }
+        };
+        Some(PermissionDecision::NeedsUserReview {
+            decision_id: next_permission_decision_id(),
+            reviewer: PermissionReviewer::User,
+            mode: PermissionMode::Ask,
+            reason,
+            prompt: restriction_prompt(request, restriction),
+            policy_revision: policy.revision,
+        })
+    }
+}
+
+fn selected_restriction<'a>(
+    policy: &'a ReviewPolicy,
+    request: &PermissionRequest,
+) -> Option<&'a ReviewRestriction> {
+    let global = strongest_match(&policy.global, request);
+    let project = strongest_match(&policy.project, request);
+    match (global, project) {
+        (Some(global @ ReviewRestriction::HumanPerforms { .. }), _) => Some(global),
+        (_, Some(project @ ReviewRestriction::HumanPerforms { .. })) => Some(project),
+        (Some(global), _) => Some(global),
+        (None, project) => project,
+    }
+}
+
+fn strongest_match<'a>(
+    restrictions: &'a [ReviewRestriction],
+    request: &PermissionRequest,
+) -> Option<&'a ReviewRestriction> {
+    let mut selected: Option<&ReviewRestriction> = None;
+    for restriction in restrictions {
+        if !restriction_matches(restriction, request) {
+            continue;
+        }
+        let replace = match selected {
+            None => true,
+            Some(ReviewRestriction::AskFirst { .. })
+                if matches!(restriction, ReviewRestriction::HumanPerforms { .. }) =>
+            {
+                true
+            }
+            Some(_) => false,
+        };
+        if replace {
+            selected = Some(restriction);
+        }
+    }
+    selected
+}
+
+fn restriction_matches(restriction: &ReviewRestriction, request: &PermissionRequest) -> bool {
+    let matcher = match restriction {
+        ReviewRestriction::AskFirst { matcher, .. }
+        | ReviewRestriction::HumanPerforms { matcher, .. } => matcher,
+    };
+    match matcher {
+        RestrictionMatcher::CommandPrefix { prefix } => {
+            command_candidates(request).any(|command| command_prefix_matches(command, prefix))
+        }
+        RestrictionMatcher::PathPrefix { prefix } => {
+            path_prefix_matches(&request.target.resource, prefix)
+        }
+        RestrictionMatcher::ActionClass { class } => command_candidates(request)
+            .any(|command| inferred_action_class(command) == Some(*class)),
+    }
+}
+
+fn command_candidates(request: &PermissionRequest) -> impl Iterator<Item = &str> {
+    let explicit = request
+        .command
+        .as_deref()
+        .filter(|command| !command.is_empty());
+    let operation = (request.capability == PermissionCapability::ShellCommand)
+        .then_some(request.target.operation.as_str())
+        .filter(|operation| !operation.is_empty());
+    explicit.into_iter().chain(operation)
+}
+
+fn command_prefix_matches(command: &str, prefix: &str) -> bool {
+    let command = normalized_argv(command);
+    let prefix = normalized_argv(prefix);
+    if prefix.is_empty() || command.len() < prefix.len() {
+        return false;
+    }
+    command
+        .iter()
+        .zip(prefix.iter())
+        .all(|(left, right)| left == right)
+}
+
+fn normalized_argv(command: &str) -> Vec<String> {
+    match shell_words::split(command) {
+        Ok(argv) if !argv.is_empty() => argv,
+        _ => command.split_whitespace().map(str::to_owned).collect(),
+    }
+}
+
+fn path_prefix_matches(resource: &str, prefix: &str) -> bool {
+    let resource = resource.trim();
+    let prefix = prefix.trim();
+    if prefix.is_empty() || resource.is_empty() {
+        return false;
+    }
+    Path::new(resource).starts_with(Path::new(prefix))
+}
+
+fn inferred_action_class(command: &str) -> Option<ActionClass> {
+    let argv = normalized_argv(command);
+    let first = argv.first().map(String::as_str)?;
+    let second = argv.get(1).map(String::as_str);
+    match (first, second) {
+        ("nixos-rebuild" | "darwin-rebuild", _) => Some(ActionClass::HostActivation),
+        ("cargo" | "npm" | "pnpm" | "yarn", Some("publish")) => Some(ActionClass::ExternalPublish),
+        ("cargo", Some("install")) | ("nix-env", _) | ("brew", Some("install")) => {
+            Some(ActionClass::PersistentInstall)
+        }
+        ("nix", Some("profile")) => Some(ActionClass::PersistentInstall),
+        ("rm" | "shred", _) | ("git", Some("clean")) => Some(ActionClass::DestructiveDelete),
+        _ => None,
+    }
+}
+
+fn restriction_prompt(
+    request: &PermissionRequest,
+    restriction: &ReviewRestriction,
+) -> PermissionPrompt {
+    let note = match restriction {
+        ReviewRestriction::AskFirst { note, .. }
+        | ReviewRestriction::HumanPerforms { note, .. } => note.as_str(),
+    };
+    let title = match restriction {
+        ReviewRestriction::HumanPerforms { .. } => String::from("Human performs this action"),
+        ReviewRestriction::AskFirst { .. } => format!("Approve {}", request.target.operation),
+    };
+    PermissionPrompt {
+        title: truncate_chars(&title, 128),
+        body: truncate_chars(note, 512),
     }
 }
 
@@ -576,9 +799,11 @@ fn next_permission_decision_id() -> PermissionDecisionId {
 mod tests {
     use super::{
         PermissionActor, PermissionCapability, PermissionDecision, PermissionDecisionEngine,
-        PermissionDecisionId, PermissionMode, PermissionPolicy, PermissionRequest,
-        PermissionReviewer, PermissionRisk, PermissionTargetSummary, persist_project_approval_mode,
+        PermissionDecisionId, PermissionDecisionSummary, PermissionMode, PermissionPolicy,
+        PermissionRequest, PermissionReviewer, PermissionRisk, PermissionTargetSummary,
+        persist_project_approval_mode,
     };
+    use crate::review::{PolicyRevision, ReviewPolicy};
     use std::path::Path;
     use yach_proto::ApprovalMode;
 
@@ -593,6 +818,7 @@ mod tests {
             },
             risk: PermissionRisk::WorkspaceWrite,
             requested_reviewer: None,
+            command: None,
         }
     }
 
@@ -607,6 +833,7 @@ mod tests {
             },
             risk: PermissionRisk::ProcessExecution,
             requested_reviewer: None,
+            command: None,
         }
     }
 
@@ -615,6 +842,7 @@ mod tests {
         let decision = PermissionDecisionEngine::decide(
             &edit_request(),
             &PermissionPolicy::for_edit_mode(PermissionMode::Ask),
+            &ReviewPolicy::empty(),
         );
 
         assert!(matches!(
@@ -631,6 +859,7 @@ mod tests {
         let decision = PermissionDecisionEngine::decide(
             &edit_request(),
             &PermissionPolicy::for_edit_mode(PermissionMode::Allow),
+            &ReviewPolicy::empty(),
         );
 
         assert!(matches!(
@@ -647,6 +876,7 @@ mod tests {
         let decision = PermissionDecisionEngine::decide(
             &edit_request(),
             &PermissionPolicy::for_edit_mode(PermissionMode::Deny),
+            &ReviewPolicy::empty(),
         );
 
         assert!(matches!(
@@ -664,6 +894,7 @@ mod tests {
         let decision = PermissionDecisionEngine::decide(
             &edit_request(),
             &PermissionPolicy::for_edit_mode(PermissionMode::AutoReview),
+            &ReviewPolicy::empty(),
         );
 
         assert!(matches!(
@@ -692,6 +923,7 @@ mod tests {
         let decision = PermissionDecisionEngine::decide(
             &request,
             &PermissionPolicy::for_edit_mode(PermissionMode::Allow),
+            &ReviewPolicy::empty(),
         );
 
         assert!(matches!(
@@ -713,6 +945,7 @@ mod tests {
         let decision = PermissionDecisionEngine::decide(
             &request,
             &PermissionPolicy::for_edit_mode(PermissionMode::Allow),
+            &ReviewPolicy::empty(),
         );
 
         assert!(matches!(
@@ -739,6 +972,7 @@ mod tests {
             mode: PermissionMode::Allow,
             reason: String::from("permission_mode_allowed"),
             rationale: Some(String::from("raw hidden reviewer rationale")),
+            policy_revision: PolicyRevision(0),
         };
 
         let summary = decision.summary(&request, false);
@@ -757,6 +991,7 @@ mod tests {
             ApprovalMode::Review,
             false,
             false,
+            &ReviewPolicy::empty(),
         );
         assert!(matches!(
             review,
@@ -772,6 +1007,7 @@ mod tests {
             ApprovalMode::FullAccess,
             false,
             false,
+            &ReviewPolicy::empty(),
         );
         assert!(matches!(
             full_access,
@@ -787,6 +1023,7 @@ mod tests {
             ApprovalMode::FullAccess,
             true,
             false,
+            &ReviewPolicy::empty(),
         );
         assert!(matches!(
             allowlisted,
@@ -806,6 +1043,7 @@ mod tests {
             ApprovalMode::Review,
             false,
             true,
+            &ReviewPolicy::empty(),
         );
         assert!(
             matches!(
@@ -830,6 +1068,7 @@ mod tests {
             ApprovalMode::Review,
             true,
             true,
+            &ReviewPolicy::empty(),
         );
         assert!(
             matches!(
@@ -849,5 +1088,310 @@ mod tests {
             return;
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    fn human_performs(prefix: &str) -> crate::ReviewRestriction {
+        crate::ReviewRestriction::HumanPerforms {
+            matcher: crate::RestrictionMatcher::CommandPrefix {
+                prefix: prefix.to_owned(),
+            },
+            note: String::from("I run rebuilds"),
+        }
+    }
+
+    #[test]
+    fn project_ask_first_cannot_relax_global_human_performs() {
+        let request = PermissionRequest {
+            target: PermissionTargetSummary {
+                operation: String::from("nixos-rebuild switch"),
+                resource: String::from("."),
+            },
+            ..shell_request()
+        };
+        let review_policy = crate::ReviewPolicy {
+            revision: crate::PolicyRevision(4),
+            global: vec![human_performs("nixos-rebuild")],
+            project: vec![crate::ReviewRestriction::AskFirst {
+                matcher: crate::RestrictionMatcher::CommandPrefix {
+                    prefix: String::from("nixos-rebuild"),
+                },
+                note: String::from("project wants to ask"),
+            }],
+        };
+
+        let decision = PermissionDecisionEngine::decide_shell(
+            &request,
+            ApprovalMode::FullAccess,
+            true,
+            true,
+            &review_policy,
+        );
+
+        assert!(
+            matches!(
+                decision,
+                PermissionDecision::NeedsUserReview { ref reason, .. }
+                    if reason == "restriction_human_performs"
+            ),
+            "global human-performs must outrank project ask-first, allowlist, session grant, and full-access, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn project_restriction_holds_when_global_does_not_match() {
+        let request = PermissionRequest {
+            target: PermissionTargetSummary {
+                operation: String::from("cargo publish -p yach"),
+                resource: String::from("."),
+            },
+            ..shell_request()
+        };
+        let review_policy = crate::ReviewPolicy {
+            revision: crate::PolicyRevision(1),
+            global: vec![human_performs("nixos-rebuild")],
+            project: vec![crate::ReviewRestriction::AskFirst {
+                matcher: crate::RestrictionMatcher::CommandPrefix {
+                    prefix: String::from("cargo publish"),
+                },
+                note: String::from("confirm publish"),
+            }],
+        };
+
+        let decision = PermissionDecisionEngine::decide_shell(
+            &request,
+            ApprovalMode::FullAccess,
+            true,
+            true,
+            &review_policy,
+        );
+
+        assert!(
+            matches!(
+                decision,
+                PermissionDecision::NeedsUserReview { ref reason, .. }
+                    if reason == "restriction_ask_first"
+            ),
+            "a project restriction must add a hold the global set does not cover, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn allow_mode_edit_still_holds_for_global_path_restriction() {
+        let request = PermissionRequest {
+            target: PermissionTargetSummary {
+                operation: String::from("modify_text_file"),
+                resource: String::from("secrets/keys.txt"),
+            },
+            ..edit_request()
+        };
+        let review_policy = crate::ReviewPolicy {
+            revision: crate::PolicyRevision(2),
+            global: vec![crate::ReviewRestriction::HumanPerforms {
+                matcher: crate::RestrictionMatcher::PathPrefix {
+                    prefix: String::from("secrets"),
+                },
+                note: String::from("I handle secrets"),
+            }],
+            project: vec![crate::ReviewRestriction::AskFirst {
+                matcher: crate::RestrictionMatcher::PathPrefix {
+                    prefix: String::from("secrets"),
+                },
+                note: String::from("project would only ask"),
+            }],
+        };
+
+        let decision = PermissionDecisionEngine::decide(
+            &request,
+            &PermissionPolicy::for_edit_mode(PermissionMode::Allow),
+            &review_policy,
+        );
+
+        assert!(
+            matches!(
+                decision,
+                PermissionDecision::NeedsUserReview { ref reason, .. }
+                    if reason == "restriction_human_performs"
+            ),
+            "edit allow mode must not bypass a global human-performs path restriction, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn host_activation_class_holds_under_full_access_and_allowlist() {
+        let request = PermissionRequest {
+            target: PermissionTargetSummary {
+                operation: String::from("nixos-rebuild switch"),
+                resource: String::from("."),
+            },
+            ..shell_request()
+        };
+        let review_policy = ReviewPolicy {
+            revision: crate::PolicyRevision(1),
+            global: vec![crate::ReviewRestriction::HumanPerforms {
+                matcher: crate::RestrictionMatcher::ActionClass {
+                    class: crate::ActionClass::HostActivation,
+                },
+                note: String::from("I run rebuilds"),
+            }],
+            project: Vec::new(),
+        };
+        let decision = PermissionDecisionEngine::decide_shell(
+            &request,
+            ApprovalMode::FullAccess,
+            true,
+            true,
+            &review_policy,
+        );
+        assert!(
+            matches!(
+                decision,
+                PermissionDecision::NeedsUserReview { ref reason, .. }
+                    if reason == "restriction_human_performs"
+            ),
+            "host activation must hold even when allowlisted under full-access, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn empty_command_prefix_does_not_hold_every_command() {
+        let review_policy = ReviewPolicy {
+            revision: crate::PolicyRevision(1),
+            global: vec![crate::ReviewRestriction::HumanPerforms {
+                matcher: crate::RestrictionMatcher::CommandPrefix {
+                    prefix: String::new(),
+                },
+                note: String::from("blank"),
+            }],
+            project: Vec::new(),
+        };
+        let decision = PermissionDecisionEngine::decide_shell(
+            &shell_request(),
+            ApprovalMode::FullAccess,
+            true,
+            false,
+            &review_policy,
+        );
+        assert!(
+            matches!(
+                decision,
+                PermissionDecision::Allowed { ref reason, .. } if reason == "shell_user_allowlist"
+            ),
+            "an empty prefix must not match every command, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn old_permission_summary_without_revisions_replays() {
+        let decision = PermissionDecisionEngine::decide(
+            &edit_request(),
+            &PermissionPolicy::for_edit_mode(PermissionMode::Ask),
+            &ReviewPolicy::empty(),
+        );
+        let summary = decision.summary(&edit_request(), false);
+        let encoded = serde_json::to_value(&summary);
+        assert!(encoded.is_ok());
+        let Ok(mut encoded) = encoded else {
+            return;
+        };
+        let Some(object) = encoded.as_object_mut() else {
+            return;
+        };
+        object.remove("policy_revision");
+        object.remove("authorization_revision");
+        let replayed = serde_json::from_value::<PermissionDecisionSummary>(encoded);
+        assert!(replayed.is_ok());
+        let Ok(replayed) = replayed else {
+            return;
+        };
+        assert_eq!(replayed.policy_revision, crate::PolicyRevision(0));
+        assert_eq!(replayed.authorization_revision, 0);
+        assert_eq!(replayed.reason, summary.reason);
+    }
+
+    #[test]
+    fn restriction_decision_records_evaluated_policy_revision() {
+        let request = PermissionRequest {
+            target: PermissionTargetSummary {
+                operation: String::from("nixos-rebuild switch"),
+                resource: String::from("."),
+            },
+            ..shell_request()
+        };
+        let review_policy = ReviewPolicy {
+            revision: crate::PolicyRevision(7),
+            global: vec![human_performs("nixos-rebuild")],
+            project: Vec::new(),
+        };
+        let decision = PermissionDecisionEngine::decide_shell(
+            &request,
+            ApprovalMode::FullAccess,
+            true,
+            true,
+            &review_policy,
+        );
+        let summary = decision.summary(&request, false);
+        assert_eq!(summary.policy_revision, crate::PolicyRevision(7));
+        assert_eq!(summary.reason, "restriction_human_performs");
+    }
+
+    #[test]
+    fn path_prefix_matches_root_and_rejects_sibling_stem() {
+        let root_hold = PermissionDecisionEngine::decide(
+            &PermissionRequest {
+                target: PermissionTargetSummary {
+                    operation: String::from("modify_text_file"),
+                    resource: String::from("/etc/nixos/configuration.nix"),
+                },
+                ..edit_request()
+            },
+            &PermissionPolicy::for_edit_mode(PermissionMode::Allow),
+            &ReviewPolicy {
+                revision: crate::PolicyRevision(1),
+                global: vec![crate::ReviewRestriction::AskFirst {
+                    matcher: crate::RestrictionMatcher::PathPrefix {
+                        prefix: String::from("/"),
+                    },
+                    note: String::from("anywhere absolute"),
+                }],
+                project: Vec::new(),
+            },
+        );
+        assert!(
+            matches!(
+                root_hold,
+                PermissionDecision::NeedsUserReview { ref reason, .. }
+                    if reason == "restriction_ask_first"
+            ),
+            "root path prefix must match an absolute resource, got {root_hold:?}"
+        );
+
+        let sibling = PermissionDecisionEngine::decide(
+            &PermissionRequest {
+                target: PermissionTargetSummary {
+                    operation: String::from("modify_text_file"),
+                    resource: String::from("/foo/bar"),
+                },
+                ..edit_request()
+            },
+            &PermissionPolicy::for_edit_mode(PermissionMode::Allow),
+            &ReviewPolicy {
+                revision: crate::PolicyRevision(1),
+                global: vec![crate::ReviewRestriction::HumanPerforms {
+                    matcher: crate::RestrictionMatcher::PathPrefix {
+                        prefix: String::from("/foo/ba"),
+                    },
+                    note: String::from("not a sibling"),
+                }],
+                project: Vec::new(),
+            },
+        );
+        assert!(
+            matches!(
+                sibling,
+                PermissionDecision::Allowed { ref reason, .. }
+                    if reason == "permission_mode_allowed"
+            ),
+            "path prefix must not match a sibling stem, got {sibling:?}"
+        );
     }
 }

@@ -3814,6 +3814,10 @@ pub(crate) fn provider_messages_from_event_slice(
         | SessionEvent::MetricRecorded { .. }
         | SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::PermissionDecisionRecorded { .. }
+        | SessionEvent::ReviewPolicyChanged { .. }
+        | SessionEvent::ReviewRequestRecorded { .. }
+        | SessionEvent::ReviewAssessmentRecorded { .. }
+        | SessionEvent::ExactActionGrantRecorded { .. }
         | SessionEvent::SessionModelChanged { .. }
         | SessionEvent::ApprovalModeChanged { .. }
         | SessionEvent::ThinkingLevelChanged { .. }
@@ -7917,6 +7921,7 @@ async fn execute_native_provider_bash_tool_request(
         },
         risk: PermissionRisk::ProcessExecution,
         requested_reviewer: None,
+        command: Some(command.clone()),
     };
 
     let finish_failed = |batch: &mut ProviderAgentToolBatch<'_>,
@@ -7987,6 +7992,7 @@ exists today. Ask the user to fix .yach/config.json.",
         batch
             .shell_session_grants
             .is_granted(&command, &prepared.cwd),
+        &crate::ReviewPolicy::empty(),
     );
     let permission_decision_id = permission_decision.decision_id().0;
     let permission_summary =
@@ -12567,6 +12573,10 @@ mod tests {
                 | SessionEvent::MetricRecorded { .. }
                 | SessionEvent::StaticContextIncluded { .. }
                 | SessionEvent::PermissionDecisionRecorded { .. }
+                | SessionEvent::ReviewPolicyChanged { .. }
+                | SessionEvent::ReviewRequestRecorded { .. }
+                | SessionEvent::ReviewAssessmentRecorded { .. }
+                | SessionEvent::ExactActionGrantRecorded { .. }
                 | SessionEvent::ApprovalModeChanged { .. }
                 | SessionEvent::ThinkingLevelChanged { .. }
                 | SessionEvent::SessionModelChanged { .. }

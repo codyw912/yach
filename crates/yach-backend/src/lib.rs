@@ -28,6 +28,7 @@ mod permission;
 mod provider;
 #[cfg(feature = "bench")]
 pub mod request_assembly;
+pub mod review;
 mod thinking_config;
 
 mod provider_connections;
@@ -67,6 +68,7 @@ pub use extension_capability::*;
 pub use extension_install::*;
 pub use permission::*;
 pub use provider::*;
+pub use review::*;
 pub use thinking_config::*;
 
 pub use provider_connections::*;
@@ -6300,10 +6302,12 @@ mod tests {
             },
             risk: PermissionRisk::WorkspaceWrite,
             requested_reviewer: None,
+            command: None,
         };
         let decision = PermissionDecisionEngine::decide(
             &request,
             &PermissionPolicy::for_edit_mode(PermissionMode::Allow),
+            &super::ReviewPolicy::empty(),
         );
 
         log.record_permission_decision(
@@ -6358,10 +6362,12 @@ mod tests {
             },
             risk: PermissionRisk::WorkspaceWrite,
             requested_reviewer: None,
+            command: None,
         };
         let decision = PermissionDecisionEngine::decide(
             &request,
             &PermissionPolicy::for_edit_mode(PermissionMode::Ask),
+            &super::ReviewPolicy::empty(),
         );
         log.record_permission_decision(
             SessionId(String::from("default")),
