@@ -2,7 +2,7 @@
 
 **Outcome:** plane:YACH-11
 
-Status: design direction approved 2026-09-21; written specification awaiting user review.
+Status: accepted 2026-09-21; implementation pending.
 
 ## Problem and outcome
 
