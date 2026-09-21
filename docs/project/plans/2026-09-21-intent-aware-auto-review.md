@@ -1,4 +1,5 @@
 # Intent-Aware Automatic Review Implementation Plan
+<!-- amended 2026-09-21: enablement gate is a compile-time const, not a docs-file check; restriction checks run ahead of allowlist/session grants -->
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use sjujperpowers:subagent-driven-development (recommended) or sjujperpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -176,7 +177,7 @@ Expected: FAIL — `review` module does not exist.
 
 `review/policy.rs`: document schema `yach.review-policy.v1`, path `$HOME/.yach/review-policy.json` (single user-owned file; project restrictions keyed inside by canonical project key). Reuse the temp-write + `sync_all` + rename pattern and `create_private_dir`/`0o700`/`0o600` modes from `permission.rs`. `replace` serializes, fsyncs, renames, then bumps in-memory revision only on success.
 
-`permission.rs`: add the new reason codes and the two `PermissionDecisionSummary` fields; add `PermissionDecisionEngine::check_restrictions(request, policy) -> Option<PermissionDecision>` that runs before mode logic and returns `NeedsUserReview`/`Denied` on `AskFirst`/`HumanPerforms` matches. Global restrictions evaluate before project restrictions; a project entry can add restrictions but never remove a global match.
+`permission.rs`: add the new reason codes and the two `PermissionDecisionSummary` fields; add `PermissionDecisionEngine::check_restrictions(request, policy) -> Option<PermissionDecision>` invoked as the **first statement** in both `decide` and `decide_shell` — ahead of the `user_allowlisted` and `session_granted` early returns in `decide_shell` (permission.rs:437-457), so a stale allowlist entry or prior session grant can never bypass a standing restriction. Global restrictions evaluate before project restrictions; a project entry can add restrictions but never remove a global match.
 
 `session.rs`: add the four event variants with bounded summary types; wire them into compaction-preserved event classes alongside existing permission events.
 
@@ -474,6 +475,11 @@ async fn human_performs_restriction_holds_under_full_access() { /* policy has
     hold, no spawn */ }
 
 #[tokio::test]
+async fn restriction_holds_despite_allowlist_and_session_grant() { /* policy has
+    AskFirst matching "cargo publish"; command is in user allowlist AND has a
+    prior session grant → still NeedsUserReview, no spawn */ }
+
+#[tokio::test]
 async fn stale_edit_preview_rejected_after_policy_change() { /* prepare edit at
     rev 1, bump policy to rev 2, apply → StaleAuthorization, file unchanged */ }
 
@@ -622,7 +628,7 @@ jj commit crates/yach-ui crates/yach-cli README.md tests/visual/auto_review.tape
   - Corpus format: one JSON per case `{id, category, action: ReviewAction, trusted_evidence, untrusted_evidence, policy, expected_route: execute|hold_risk|hold_clarify|hold_human|fail}`, covering every spec bullet (routine edits/builds/deps, persistent installs, Nix edit-vs-activate, publish, deletion, ambiguity, secrets, injection, truncated evidence, timeouts, malformed/stale responses, revocation races). Held-out set: ≥30% of cases, disjoint, same schema.
   - Runner: `yach-bench eval-review --corpus <dir> --reviewer fixture|jev --out <json>`; fixture mode is deterministic CI; jev mode requires `TYPESAFE_API_KEY` via SecretSpec and writes latency/cost/model columns. Gate: zero automatic executions on labeled hold/fail cases; 100% of designated routine cases execute; report incorrect-approval severity, unnecessary-intervention rate, p50/p95 latency, request sizes, token usage.
   - Perf workload: `review/route/deterministic` and `review/route/fixture_assess` in a new `workloads/review.rs` measuring coordinator overhead with a no-network fixture; thresholds added to `perf-thresholds.toml` after a baseline run.
-  - Enablement: `ApprovalMode::AutoReview` stays gated behind a `YACH_AUTO_EVAL_PASSED=1`-style runtime check or a compiled-in flag until the record file lands — simplest honest gate: the coordinator refuses reviewer routing unless the eval artifact path in the record exists **or** `cfg!(test)`/fixture reviewer is in use. Decide the exact mechanism in-task; the requirement is "no model-derived execution before frozen eval passes", not a specific flag shape.
+  - Enablement gate: a compile-time `pub(crate) const AUTO_REVIEW_EXECUTION_ENABLED: bool = false;` in `review/coordinator.rs`. The coordinator returns `ReviewFailed{Disabled}` for any model-derived route while it is `false`; fixture reviewers and `cfg!(test)` bypass it. Task 8 flips it to `true` in the same commit that lands the passing evaluation record — the gate is visible in the diff and has no runtime filesystem dependency.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -657,5 +663,5 @@ jj commit evals/auto-review crates/yach-bench docs/project/records -m "Add froze
 ## Self-Review Notes
 
 - **Spec coverage:** durable restrictions (T1), reviewer contract (T2), Jev adapter (T3), bounded request/assessment/routing (T4), execution wiring + freshness + cancellation (T5), protocol + compatibility (T6), TUI/RPC/headless (T7), evaluation + perf + enablement gate (T8). Amendment items (permission-vs-integrity split, exact-target grants) land in T5's `for_review_target` + apply revalidation. Evidence-before-effects in T1 events + T4/T5 ordering. Bootstrap/self-approval ban enforced by T2's reviewer-cannot-declare-tools + T5's activation-time binding.
-- **Known soft spot:** Task 8's enablement gate mechanism is deliberately left to the implementer within a stated requirement — flag for review if a concrete flag shape is preferred up front.
+- **Enablement gate:** compile-time const in the coordinator (see Task 8), not a runtime file check.
 - **Type consistency:** `ReviewRequest`/`ReviewAssessment`/`ReviewRoute`/`ReviewCoordinator`/`PolicyRevision`/`ReviewRestriction`/`RestrictionMatcher`/`ActionClass`/`ExtensionReviewerContribution`/`ReviewOrigin`/`ReviewerState`/`ReviewerStatusChanged` are defined once above and reused verbatim across tasks.
