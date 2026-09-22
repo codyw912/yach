@@ -310,7 +310,7 @@ pub enum ExtensionHostInvocation {
     EditProposal(ExtensionEditProposal),
 }
 
-pub trait ExtensionResourceBroker {
+pub trait ExtensionResourceBroker: Send + Sync {
     fn execute(&self, request: &ExtensionResourceRequest) -> ExtensionResourceResult;
 }
 
@@ -414,6 +414,21 @@ pub trait ExtensionHostInvoker: Send {
         timeout: Duration,
         resources: &dyn ExtensionResourceBroker,
     ) -> Result<ExtensionHostInvocation, ExtensionHostProtocolError>;
+
+    /// Send `review.assess` and return the matching `review.result` assessment.
+    ///
+    /// The default rejects the call: only a host that completed the
+    /// `review.ready` handshake implements it. Tool-only hosts and test
+    /// doubles that do not override this method fail closed.
+    fn review(
+        &mut self,
+        _request_id: &str,
+        _request: serde_json::Value,
+        _timeout: Duration,
+        _resources: &dyn ExtensionResourceBroker,
+    ) -> Result<serde_json::Value, ExtensionHostProtocolError> {
+        Err(ExtensionHostProtocolError::UnsupportedProtocol)
+    }
 }
 
 #[derive(Debug)]
@@ -687,6 +702,29 @@ pub struct ExtensionActivationDiagnostic {
     pub capability_grant: ExtensionCapabilityGrantStatus,
 }
 
+/// A live reviewer host session bound to its manifest identity.
+///
+/// The runner clones the `Arc` into a review coordinator when the user
+/// selects automatic review; the generation increments on reload so a
+/// response from a previous process is stale.
+#[derive(Clone)]
+pub struct ActiveReviewer {
+    pub reviewer_id: String,
+    pub extension_id: String,
+    pub generation: u64,
+    pub invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>>,
+}
+
+impl std::fmt::Debug for ActiveReviewer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveReviewer")
+            .field("reviewer_id", &self.reviewer_id)
+            .field("extension_id", &self.extension_id)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtensionActivationSnapshot {
     pub registry: ToolRegistry,
@@ -694,6 +732,9 @@ pub struct ExtensionActivationSnapshot {
     pub diagnostics: Vec<ExtensionActivationDiagnostic>,
     pub replacement_bundles: Vec<ActivatedToolReplacementBundle>,
     pub host_start_count: usize,
+    /// At most one reviewer per snapshot; a second activation replaces the
+    /// first so the coordinator never sees a split-brain reviewer set.
+    pub reviewer: Option<ActiveReviewer>,
 }
 
 impl Default for ExtensionActivationSnapshot {
@@ -704,6 +745,7 @@ impl Default for ExtensionActivationSnapshot {
             diagnostics: Vec::new(),
             replacement_bundles: Vec::new(),
             host_start_count: 0,
+            reviewer: None,
         }
     }
 }
@@ -937,6 +979,14 @@ impl ExtensionActivationSnapshot {
             Ok((session, registered_tools)) => {
                 let shared_invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>> =
                     Arc::new(Mutex::new(Box::new(session)));
+                if let Some(reviewer) = &record.manifest.contributes.reviewer {
+                    self.reviewer = Some(ActiveReviewer {
+                        reviewer_id: reviewer.reviewer_id.clone(),
+                        extension_id: extension_id.clone(),
+                        generation: next_generation,
+                        invoker: shared_invoker.clone(),
+                    });
+                }
                 for tool_name in &registered_tools {
                     self.executor.insert_tool(
                         tool_name.clone(),
@@ -1282,6 +1332,14 @@ pub fn activate_background_metadata_extensions(
             Ok((session, registered_tools)) => {
                 let shared_invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>> =
                     Arc::new(Mutex::new(Box::new(session)));
+                if let Some(reviewer) = &record.manifest.contributes.reviewer {
+                    snapshot.reviewer = Some(ActiveReviewer {
+                        reviewer_id: reviewer.reviewer_id.clone(),
+                        extension_id: record.manifest.id.0.clone(),
+                        generation: diagnostic.generation,
+                        invoker: shared_invoker.clone(),
+                    });
+                }
                 for tool_name in &registered_tools {
                     handlers.insert(
                         tool_name.clone(),
@@ -2244,6 +2302,16 @@ where
         resources: &dyn ExtensionResourceBroker,
     ) -> Result<ExtensionHostInvocation, ExtensionHostProtocolError> {
         self.invoke_tool(request_id, tool_name, arguments, timeout, resources)
+    }
+
+    fn review(
+        &mut self,
+        request_id: &str,
+        request: serde_json::Value,
+        timeout: Duration,
+        resources: &dyn ExtensionResourceBroker,
+    ) -> Result<serde_json::Value, ExtensionHostProtocolError> {
+        Self::review(self, request_id, request, timeout, resources)
     }
 }
 
@@ -4286,8 +4354,9 @@ done
                 }
             }
         }));
+        assert!(manifest.is_ok());
         let Ok(manifest) = manifest else {
-            panic!("fixture parses");
+            return;
         };
         let caps = requested_capabilities(
             &manifest.contributes.tools,
@@ -4315,8 +4384,9 @@ done
                 }
             }
         }));
+        assert!(manifest.is_ok());
         let Ok(manifest) = manifest else {
-            panic!("fixture parses");
+            return;
         };
         assert!(
             requested_capabilities(
