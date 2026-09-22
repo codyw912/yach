@@ -245,6 +245,7 @@ pub(super) fn local_edit_preview_summary(
         review_state,
         diff_summary: preview.diff_summary,
         diff_summary_truncated: preview.diff_summary_truncated,
+        review_origin: None,
     }
 }
 
@@ -272,5 +273,6 @@ pub(super) fn local_edit_error_message(error: &EditAccessError) -> String {
         EditAccessError::EvidencePersistFailed => {
             String::from("failed to persist local edit evidence")
         }
+        EditAccessError::StaleAuthorization => String::from("local edit authorization went stale"),
     }
 }

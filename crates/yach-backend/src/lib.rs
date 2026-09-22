@@ -3729,6 +3729,7 @@ mod tests {
                 path,
                 operation,
             },
+            None,
         );
 
         assert!(result.is_ok());

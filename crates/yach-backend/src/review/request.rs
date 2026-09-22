@@ -94,7 +94,7 @@ pub struct ReviewRequest {
 /// Outcome of fitting a request into the 64 KiB contract.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundReviewRequest {
-    Ready(ReviewRequest),
+    Ready(Box<ReviewRequest>),
     /// A trusted item would have to be dropped, or the request is still over
     /// budget after dropping untrusted evidence. The reviewer is not called.
     OverBudget {
@@ -109,7 +109,7 @@ pub enum BoundReviewRequest {
 /// item would be required to fit.
 pub fn bind_review_request(mut request: ReviewRequest) -> BoundReviewRequest {
     if serialized_len(&request).is_some_and(|len| len <= REVIEW_REQUEST_MAX_BYTES) {
-        return BoundReviewRequest::Ready(request);
+        return BoundReviewRequest::Ready(Box::new(request));
     }
     if request.untrusted_evidence.is_empty() {
         return BoundReviewRequest::OverBudget {
@@ -126,7 +126,7 @@ pub fn bind_review_request(mut request: ReviewRequest) -> BoundReviewRequest {
     request.omissions.extend(dropped);
     request.untrusted_evidence.clear();
     if serialized_len(&request).is_some_and(|len| len <= REVIEW_REQUEST_MAX_BYTES) {
-        BoundReviewRequest::Ready(request)
+        BoundReviewRequest::Ready(Box::new(request))
     } else {
         BoundReviewRequest::OverBudget {
             omissions: request.omissions,

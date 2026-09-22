@@ -11,12 +11,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::sync::Mutex as AsyncMutex;
 
-use crate::extension::{
-    ExtensionHostProtocolError, ExtensionHostSession, ExtensionHostTransport,
-    ExtensionResourceBroker,
-};
+use crate::extension::{ExtensionHostProtocolError, ExtensionResourceBroker};
 use crate::session::{SessionEvent, SessionId, TurnId};
 use crate::session_store::SessionEventSink;
 use crate::{
@@ -24,9 +20,7 @@ use crate::{
     ReviewRequestSummary,
 };
 
-use super::assessment::{
-    AssessmentValidationError, AuthorizationAnswer, REVIEW_ASSESSMENT_MAX_BYTES, ReviewAssessment,
-};
+use super::assessment::{AssessmentValidationError, AuthorizationAnswer, ReviewAssessment};
 use super::request::{
     BoundReviewRequest, EvidenceItem, REVIEW_REQUEST_SCHEMA, ReviewAction, ReviewRequest,
     SandboxState, action_kind, action_target, bind_review_request,
@@ -177,40 +171,46 @@ pub struct ReviewFreshness {
 }
 
 /// Builds requests, invokes one reviewer, and routes the typed assessment.
-pub struct ReviewCoordinator<S, T> {
+///
+/// The reviewer session is the same shared handle the tool executor uses, so
+/// a reviewer host that also serves tools is locked consistently. `review()`
+/// on [`crate::ExtensionHostInvoker`] fails closed for hosts that never
+/// completed the `review.ready` handshake.
+///
+/// The sink is borrowed, not owned: `append_event` must write through to
+/// durable storage before returning, because `ReviewRequestRecorded` has to
+/// be persisted before `review.assess` is sent. A sink that only buffers
+/// breaks evidence-before-effects.
+pub struct ReviewCoordinator<'a> {
     policy: Arc<Mutex<ReviewPolicy>>,
     reviewer_generation: Arc<Mutex<u64>>,
     authorization_revision: Arc<Mutex<u64>>,
-    sink: Arc<S>,
-    session: AsyncMutex<ExtensionHostSession<T>>,
+    sink: &'a (dyn SessionEventSink + Sync),
+    reviewer: Arc<Mutex<Box<dyn crate::ExtensionHostInvoker>>>,
     reviewer_id: String,
     session_id: SessionId,
     turn_id: TurnId,
     sandbox_state: SandboxState,
-    resources: Arc<dyn ExtensionResourceBroker>,
+    resources: Arc<dyn ExtensionResourceBroker + Sync>,
     /// Test-only seam: runs after the request is sent and before the response
     /// is read, so a test can revoke policy mid-flight.
     #[cfg(test)]
     after_send: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
-impl<S, T> ReviewCoordinator<S, T>
-where
-    S: SessionEventSink + Send + Sync,
-    T: ExtensionHostTransport + Send,
-{
-    #[allow(clippy::too_many_arguments)]
+impl<'a> ReviewCoordinator<'a> {
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         policy: Arc<Mutex<ReviewPolicy>>,
         reviewer_generation: Arc<Mutex<u64>>,
         authorization_revision: Arc<Mutex<u64>>,
-        sink: Arc<S>,
-        transport: T,
+        sink: &'a (dyn SessionEventSink + Sync),
+        reviewer: Arc<Mutex<Box<dyn crate::ExtensionHostInvoker>>>,
         reviewer_id: impl Into<String>,
         session_id: SessionId,
         turn_id: TurnId,
         sandbox_state: SandboxState,
-        resources: Arc<dyn ExtensionResourceBroker>,
+        resources: Arc<dyn ExtensionResourceBroker + Sync>,
     ) -> Self {
         let reviewer_id = reviewer_id.into();
         Self {
@@ -218,11 +218,7 @@ where
             reviewer_generation,
             authorization_revision,
             sink,
-            session: AsyncMutex::new(ExtensionHostSession::new(
-                reviewer_id.clone(),
-                transport,
-                REVIEW_ASSESSMENT_MAX_BYTES,
-            )),
+            reviewer,
             reviewer_id,
             session_id,
             turn_id,
@@ -244,9 +240,12 @@ where
         trusted: Vec<EvidenceItem>,
         untrusted: Vec<EvidenceItem>,
     ) -> ReviewRoute {
+        // The reviewer call is synchronous; the deadline is enforced by the
+        // transport timeout, not by tokio. The async signature is kept for
+        // the caller's `tokio::select!` cancellation arm.
         match tokio::time::timeout(
             REVIEW_DEADLINE,
-            self.review_within_deadline(request, action, trusted, untrusted),
+            std::future::ready(self.review_within_deadline(&request, &action, trusted, untrusted)),
         )
         .await
         {
@@ -256,21 +255,17 @@ where
             },
         }
     }
-
-    async fn review_within_deadline(
+    fn review_within_deadline(
         &self,
-        request: PermissionRequest,
-        action: ReviewAction,
+        request: &PermissionRequest,
+        action: &ReviewAction,
         trusted: Vec<EvidenceItem>,
         untrusted: Vec<EvidenceItem>,
     ) -> ReviewRoute {
-        let freshness = match self.snapshot() {
-            Some(freshness) => freshness,
-            None => {
-                return ReviewRoute::ReviewFailed {
-                    reason: ReviewFailure::Unavailable,
-                };
-            }
+        let Some(freshness) = self.snapshot() else {
+            return ReviewRoute::ReviewFailed {
+                reason: ReviewFailure::Unavailable,
+            };
         };
         let review_request = ReviewRequest {
             schema: REVIEW_REQUEST_SCHEMA,
@@ -298,8 +293,8 @@ where
         };
         let summary = ReviewRequestSummary {
             request_id: BoundedReviewText::new(&review_request.request_id),
-            action_kind: BoundedReviewText::new(action_kind(&action)),
-            target: BoundedReviewText::new(&action_target(&action)),
+            action_kind: BoundedReviewText::new(action_kind(action)),
+            target: BoundedReviewText::new(&action_target(action)),
             policy_revision: freshness.policy_revision,
             authorization_revision: freshness.authorization_revision,
         };
@@ -313,13 +308,10 @@ where
             };
         }
 
-        let payload = match serde_json::to_value(&review_request) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return ReviewRoute::ReviewFailed {
-                    reason: ReviewFailure::Unavailable,
-                };
-            }
+        let Ok(payload) = serde_json::to_value(&review_request) else {
+            return ReviewRoute::ReviewFailed {
+                reason: ReviewFailure::Unavailable,
+            };
         };
         #[cfg(test)]
         if let Ok(hook) = self.after_send.lock()
@@ -328,8 +320,12 @@ where
             hook();
         }
         let assessment = {
-            let mut session = self.session.lock().await;
-            session.review(
+            let Ok(mut reviewer) = self.reviewer.lock() else {
+                return ReviewRoute::ReviewFailed {
+                    reason: ReviewFailure::Unavailable,
+                };
+            };
+            reviewer.review(
                 &review_request.request_id,
                 payload,
                 REVIEW_DEADLINE,
@@ -354,13 +350,10 @@ where
                 };
             }
         };
-        let bytes = match serde_json::to_vec(&assessment) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return ReviewRoute::ReviewFailed {
-                    reason: ReviewFailure::MalformedAssessment,
-                };
-            }
+        let Ok(bytes) = serde_json::to_vec(&assessment) else {
+            return ReviewRoute::ReviewFailed {
+                reason: ReviewFailure::MalformedAssessment,
+            };
         };
         let assessment = match ReviewAssessment::validate_against(&bytes, &review_request) {
             Ok(assessment) => assessment,
@@ -384,13 +377,10 @@ where
                 };
             }
         };
-        let current = match self.snapshot() {
-            Some(current) => current,
-            None => {
-                return ReviewRoute::ReviewFailed {
-                    reason: ReviewFailure::Unavailable,
-                };
-            }
+        let Some(current) = self.snapshot() else {
+            return ReviewRoute::ReviewFailed {
+                reason: ReviewFailure::Unavailable,
+            };
         };
         if current != freshness {
             return ReviewRoute::ReviewFailed {
@@ -415,7 +405,7 @@ where
         route
     }
 
-    fn snapshot(&self) -> Option<ReviewFreshness> {
+    pub(crate) fn snapshot(&self) -> Option<ReviewFreshness> {
         let policy_revision = self.policy.lock().ok()?.revision;
         let authorization_revision = *self.authorization_revision.lock().ok()?;
         let reviewer_generation = *self.reviewer_generation.lock().ok()?;
@@ -438,13 +428,10 @@ pub fn route_assessment(assessment: &ReviewAssessment) -> ReviewRoute {
             evidence_refs: refs,
         };
     }
-    let authorization = match assessment.authorization_answer() {
-        Ok(answer) => answer,
-        Err(_) => {
-            return ReviewRoute::ReviewFailed {
-                reason: ReviewFailure::MalformedAssessment,
-            };
-        }
+    let Ok(authorization) = assessment.authorization_answer() else {
+        return ReviewRoute::ReviewFailed {
+            reason: ReviewFailure::MalformedAssessment,
+        };
     };
     if !matches!(
         authorization,
@@ -512,7 +499,7 @@ fn route_reason(route: &ReviewRoute) -> &'static str {
 }
 
 #[cfg(test)]
-impl<S, T> ReviewCoordinator<S, T> {
+impl ReviewCoordinator<'_> {
     fn review_action_observing<F>(
         &self,
         request: PermissionRequest,
@@ -523,8 +510,6 @@ impl<S, T> ReviewCoordinator<S, T> {
     ) -> impl Future<Output = ReviewRoute> + '_
     where
         F: Fn() + Send + 'static,
-        S: SessionEventSink + Send + Sync,
-        T: ExtensionHostTransport + Send,
     {
         if let Ok(mut hook) = self.after_send.lock() {
             *hook = Some(Box::new(observe));
@@ -737,13 +722,20 @@ mod tests {
         }
     }
 
-    fn coordinator(fixture: &Fixture) -> ReviewCoordinator<MemorySink, SharedTransport> {
+    fn coordinator(fixture: &Fixture) -> ReviewCoordinator<'_> {
+        let session = crate::ExtensionHostSession::new(
+            "jev-typesafe",
+            SharedTransport(fixture.transport.clone()),
+            16 * 1024,
+        );
+        let reviewer: Arc<Mutex<Box<dyn crate::ExtensionHostInvoker>>> =
+            Arc::new(Mutex::new(Box::new(session)));
         ReviewCoordinator::new(
             fixture.policy.clone(),
             fixture.generation.clone(),
             fixture.authorization.clone(),
-            fixture.sink.clone(),
-            SharedTransport(fixture.transport.clone()),
+            fixture.sink.as_ref(),
+            reviewer,
             "jev-typesafe",
             SessionId(String::from("session-1")),
             TurnId(String::from("turn-1")),
@@ -959,12 +951,19 @@ mod tests {
     async fn evidence_persistence_failure_blocks_execution() {
         let built = fixture(Ok(review_result(clear_assessment("perm-1"))));
         let sink = Arc::new(MemorySink::failing());
+        let session = crate::ExtensionHostSession::new(
+            "jev-typesafe",
+            SharedTransport(built.transport.clone()),
+            16 * 1024,
+        );
+        let reviewer: Arc<Mutex<Box<dyn crate::ExtensionHostInvoker>>> =
+            Arc::new(Mutex::new(Box::new(session)));
         let failing = ReviewCoordinator::new(
             built.policy.clone(),
             built.generation.clone(),
             built.authorization.clone(),
-            sink.clone(),
-            SharedTransport(built.transport.clone()),
+            sink.as_ref(),
+            reviewer,
             "jev-typesafe",
             SessionId(String::from("session-1")),
             TurnId(String::from("turn-1")),

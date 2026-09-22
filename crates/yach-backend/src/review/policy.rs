@@ -162,7 +162,7 @@ impl ReviewPolicyStore {
         let next = base.checked_add(1).ok_or(ReviewPolicyError::Io)?;
         document.schema = String::from(SCHEMA);
         document.revision = PolicyRevision(next);
-        document.global = policy.global.clone();
+        document.global.clone_from(&policy.global);
         if policy.project.is_empty() {
             document.projects.remove(project_key);
         } else {
@@ -203,7 +203,7 @@ impl ReviewPolicyStore {
         let mut guard = self
             .cached
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         body(&mut guard)
     }
 }

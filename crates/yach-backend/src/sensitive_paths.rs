@@ -113,7 +113,7 @@ impl SensitivePathPolicy {
         }
     }
 
-    fn from_patterns(
+    pub(crate) fn from_patterns(
         deny_patterns: Vec<String>,
         allow_patterns: Vec<String>,
     ) -> Result<Self, SensitivePathConfigWarning> {

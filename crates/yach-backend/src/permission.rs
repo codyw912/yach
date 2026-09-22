@@ -462,9 +462,9 @@ impl PermissionDecisionEngine {
             },
             PermissionMode::AutoReview => PermissionDecision::NeedsUserReview {
                 decision_id: next_permission_decision_id(),
-                reviewer: PermissionReviewer::User,
+                reviewer: PermissionReviewer::AutoReview,
                 mode,
-                reason: String::from("auto_review_unavailable_fallback_ask"),
+                reason: String::from("route_to_reviewer"),
                 prompt: permission_prompt(request),
                 policy_revision: review_policy.revision,
             },
@@ -530,6 +530,17 @@ impl PermissionDecisionEngine {
                 mode: PermissionMode::Allow,
                 reason: String::from("approval_mode_full_access"),
                 rationale: None,
+                policy_revision: review_policy.revision,
+            },
+            // The caller intercepts this route and invokes the review
+            // coordinator instead of the user widget. Reaching the widget
+            // means no reviewer session was live.
+            ApprovalMode::AutoReview => PermissionDecision::NeedsUserReview {
+                decision_id: next_permission_decision_id(),
+                reviewer: PermissionReviewer::AutoReview,
+                mode: PermissionMode::AutoReview,
+                reason: String::from("route_to_reviewer"),
+                prompt: permission_prompt(request),
                 policy_revision: review_policy.revision,
             },
         }
@@ -684,7 +695,7 @@ fn inferred_action_class(command: &str) -> Option<ActionClass> {
     match (first, second) {
         ("nixos-rebuild" | "darwin-rebuild", _) => Some(ActionClass::HostActivation),
         ("cargo" | "npm" | "pnpm" | "yarn", Some("publish")) => Some(ActionClass::ExternalPublish),
-        ("cargo", Some("install")) | ("nix-env", _) | ("brew", Some("install")) => {
+        ("cargo" | "brew", Some("install")) | ("nix-env", _) => {
             Some(ActionClass::PersistentInstall)
         }
         ("nix", Some("profile")) => Some(ActionClass::PersistentInstall),
@@ -890,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_review_is_represented_and_falls_back_to_user_review() {
+    fn auto_review_routes_to_reviewer() {
         let decision = PermissionDecisionEngine::decide(
             &edit_request(),
             &PermissionPolicy::for_edit_mode(PermissionMode::AutoReview),
@@ -900,11 +911,11 @@ mod tests {
         assert!(matches!(
             decision,
             PermissionDecision::NeedsUserReview {
-                reviewer: PermissionReviewer::User,
+                reviewer: PermissionReviewer::AutoReview,
                 mode: PermissionMode::AutoReview,
                 reason,
                 ..
-            } if reason == "auto_review_unavailable_fallback_ask"
+            } if reason == "route_to_reviewer"
         ));
     }
 

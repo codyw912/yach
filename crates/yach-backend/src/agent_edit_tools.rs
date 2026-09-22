@@ -540,7 +540,7 @@ pub fn prepare_agent_edit_tool_request(
                 path: normalized.path,
                 operation: normalized.operation,
             };
-            let result = apply_agent_edit_tool_review(edit_access, sink, pending)?;
+            let result = apply_agent_edit_tool_review(edit_access, sink, pending, None)?;
             Ok(AgentEditToolPrepared::Completed { trace_id, result })
         }
         EditAccessReviewState::NeedsUserApproval | EditAccessReviewState::AutoReviewUnavailable => {
@@ -681,7 +681,7 @@ pub fn prepare_extension_edit_proposal(
                 path,
                 operation,
             };
-            let result = apply_agent_edit_tool_review(edit_access, sink, pending)?;
+            let result = apply_agent_edit_tool_review(edit_access, sink, pending, None)?;
             Ok(AgentEditToolPrepared::Completed { trace_id, result })
         }
         EditAccessReviewState::NeedsUserApproval | EditAccessReviewState::AutoReviewUnavailable => {
@@ -719,10 +719,16 @@ pub fn apply_agent_edit_tool_review(
     edit_access: &mut EditAccess,
     sink: &impl SessionEventSink,
     pending: PendingAgentEditToolReview,
+    freshness: Option<crate::ReviewFreshness>,
 ) -> Result<ProviderToolResult, ToolContinuationError> {
     let apply_started = Instant::now();
     let (apply_result, completed_evidence_persisted) = edit_access
-        .apply_with_evidence_sink(&pending.preview_id, &pending.permission_decision_id, sink)
+        .apply_with_evidence_sink_and_freshness(
+            &pending.preview_id,
+            &pending.permission_decision_id,
+            sink,
+            freshness,
+        )
         .map_err(|_| ToolContinuationError::Execution(ToolExecutionError::MalformedResult))?;
     let mut result = provider_result(
         &pending.request_id,

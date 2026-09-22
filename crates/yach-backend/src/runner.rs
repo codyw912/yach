@@ -4783,6 +4783,10 @@ struct ProviderAgentToolBatch<'a> {
     trace: Option<&'a yach_trace::TraceSink>,
     pending_events: &'a mut Vec<SessionEvent>,
     current_tool_index: u32,
+    /// Live reviewer coordinator, present only when the session selected
+    /// automatic review and a reviewer host is active. `None` falls through
+    /// to the manual review path.
+    review_coordinator: Option<&'a crate::ReviewCoordinator<'a>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderToolBatchOutcome {
@@ -5407,6 +5411,30 @@ answer now, or call tools if more work is needed.",
         };
         let tool_round_index = loop_budget.tool_rounds + 1;
         let edit_trace_start = provider_continuation_edit_traces.len();
+        let effective_approval_mode = live_session_modes.as_ref().map_or(approval_mode, |state| {
+            approval_mode_from_code(state.approval.load(AtomicOrdering::Acquire))
+        });
+        let review_coordinator = if effective_approval_mode == ApprovalMode::AutoReview {
+            extension_activation_snapshot
+                .reviewer
+                .as_ref()
+                .map(|reviewer| {
+                    crate::ReviewCoordinator::new(
+                        Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                        Arc::new(Mutex::new(reviewer.generation)),
+                        Arc::new(Mutex::new(0)),
+                        &edit_sink,
+                        reviewer.invoker.clone(),
+                        reviewer.reviewer_id.clone(),
+                        session_id.clone(),
+                        turn_id.clone(),
+                        crate::SandboxState::None,
+                        Arc::new(crate::DenyExtensionResources),
+                    )
+                })
+        } else {
+            None
+        };
         let ProviderToolBatchOutcome {
             results: tool_results,
             terminal_error,
@@ -5427,9 +5455,7 @@ answer now, or call tools if more work is needed.",
                 review_decisions: &mut review_decisions,
                 structured_review_rows,
                 tool_event_store,
-                approval_mode: live_session_modes.as_ref().map_or(approval_mode, |state| {
-                    approval_mode_from_code(state.approval.load(AtomicOrdering::Acquire))
-                }),
+                approval_mode: effective_approval_mode,
                 cancellation: cancellation.clone(),
                 shell_session_grants: shell_session_grants.clone(),
                 budget: &mut loop_budget,
@@ -5437,6 +5463,7 @@ answer now, or call tools if more work is needed.",
                 edit_traces: &mut provider_continuation_edit_traces,
                 log,
                 current_tool_index: 0,
+                review_coordinator: review_coordinator.as_ref(),
                 pending_events,
                 trace,
             },
@@ -7444,6 +7471,7 @@ fn approval_mode_code(mode: ApprovalMode) -> u8 {
         ApprovalMode::Review => 0,
         ApprovalMode::AcceptEdits => 1,
         ApprovalMode::FullAccess => 2,
+        ApprovalMode::AutoReview => 3,
     }
 }
 
@@ -7451,6 +7479,7 @@ fn approval_mode_from_code(code: u8) -> ApprovalMode {
     match code {
         1 => ApprovalMode::AcceptEdits,
         2 => ApprovalMode::FullAccess,
+        3 => ApprovalMode::AutoReview,
         _ => ApprovalMode::Review,
     }
 }
@@ -7487,6 +7516,7 @@ fn edit_permission_mode(mode: ApprovalMode) -> PermissionMode {
     match mode {
         ApprovalMode::Review => PermissionMode::Ask,
         ApprovalMode::AcceptEdits | ApprovalMode::FullAccess => PermissionMode::Allow,
+        ApprovalMode::AutoReview => PermissionMode::AutoReview,
     }
 }
 
@@ -7556,6 +7586,85 @@ async fn finish_prepared_edit_tool_request(
             path,
             operation,
         } => {
+            if preview.review_state == crate::EditAccessReviewState::AutoReviewUnavailable
+                && let Some(coordinator) = batch.review_coordinator
+            {
+                let action = batch
+                    .edit_access
+                    .review_action_for_preview(&preview.preview_id)
+                    .unwrap_or(crate::ReviewAction::EditTransaction {
+                        operations: Vec::new(),
+                        preconditions: Vec::new(),
+                    });
+                let permission_request = PermissionRequest {
+                    request_id: request_id.clone(),
+                    actor: PermissionActor::Provider,
+                    capability: PermissionCapability::EditTransaction,
+                    target: PermissionTargetSummary {
+                        operation: operation.clone(),
+                        resource: path.clone(),
+                    },
+                    risk: PermissionRisk::WorkspaceWrite,
+                    requested_reviewer: Some(PermissionReviewer::AutoReview),
+                    command: None,
+                };
+                let route = tokio::select! {
+                    () = batch.cancellation.cancelled() => {
+                        return Err(ProviderRoundError::Cancelled(String::from(
+                            "native provider prompt cancelled",
+                        )));
+                    }
+                    route = coordinator.review_action(
+                        permission_request,
+                        action,
+                        Vec::new(),
+                        Vec::new(),
+                    ) => route,
+                };
+                match route {
+                    crate::ReviewRoute::Execute => {
+                        let reviewed = apply_agent_edit_tool_review(
+                            batch.edit_access,
+                            batch.edit_sink,
+                            PendingAgentEditToolReview {
+                                trace_id: trace_id.clone(),
+                                session_id: batch.session_id.clone(),
+                                turn_id: batch.turn_id.clone(),
+                                request_id: request_id.clone(),
+                                provider_call_id,
+                                preview_id: preview.preview_id.clone(),
+                                permission_decision_id: preview.permission_decision_id.clone(),
+                                path,
+                                operation,
+                            },
+                            coordinator.snapshot(),
+                        );
+                        drain_edit_sink_events(batch)?;
+                        let result = reviewed.map_err(|error| {
+                            ProviderRoundError::ToolContinuation(tool_round_error_label(&error))
+                        })?;
+                        batch.edit_traces.push(ProviderContinuationEditTrace {
+                            trace_id,
+                            tool_name,
+                            tool_request_id: ToolRequestId(request_id),
+                            provider_call_id: Some(
+                                result.provider_call_id.clone().unwrap_or_default(),
+                            ),
+                            preview_id: Some(preview.preview_id),
+                            permission_decision_id: Some(preview.permission_decision_id),
+                        });
+                        batch
+                            .budget
+                            .record_tool_result(&result.tool_request_id, result.byte_count)
+                            .map_err(|error| provider_tool_batch_result_budget_failure(error).0)?;
+                        return Ok(result);
+                    }
+                    crate::ReviewRoute::Hold { .. } | crate::ReviewRoute::ReviewFailed { .. } => {
+                        // Fall through to the manual review path below — the
+                        // preview stays pending and the user sees the hold.
+                    }
+                }
+            }
             if !batch.structured_review_rows {
                 return Err(ProviderRoundError::ToolContinuation(String::from(
                     "structured_review_rows_not_negotiated",
@@ -7679,7 +7788,7 @@ async fn finish_prepared_edit_tool_request(
             };
             let reviewed = match decision {
                 ToolReviewDecision::Approve | ToolReviewDecision::ApproveForSession => {
-                    apply_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending)
+                    apply_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending, None)
                 }
                 ToolReviewDecision::Reject => {
                     reject_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending)
@@ -8006,6 +8115,259 @@ exists today. Ask the user to fix .yach/config.json.",
                 "The command was denied by shell permission policy.",
             );
         }
+        PermissionDecision::NeedsUserReview {
+            ref reason,
+            reviewer: PermissionReviewer::AutoReview,
+            ..
+        } if reason == "route_to_reviewer" => {
+            let Some(coordinator) = batch.review_coordinator else {
+                return finish_failed(
+                    batch,
+                    "reviewer_unavailable",
+                    "Automatic review is selected but no reviewer host is active. \
+Select a reviewer extension or switch to a manual approval mode.",
+                );
+            };
+            let action = crate::ReviewAction::ShellCommand {
+                command: command.clone(),
+                cwd: prepared.cwd.to_string_lossy().into_owned(),
+                timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                env_keys: shell_policy.config.env_allow.clone(),
+            };
+            let route = tokio::select! {
+                () = batch.cancellation.cancelled() => {
+                    return Err(ProviderRoundError::Cancelled(String::from(
+                        "native provider prompt cancelled",
+                    )));
+                }
+                route = coordinator.review_action(
+                    permission_request.clone(),
+                    action,
+                    Vec::new(),
+                    Vec::new(),
+                ) => route,
+            };
+            match route {
+                crate::ReviewRoute::Execute => {}
+                crate::ReviewRoute::Hold { reason, .. } => {
+                    let hold_reason = match reason {
+                        crate::HoldReason::EvidenceOverBudget => "evidence_over_budget",
+                        crate::HoldReason::SignificantRisk => "reviewer_hold_risk",
+                        crate::HoldReason::NeedsClarification => "reviewer_hold_evidence",
+                        crate::HoldReason::RestrictionApplies => "restriction_ask_first",
+                    };
+                    if !batch.structured_review_rows {
+                        return finish_failed(
+                            batch,
+                            hold_reason,
+                            "The reviewer held this command and the client cannot show \
+structured review rows.",
+                        );
+                    }
+                    let review_id = next_command_review_id();
+                    let payload = ToolReviewPayload::Command {
+                        command: yach_proto::CommandReviewSummary {
+                            review_id: review_id.clone(),
+                            permission_decision_id: permission_decision_id.clone(),
+                            command: command.clone(),
+                            workdir: workdir.clone(),
+                            timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                            review_origin: Some(match reason {
+                                crate::HoldReason::SignificantRisk => {
+                                    yach_proto::ReviewOrigin::Risk
+                                }
+                                crate::HoldReason::RestrictionApplies => {
+                                    yach_proto::ReviewOrigin::HumanPerforms
+                                }
+                                _ => yach_proto::ReviewOrigin::Risk,
+                            }),
+                        },
+                    };
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewRequested {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(request.request_id.clone()),
+                            tool_name: String::from("bash"),
+                            payload: payload.clone(),
+                        },
+                    )?;
+                    if batch
+                        .review_tx
+                        .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                            request_id: request.request_id.clone(),
+                            tool_name: String::from("bash"),
+                            payload,
+                        }))
+                        .is_err()
+                    {
+                        persist_tool_review_event(
+                            batch,
+                            SessionEvent::ToolReviewInterrupted {
+                                session_id: batch.session_id.clone(),
+                                turn_id: batch.turn_id.clone(),
+                                tool_request_id: ToolRequestId(request.request_id.clone()),
+                                reason: String::from("ui_receiver_dropped"),
+                            },
+                        )?;
+                        return Err(ProviderRoundError::Cancelled(String::from(
+                            "ui receiver dropped during tool review",
+                        )));
+                    }
+                    let review_decision = match wait_for_command_review_decision(
+                        batch.review_decisions,
+                        &request.request_id,
+                        &review_id,
+                        &permission_decision_id,
+                        &batch.cancellation,
+                    )
+                    .await
+                    {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            persist_tool_review_event(
+                                batch,
+                                SessionEvent::ToolReviewInterrupted {
+                                    session_id: batch.session_id.clone(),
+                                    turn_id: batch.turn_id.clone(),
+                                    tool_request_id: ToolRequestId(request.request_id.clone()),
+                                    reason: provider_round_error_label(&error),
+                                },
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewDecisionRecorded {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(request.request_id.clone()),
+                            decision: review_decision,
+                        },
+                    )?;
+                    persist_shell_review_resolution(batch, permission_summary, review_decision)?;
+                    if review_decision == ToolReviewDecision::Reject {
+                        return finish_failed(
+                            batch,
+                            "user_rejected",
+                            "The user declined to run this command. Ask the user how to proceed \
+or take a different approach.",
+                        );
+                    }
+                    if review_decision == ToolReviewDecision::ApproveForSession {
+                        batch.shell_session_grants.grant(&command, &prepared.cwd);
+                    }
+                }
+                crate::ReviewRoute::ReviewFailed { reason } => {
+                    let failure_reason = match reason {
+                        crate::ReviewFailure::Disabled => "reviewer_disabled",
+                        crate::ReviewFailure::Stale => "reviewer_stale",
+                        crate::ReviewFailure::MalformedAssessment => "reviewer_malformed",
+                        crate::ReviewFailure::TimedOut => "reviewer_timed_out",
+                        crate::ReviewFailure::Unavailable => "reviewer_unavailable",
+                        crate::ReviewFailure::EvidenceWriteFailed => "reviewer_evidence_failed",
+                        crate::ReviewFailure::OversizedAssessment => "reviewer_oversized",
+                    };
+                    if !batch.structured_review_rows {
+                        return finish_failed(
+                            batch,
+                            failure_reason,
+                            "The reviewer failed and the client cannot show \
+structured review rows.",
+                        );
+                    }
+                    let review_id = next_command_review_id();
+                    let payload = ToolReviewPayload::Command {
+                        command: yach_proto::CommandReviewSummary {
+                            review_id: review_id.clone(),
+                            permission_decision_id: permission_decision_id.clone(),
+                            command: command.clone(),
+                            workdir: workdir.clone(),
+                            timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                            review_origin: Some(yach_proto::ReviewOrigin::ReviewerError),
+                        },
+                    };
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewRequested {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(request.request_id.clone()),
+                            tool_name: String::from("bash"),
+                            payload: payload.clone(),
+                        },
+                    )?;
+                    if batch
+                        .review_tx
+                        .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                            request_id: request.request_id.clone(),
+                            tool_name: String::from("bash"),
+                            payload,
+                        }))
+                        .is_err()
+                    {
+                        persist_tool_review_event(
+                            batch,
+                            SessionEvent::ToolReviewInterrupted {
+                                session_id: batch.session_id.clone(),
+                                turn_id: batch.turn_id.clone(),
+                                tool_request_id: ToolRequestId(request.request_id.clone()),
+                                reason: String::from("ui_receiver_dropped"),
+                            },
+                        )?;
+                        return Err(ProviderRoundError::Cancelled(String::from(
+                            "ui receiver dropped during tool review",
+                        )));
+                    }
+                    let review_decision = match wait_for_command_review_decision(
+                        batch.review_decisions,
+                        &request.request_id,
+                        &review_id,
+                        &permission_decision_id,
+                        &batch.cancellation,
+                    )
+                    .await
+                    {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            persist_tool_review_event(
+                                batch,
+                                SessionEvent::ToolReviewInterrupted {
+                                    session_id: batch.session_id.clone(),
+                                    turn_id: batch.turn_id.clone(),
+                                    tool_request_id: ToolRequestId(request.request_id.clone()),
+                                    reason: provider_round_error_label(&error),
+                                },
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewDecisionRecorded {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(request.request_id.clone()),
+                            decision: review_decision,
+                        },
+                    )?;
+                    persist_shell_review_resolution(batch, permission_summary, review_decision)?;
+                    if review_decision == ToolReviewDecision::Reject {
+                        return finish_failed(
+                            batch,
+                            "user_rejected",
+                            "The user declined to run this command. Ask the user how to proceed \
+or take a different approach.",
+                        );
+                    }
+                    if review_decision == ToolReviewDecision::ApproveForSession {
+                        batch.shell_session_grants.grant(&command, &prepared.cwd);
+                    }
+                }
+            }
+        }
         PermissionDecision::NeedsUserReview { .. } => {
             if !batch.structured_review_rows {
                 return finish_failed(
@@ -8023,6 +8385,7 @@ non-allowlisted commands.",
                     command: command.clone(),
                     workdir: workdir.clone(),
                     timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                    review_origin: None,
                 },
             };
             persist_tool_review_event(
@@ -10077,6 +10440,7 @@ mod tests {
                 }],
                 replacement_bundles: Vec::new(),
                 host_start_count: 1,
+                reviewer: None,
             }));
             let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -10141,6 +10505,7 @@ mod tests {
                 }],
                 replacement_bundles: Vec::new(),
                 host_start_count: 1,
+                reviewer: None,
             }));
             let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -10406,6 +10771,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-read-1"),
@@ -10511,6 +10877,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
             },
             vec![
                 ProviderToolCall {
@@ -10632,6 +10999,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
             },
             request,
         )
@@ -10739,6 +11107,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
             },
             request,
         )
@@ -10821,6 +11190,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
             },
             vec![
                 ProviderToolCall {
@@ -11301,6 +11671,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-edit-1"),
@@ -11414,6 +11785,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
             },
             vec![
                 ProviderToolCall {
@@ -11631,6 +12003,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
             },
             vec![
                 ProviderToolCall {
@@ -11772,6 +12145,7 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-replaced-1"),
@@ -18477,6 +18851,7 @@ mod tests {
             }],
             replacement_bundles: Vec::new(),
             host_start_count: 1,
+            reviewer: None,
         };
         let turn_id = TurnId(String::from("turn-active-extension"));
         let model = ProviderModel {
@@ -24645,6 +25020,7 @@ manual anchored summary"
                     pending_events: &mut pending_events,
                     trace: None,
                     current_tool_index: 0,
+                    review_coordinator: None,
                 },
                 round.tool_calls,
             )
@@ -25708,6 +26084,7 @@ manual anchored summary"
                 command: String::from("cargo test"),
                 workdir: Some(String::from("/workspace")),
                 timeout_ms: 30_000,
+                review_origin: None,
             },
         };
         let mut log = SessionLog::default();
@@ -25781,6 +26158,7 @@ manual anchored summary"
                 command: String::from("cargo test"),
                 workdir: None,
                 timeout_ms: 30_000,
+                review_origin: None,
             },
         };
         let second_payload = ToolReviewPayload::Command {
@@ -25790,6 +26168,7 @@ manual anchored summary"
                 command: String::from("cargo fmt"),
                 workdir: None,
                 timeout_ms: 30_000,
+                review_origin: None,
             },
         };
         let mut log = SessionLog::default();

@@ -50,12 +50,17 @@ pub struct EditPreview {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditAccessError {
-    PermissionDenied { reason: String },
+    PermissionDenied {
+        reason: String,
+    },
     Preview(EditError),
     Apply(EditError),
     PreviewNotFound,
     DecisionMismatch,
     EvidencePersistFailed,
+    /// Policy, authorization, or reviewer generation changed between preview
+    /// and apply. The pending preview is retained; a fresh preview is needed.
+    StaleAuthorization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,11 +96,61 @@ struct PendingEditPreview {
     prepared: PreparedEditTransaction,
     permission_decision_id: PermissionDecisionId,
     permission_summary: PermissionDecisionSummary,
+    /// Stable fingerprint of the exact action (operations + preconditions)
+    /// for exact-action grant matching.
+    #[expect(dead_code)]
+    action_fingerprint: String,
+    /// Policy revision at prepare time; apply revalidates against current.
+    policy_revision: crate::PolicyRevision,
+    /// Authorization revision at prepare time.
+    authorization_revision: u64,
+    /// Reviewer generation at prepare time.
+    reviewer_generation: u64,
+    /// Exact-action grant id when the preview was approved through one.
+    /// Populated when the grant store lands; apply revalidates it then.
+    #[expect(dead_code)]
+    grant_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
 pub struct EditAccess {
     pending: BTreeMap<String, PendingEditPreview>,
+}
+
+impl EditAccess {
+    /// Bounded review action for a pending preview. Returns `None` when the
+    /// preview id is unknown — the coordinator treats that as unavailable.
+    #[must_use]
+    pub fn review_action_for_preview(
+        &self,
+        preview_id: &EditPreviewId,
+    ) -> Option<crate::ReviewAction> {
+        let pending = self.pending.get(&preview_id.0)?;
+        let operations = pending
+            .prepared
+            .operations
+            .iter()
+            .map(|operation| match operation {
+                crate::PreparedEditOperation::ModifyTextFile {
+                    relative_path,
+                    before_sha256,
+                    ..
+                } => crate::ReviewEditOperation::ModifyTextFile {
+                    path: relative_path.clone(),
+                    expected_sha256: before_sha256.clone(),
+                },
+                crate::PreparedEditOperation::CreateTextFile { relative_path, .. } => {
+                    crate::ReviewEditOperation::CreateTextFile {
+                        path: relative_path.clone(),
+                    }
+                }
+            })
+            .collect();
+        Some(crate::ReviewAction::EditTransaction {
+            operations,
+            preconditions: Vec::new(),
+        })
+    }
 }
 
 impl EditAccess {
@@ -140,7 +195,8 @@ impl EditAccess {
         let review_state = match &decision {
             PermissionDecision::Allowed { .. } => EditAccessReviewState::Allowed,
             PermissionDecision::NeedsUserReview { reason, .. }
-                if reason == "auto_review_unavailable_fallback_ask" =>
+                if reason == "route_to_reviewer"
+                    || reason == "auto_review_unavailable_fallback_ask" =>
             {
                 EditAccessReviewState::AutoReviewUnavailable
             }
@@ -203,6 +259,7 @@ impl EditAccess {
             diff_summary_truncated: prepared.diff_summary_truncated,
             diff_summary_bytes: prepared.diff_summary_bytes,
         };
+        let action_fingerprint = edit_action_fingerprint(&prepared);
         self.pending.insert(
             preview_id.0.clone(),
             PendingEditPreview {
@@ -210,7 +267,12 @@ impl EditAccess {
                 root: root.clone(),
                 prepared,
                 permission_decision_id: preview.permission_decision_id.clone(),
-                permission_summary,
+                permission_summary: permission_summary.clone(),
+                action_fingerprint,
+                policy_revision: permission_summary.policy_revision,
+                authorization_revision: permission_summary.authorization_revision,
+                reviewer_generation: 0,
+                grant_id: None,
             },
         );
         Ok(EditAccessPrepareOutcome {
@@ -285,6 +347,20 @@ impl EditAccess {
         decision_id: &PermissionDecisionId,
         sink: &impl SessionEventSink,
     ) -> Result<(EditApplyResult, bool), EditAccessError> {
+        self.apply_with_evidence_sink_and_freshness(preview_id, decision_id, sink, None)
+    }
+
+    /// Apply with freshness revalidation. `current` carries the live policy
+    /// revision, authorization revision, and reviewer generation; a mismatch
+    /// against the values captured at prepare time means the authorization
+    /// context changed and the preview is stale.
+    pub fn apply_with_evidence_sink_and_freshness(
+        &mut self,
+        preview_id: &EditPreviewId,
+        decision_id: &PermissionDecisionId,
+        sink: &impl SessionEventSink,
+        current: Option<crate::ReviewFreshness>,
+    ) -> Result<(EditApplyResult, bool), EditAccessError> {
         let pending = self
             .pending
             .remove(&preview_id.0)
@@ -292,6 +368,15 @@ impl EditAccess {
         if &pending.permission_decision_id != decision_id {
             self.pending.insert(preview_id.0.clone(), pending);
             return Err(EditAccessError::DecisionMismatch);
+        }
+        if let Some(current) = current {
+            let stale = pending.policy_revision != current.policy_revision
+                || pending.authorization_revision != current.authorization_revision
+                || pending.reviewer_generation != current.reviewer_generation;
+            if stale {
+                self.pending.insert(preview_id.0.clone(), pending);
+                return Err(EditAccessError::StaleAuthorization);
+            }
         }
 
         let transaction_id = pending.prepared.transaction_id.clone();
@@ -486,6 +571,39 @@ fn next_edit_preview_id() -> String {
 fn next_edit_permission_request_id() -> String {
     let next = EDIT_PERMISSION_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("edit-permission-request-{next}")
+}
+
+/// Stable fingerprint of the exact action for grant matching. Hashes the
+/// operation kind, path, and content hashes — not the transaction id, which
+/// is fresh per preview.
+fn edit_action_fingerprint(prepared: &crate::PreparedEditTransaction) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for operation in &prepared.operations {
+        match operation {
+            crate::PreparedEditOperation::ModifyTextFile {
+                relative_path,
+                before_sha256,
+                after_sha256,
+                ..
+            } => {
+                "modify".hash(&mut hasher);
+                relative_path.hash(&mut hasher);
+                before_sha256.hash(&mut hasher);
+                after_sha256.hash(&mut hasher);
+            }
+            crate::PreparedEditOperation::CreateTextFile {
+                relative_path,
+                after_sha256,
+                ..
+            } => {
+                "create".hash(&mut hasher);
+                relative_path.hash(&mut hasher);
+                after_sha256.hash(&mut hasher);
+            }
+        }
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 #[cfg(test)]
