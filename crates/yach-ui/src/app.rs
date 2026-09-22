@@ -1160,7 +1160,7 @@ impl App {
 
     fn handle_server_event(&mut self, event: ServerEvent) {
         match event {
-            ServerEvent::Ready { .. } => {}
+            ServerEvent::Ready { .. } | ServerEvent::ReviewerStatusChanged { .. } => {}
             ServerEvent::StateUpdated(state) => self.apply_backend_state(*state),
             ServerEvent::ApprovalModeChanged { mode, .. } => {
                 self.approval_mode = mode;
@@ -4978,6 +4978,7 @@ mod tests {
             review_state,
             diff_summary: String::from("-old\n+new"),
             diff_summary_truncated: false,
+            review_origin: None,
         }
     }
 
@@ -6754,6 +6755,7 @@ mod tests {
         app.submit_input();
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert!(matches!(
@@ -8458,6 +8460,7 @@ mod tests {
                     review_state: LocalEditReviewState::NeedsUserApproval,
                     diff_summary: String::from("+ added"),
                     diff_summary_truncated: false,
+                    review_origin: None,
                 },
             },
         );
@@ -8486,6 +8489,7 @@ mod tests {
                     command: String::from("cargo test"),
                     workdir: None,
                     timeout_ms: 30_000,
+                    review_origin: None,
                 },
             },
         );
@@ -8806,6 +8810,7 @@ mod tests {
                     command: String::from("cat src/lib.rs"),
                     workdir: None,
                     timeout_ms: 1_000,
+                    review_origin: None,
                 },
             },
         );

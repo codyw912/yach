@@ -1564,6 +1564,7 @@ mod tests {
                         command: String::from("rm -rf ."),
                         workdir: None,
                         timeout_ms: 1_000,
+                        review_origin: None,
                     },
                 },
             };
@@ -1615,6 +1616,7 @@ mod tests {
                         command: String::from("cargo test"),
                         workdir: None,
                         timeout_ms: 1_000,
+                        review_origin: None,
                     },
                 },
             };

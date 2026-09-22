@@ -15,7 +15,11 @@ pub struct ApprovalModeSelector<'a> {
 impl Widget for ApprovalModeSelector<'_> {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         Clear.render(area, buf);
-        let popup_area = centered_rect(area, 32, 5);
+        let popup_area = centered_rect(
+            area,
+            32,
+            u16::try_from(ApprovalMode::ALL.len()).unwrap_or(4) + 2,
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(self.theme.colors.border))
@@ -139,7 +143,10 @@ mod tests {
         Widget::render(
             ApprovalModeSelector {
                 current_mode: ApprovalMode::Review,
-                selected_index: 2,
+                selected_index: ApprovalMode::ALL
+                    .iter()
+                    .position(|m| *m == ApprovalMode::FullAccess)
+                    .unwrap_or(0),
                 theme: &Theme::default(),
             },
             area,
