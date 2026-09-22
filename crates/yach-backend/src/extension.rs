@@ -473,6 +473,7 @@ impl ExtensionProcessHostTransport {
         main: &ExtensionMain,
         package_root: &Path,
         max_stdout_line_bytes: usize,
+        remote_reviewer: bool,
     ) -> Result<Self, ExtensionHostProtocolError> {
         let mut process = Command::new(&main.command);
         process
@@ -481,7 +482,7 @@ impl ExtensionProcessHostTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        configure_extension_host_process(&mut process);
+        configure_extension_host_process(&mut process, remote_reviewer);
 
         let mut child = process
             .spawn()
@@ -1425,6 +1426,12 @@ fn activate_extension_host_record(
         &record.manifest.main,
         &record.package_root,
         config.max_stdout_line_bytes,
+        record
+            .manifest
+            .contributes
+            .reviewer
+            .as_ref()
+            .is_some_and(|r| r.remote),
     )?;
     mark_extension_host(trace, "extension_host_spawned", extension_id);
     let mut session = ExtensionHostSession::new(
@@ -2351,7 +2358,7 @@ pub fn run_extension_host_registration_command(
         .args(&command.args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    configure_extension_host_process(&mut process);
+    configure_extension_host_process(&mut process, false);
 
     let mut child = process
         .spawn()
@@ -2429,23 +2436,42 @@ pub fn run_extension_host_registration_command(
 }
 
 #[cfg(unix)]
-fn configure_extension_host_process(command: &mut Command) {
-    configure_extension_host_environment(command);
+fn configure_extension_host_process(command: &mut Command, remote_reviewer: bool) {
+    configure_extension_host_environment(command, remote_reviewer);
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn configure_extension_host_process(command: &mut Command) {
-    configure_extension_host_environment(command);
+fn configure_extension_host_process(command: &mut Command, remote_reviewer: bool) {
+    configure_extension_host_environment(command, remote_reviewer);
 }
 
-fn configure_extension_host_environment(command: &mut Command) {
+fn configure_extension_host_environment(command: &mut Command, remote_reviewer: bool) {
     command.env_clear();
     copy_parent_env_if_present(command, "PATH");
     copy_parent_env_if_present(command, "HOME");
     copy_parent_env_if_present(command, "LANG");
     copy_parent_env_if_present(command, "LC_ALL");
     copy_parent_env_if_present(command, "LC_CTYPE");
+
+    if remote_reviewer {
+        // A remote reviewer calls its provider endpoint through the managed
+        // egress proxy; without these vars the subprocess bypasses policy
+        // enforcement and cannot verify the proxy's TLS interception.
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "NODE_EXTRA_CA_CERTS",
+            "TYPESAFE_API_KEY",
+        ] {
+            copy_parent_env_if_present(command, key);
+        }
+    }
 
     #[cfg(windows)]
     {
@@ -4933,6 +4959,7 @@ done
             },
             &package.path,
             4096,
+            false,
         )
         .map_err(|error| format!("{error:?}"))?;
         let mut session = ExtensionHostSession::new("example.toy-tools", transport, 4096);

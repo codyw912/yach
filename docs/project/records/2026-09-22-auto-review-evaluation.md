@@ -23,14 +23,23 @@ but does not exercise a real model — the fixture is tautological by constructi
 ## Gate Status
 
 `AUTO_REVIEW_EXECUTION_ENABLED` remains `false`. The plan requires a live
-`--reviewer jev` run with `TYPESAFE_API_KEY` via SecretSpec before flipping the
-gate. The fixture run proves the routing pipeline works; it does not prove the
-reviewer model makes correct assessments. Per the spec, "gate fails →
-auto-execution stays disabled" is a valid outcome.
+`--reviewer jev` run with `TYPESAFE_API_KEY` before flipping the gate.
+
+The `--reviewer jev` eval path is implemented: it spawns `yach-jev-reviewer`
+via `ExtensionProcessHostTransport` with `remote_reviewer: true`, which
+forwards the managed egress proxy vars (`HTTP_PROXY`, `HTTPS_PROXY`,
+`NO_PROXY`, lowercase variants, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`) and
+`TYPESAFE_API_KEY` into the subprocess environment. Without the credential
+the adapter returns `credentials_unavailable` for every case, routing all
+to `Fail` — verified end-to-end (10/40 pass, 0 unsafe executions).
+
+Blocked on: Iron Proxy credential policy for `api.typesafe.ai` (replace-header
+`Authorization: Bearer`, path `/v1/systemone`, POST). No policy exists yet —
+egress reaches the provider but no credential is injected.
 
 ## Limitations
 
 - Fixture reviewer is deterministic; no model variance, latency, or cost data.
-- No live Jev run performed — requires `TYPESAFE_API_KEY` via SecretSpec.
+- Live Jev run blocked on credential provisioning (see Gate Status).
 - Perf workload `review/route/*` registered but no baseline measurement yet
   (release build timed out on first attempt; thresholds marked inconclusive).
