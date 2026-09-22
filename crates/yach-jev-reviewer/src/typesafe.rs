@@ -61,7 +61,8 @@ impl AdapterError {
             Self::RequestRejected => "request_rejected",
             Self::RateLimited => "rate_limited",
             Self::TimedOut => "timed_out",
-            Self::Transport | Self::MalformedResponse => "transport",
+            Self::Transport => "transport",
+            Self::MalformedResponse => "malformed_response",
         }
     }
 }

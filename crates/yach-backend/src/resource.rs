@@ -278,7 +278,7 @@ impl ResourceRoot {
         let control_plane = canonical_target.components().any(|component| {
             matches!(
                 component.as_os_str().to_str(),
-                Some(".git" | ".jj" | ".yach" | "target")
+                Some(".git" | ".jj" | ".yach" | "target" | ".hg" | ".svn")
             )
         });
         if control_plane {

@@ -113,11 +113,11 @@ reviewer flagged risk, `reviewer_error` means review was unavailable and fell ba
 ordinary user-ask path so older clients continue to decode review payloads.
 
 When `auto_review` is negotiated, `ReviewerStatusChanged` reports `reviewer_id`, monotonically
-ordered `generation`, and `state` (`selected`, `unavailable`, or `reloaded`). The backend emits a
-selection before review work for that reviewer generation. A reload advances the generation and
-emits `reloaded` before review work from the replacement generation; clients must use generation
-order rather than arrival text to reject stale status. No reviewer status event is emitted unless
-`auto_review` was negotiated.
+ordered `generation`, `state` (`selected`, `unavailable`, or `reloaded`), and
+`disclosure_summary` (bounded text from the reviewer manifest describing what the reviewer sees).
+The backend does not yet emit this event; clients that receive it must use generation order rather
+than arrival text to reject stale status. No reviewer status event is emitted unless `auto_review`
+was negotiated.
 
 ## Extension lifecycle and diagnostics
 

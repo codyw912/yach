@@ -69,17 +69,18 @@ impl<'de> serde::Deserialize<'de> for BoundedReviewText {
 }
 
 fn bound_review_text(value: &str) -> String {
-    if value.chars().any(char::is_control) {
-        return String::from("<redacted>");
-    }
-    if value.len() <= REVIEW_TEXT_MAX_BYTES {
-        return value.to_owned();
+    let escaped: String = value
+        .chars()
+        .map(|ch| if ch.is_control() { '\u{FFFD}' } else { ch })
+        .collect();
+    if escaped.len() <= REVIEW_TEXT_MAX_BYTES {
+        return escaped;
     }
     let mut end = REVIEW_TEXT_MAX_BYTES;
-    while !value.is_char_boundary(end) {
+    while !escaped.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
-    value[..end].to_owned()
+    escaped[..end].to_owned()
 }
 
 /// Bounded review-request evidence. Never carries command environment values,

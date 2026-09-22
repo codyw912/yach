@@ -729,7 +729,12 @@ pub fn apply_agent_edit_tool_review(
             sink,
             freshness,
         )
-        .map_err(|_| ToolContinuationError::Execution(ToolExecutionError::MalformedResult))?;
+        .map_err(|error| match error {
+            crate::EditAccessError::StaleAuthorization => {
+                ToolContinuationError::Execution(ToolExecutionError::PermissionDenied)
+            }
+            _ => ToolContinuationError::Execution(ToolExecutionError::MalformedResult),
+        })?;
     let mut result = provider_result(
         &pending.request_id,
         Some(pending.provider_call_id.clone()),
