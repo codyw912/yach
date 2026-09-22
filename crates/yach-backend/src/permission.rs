@@ -38,7 +38,7 @@ pub fn stored_project_approval_mode(project_root: &Path) -> Option<ApprovalMode>
         .and_then(|raw| serde_json::from_str::<StoredApprovalSettings>(&raw).ok())
         .filter(|settings| settings.schema == APPROVAL_SETTINGS_SCHEMA)
         .map(|settings| settings.mode)
-        .filter(|mode| *mode != ApprovalMode::FullAccess)
+        .filter(|mode| *mode != ApprovalMode::FullAccess && *mode != ApprovalMode::AutoReview)
 }
 
 #[must_use]
@@ -63,15 +63,15 @@ pub fn project_approval_mode_warning(project_root: &Path) -> Option<String> {
             "approval_mode_config: unsupported user-state schema; using review",
         ));
     }
-    (settings.mode == ApprovalMode::FullAccess)
-        .then(|| String::from("approval_mode_config: stored full-access ignored; using review"))
+    (settings.mode == ApprovalMode::FullAccess || settings.mode == ApprovalMode::AutoReview)
+        .then(|| String::from("approval_mode_config: stored dangerous mode ignored; using review"))
 }
 
 pub fn persist_project_approval_mode(project_root: &Path, mode: ApprovalMode) -> io::Result<()> {
-    if mode == ApprovalMode::FullAccess {
+    if mode == ApprovalMode::FullAccess || mode == ApprovalMode::AutoReview {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "full-access approval mode is session-only",
+            "full-access and auto-review approval modes are session-only",
         ));
     }
     let path = approval_settings_path(project_root).ok_or_else(|| {

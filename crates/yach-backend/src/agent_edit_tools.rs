@@ -731,7 +731,7 @@ pub fn apply_agent_edit_tool_review(
         )
         .map_err(|error| match error {
             crate::EditAccessError::StaleAuthorization => {
-                ToolContinuationError::Execution(ToolExecutionError::PermissionDenied)
+                ToolContinuationError::Execution(ToolExecutionError::StaleAuthorization)
             }
             _ => ToolContinuationError::Execution(ToolExecutionError::MalformedResult),
         })?;

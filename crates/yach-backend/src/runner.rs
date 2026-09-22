@@ -2576,6 +2576,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     continue;
                 };
                 if mode != ApprovalMode::FullAccess
+                    && mode != ApprovalMode::AutoReview
                     && let Err(error) = crate::persist_project_approval_mode(project_root, mode)
                 {
                     let _ = tx.send(BackendEvent::Server(
@@ -7049,6 +7050,10 @@ fn recoverable_readonly_failure(
         | crate::ToolExecutionError::UnsupportedTool
         | crate::ToolExecutionError::MalformedResult
         | crate::ToolExecutionError::ExtensionHost { .. } => None,
+        crate::ToolExecutionError::StaleAuthorization => Some((
+            "stale_authorization",
+            "The edit preview is stale because policy or reviewer state changed; request a new preview.",
+        )),
         crate::ToolExecutionError::ResourcePath { error } => Some(resource_path_failure(*error)),
     }
 }
@@ -9256,6 +9261,9 @@ fn tool_round_error_label(error: &ToolContinuationError) -> String {
     match error {
         ToolContinuationError::TooManyToolCalls { .. } => String::from("tool_round_too_many_calls"),
         ToolContinuationError::Validation(_) => String::from("tool_round_validation_failed"),
+        ToolContinuationError::Execution(crate::ToolExecutionError::StaleAuthorization) => {
+            String::from("tool_round_stale_authorization")
+        }
         ToolContinuationError::Execution(_) => String::from("tool_round_execution_failed"),
         ToolContinuationError::ResultTooLarge { .. } => String::from("tool_round_result_too_large"),
     }
