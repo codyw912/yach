@@ -18,13 +18,13 @@ const ASSESSMENT_SCHEMA: &str = "yach.review-assessment.v1";
 pub fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    run_host(stdin.lock(), stdout.lock(), config_from_env().ok())
+    run_host(stdin.lock(), stdout.lock(), config_from_env().ok().as_ref())
 }
 
 pub fn run_host(
     input: impl BufRead,
     mut output: impl Write,
-    config: Option<JevConfig>,
+    config: Option<&JevConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for line in input.lines() {
         let line = line?;
@@ -33,7 +33,7 @@ pub fn run_host(
         };
         match message.get("type").and_then(Value::as_str) {
             Some("extension.initialize") => send_registration(&mut output)?,
-            Some("review.assess") => handle_review_assess(&mut output, &message, config.as_ref())?,
+            Some("review.assess") => handle_review_assess(&mut output, &message, config)?,
             _ => {}
         }
     }
@@ -276,7 +276,7 @@ mod tests {
             })
         );
         let mut output = Vec::new();
-        let ran = run_host(std::io::Cursor::new(input), &mut output, Some(config));
+        let ran = run_host(std::io::Cursor::new(input), &mut output, Some(&config));
         assert!(ran.is_ok(), "host loop should finish: {ran:?}");
 
         let frames = String::from_utf8_lossy(&output);

@@ -195,8 +195,11 @@ pub struct ReviewCoordinator<'a> {
     /// Test-only seam: runs after the request is sent and before the response
     /// is read, so a test can revoke policy mid-flight.
     #[cfg(test)]
-    after_send: Mutex<Option<Box<dyn Fn() + Send>>>,
+    after_send: Mutex<Option<AfterSendHook>>,
 }
+
+#[cfg(test)]
+type AfterSendHook = Box<dyn Fn() + Send>;
 
 impl<'a> ReviewCoordinator<'a> {
     #[expect(clippy::too_many_arguments)]
@@ -884,8 +887,7 @@ mod tests {
         let invocations = built
             .transport
             .lock()
-            .map(|transport| transport.invocations())
-            .unwrap_or(usize::MAX);
+            .map_or(usize::MAX, |transport| transport.invocations());
         assert_eq!(
             invocations, 0,
             "over-budget review never invokes the reviewer"
@@ -986,8 +988,7 @@ mod tests {
         let invocations = built
             .transport
             .lock()
-            .map(|transport| transport.invocations())
-            .unwrap_or(usize::MAX);
+            .map_or(usize::MAX, |transport| transport.invocations());
         assert_eq!(
             invocations, 0,
             "nothing is sent when evidence cannot be recorded"

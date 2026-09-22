@@ -54,15 +54,14 @@ pub enum AdapterError {
 }
 
 impl AdapterError {
-    pub const fn as_str(self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::CredentialsUnavailable => "credentials_unavailable",
             Self::CredentialsInvalid => "credentials_invalid",
             Self::RequestRejected => "request_rejected",
             Self::RateLimited => "rate_limited",
             Self::TimedOut => "timed_out",
-            Self::Transport => "transport",
-            Self::MalformedResponse => "transport",
+            Self::Transport | Self::MalformedResponse => "transport",
         }
     }
 }
@@ -96,7 +95,7 @@ pub fn assess(config: &JevConfig, state: &Value) -> Result<JevAssessment, Adapte
             "questions": review_questions(),
         }))
         .send()
-        .map_err(map_send_error)?;
+        .map_err(|error| map_send_error(&error))?;
     let status = response.status();
     if status.as_u16() == 401 {
         return Err(AdapterError::CredentialsInvalid);
@@ -117,7 +116,7 @@ pub fn assess(config: &JevConfig, state: &Value) -> Result<JevAssessment, Adapte
     Ok(assessment)
 }
 
-fn map_send_error(error: reqwest::Error) -> AdapterError {
+fn map_send_error(error: &reqwest::Error) -> AdapterError {
     if error.is_timeout() {
         AdapterError::TimedOut
     } else {
@@ -245,7 +244,7 @@ fn score_answer(value: &Value, level_count: usize) -> Result<(f64, f64), Adapter
     let Some(score) = score.as_f64() else {
         return Err(AdapterError::MalformedResponse);
     };
-    let max = (level_count.saturating_sub(1)) as f64;
+    let max = f64::from(u32::try_from(level_count.saturating_sub(1)).unwrap_or(u32::MAX));
     if !score.is_finite() || !(0.0..=max).contains(&score) {
         return Err(AdapterError::MalformedResponse);
     }
@@ -380,10 +379,10 @@ mod tests {
         };
         assert_eq!(assessment.model_returned, "jev-1.13.0");
         assert_eq!(assessment.authorization, "exact_authorized");
-        assert_eq!(assessment.restriction_applies, 0.02);
-        assert_eq!(assessment.consequence, 1.05);
-        assert_eq!(assessment.evidence_sufficient, 0.97);
-        assert_eq!(assessment.origin_confusion, 0.01);
+        assert!((assessment.restriction_applies - 0.02).abs() < f64::EPSILON);
+        assert!((assessment.consequence - 1.05).abs() < f64::EPSILON);
+        assert!((assessment.evidence_sufficient - 0.97).abs() < f64::EPSILON);
+        assert!((assessment.origin_confusion - 0.01).abs() < f64::EPSILON);
         assert_eq!(assessment.usage.input_tokens, 120);
         assert_eq!(assessment.usage.output_tokens, 40);
         assert_eq!(

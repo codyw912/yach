@@ -214,8 +214,9 @@ mod tests {
             vec![item("user", 64)],
             vec![item("tool", REVIEW_REQUEST_MAX_BYTES)],
         ));
+        assert!(matches!(bound, BoundReviewRequest::Ready(_)));
         let BoundReviewRequest::Ready(ready) = bound else {
-            panic!("dropping untrusted evidence should fit the request");
+            return;
         };
         assert!(ready.untrusted_evidence.is_empty());
         assert!(ready.omissions.iter().any(|marker| matches!(
