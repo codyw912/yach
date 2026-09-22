@@ -712,6 +712,7 @@ pub struct ActiveReviewer {
     pub reviewer_id: String,
     pub extension_id: String,
     pub generation: u64,
+    pub disclosure_summary: String,
     pub invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>>,
 }
 
@@ -735,6 +736,9 @@ pub struct ExtensionActivationSnapshot {
     /// At most one reviewer per snapshot; a second activation replaces the
     /// first so the coordinator never sees a split-brain reviewer set.
     pub reviewer: Option<ActiveReviewer>,
+    /// Live reviewer generation counter, bumped on every activation, reload,
+    /// or stop. The coordinator reads this to detect staleness.
+    pub reviewer_generation: Arc<Mutex<u64>>,
 }
 
 impl Default for ExtensionActivationSnapshot {
@@ -746,6 +750,7 @@ impl Default for ExtensionActivationSnapshot {
             replacement_bundles: Vec::new(),
             host_start_count: 0,
             reviewer: None,
+            reviewer_generation: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -904,6 +909,16 @@ impl ExtensionActivationSnapshot {
         );
         self.replacement_bundles
             .retain(|bundle| bundle.extension_id != extension_id);
+        if self
+            .reviewer
+            .as_ref()
+            .is_some_and(|reviewer| reviewer.extension_id == extension_id)
+        {
+            self.reviewer = None;
+            if let Ok(mut generation) = self.reviewer_generation.lock() {
+                *generation = generation.saturating_add(1);
+            }
+        }
         diagnostic.mark_stopped();
         Ok(diagnostic.clone())
     }
@@ -984,8 +999,12 @@ impl ExtensionActivationSnapshot {
                         reviewer_id: reviewer.reviewer_id.clone(),
                         extension_id: extension_id.clone(),
                         generation: next_generation,
+                        disclosure_summary: reviewer.disclosure_summary.clone(),
                         invoker: shared_invoker.clone(),
                     });
+                    if let Ok(mut generation) = self.reviewer_generation.lock() {
+                        *generation = next_generation;
+                    }
                 }
                 for tool_name in &registered_tools {
                     self.executor.insert_tool(
@@ -1337,8 +1356,12 @@ pub fn activate_background_metadata_extensions(
                         reviewer_id: reviewer.reviewer_id.clone(),
                         extension_id: record.manifest.id.0.clone(),
                         generation: diagnostic.generation,
+                        disclosure_summary: reviewer.disclosure_summary.clone(),
                         invoker: shared_invoker.clone(),
                     });
+                    if let Ok(mut generation) = snapshot.reviewer_generation.lock() {
+                        *generation = diagnostic.generation;
+                    }
                 }
                 for tool_name in &registered_tools {
                     handlers.insert(

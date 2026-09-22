@@ -61,3 +61,8 @@ comment = "session approval grants: the gate measures 331870 -> 331998 (+128 byt
 id = "turn/scripted/tools_4/builtin#alloc_bytes"
 count = 128
 comment = "session approval grants: the gate measures 592074 -> 592202 (+128 bytes) with alloc_count unchanged. Same cost as the row above, carried through a workload that runs four tool calls. Budgeted at the measured 128 exactly."
+
+[[workload]]
+id = "review/route/*"
+latency_pct = 10.0
+comment = "first landing: no baseline measurement yet; inconclusive acceptable per convention"

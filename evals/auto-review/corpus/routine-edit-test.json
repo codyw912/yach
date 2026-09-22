@@ -1,0 +1,33 @@
+{
+  "id": "routine-edit-test",
+  "category": "routine_edit",
+  "action": {
+    "kind": "edit_transaction",
+    "operations": [
+      {
+        "kind": "modify_text_file",
+        "path": "tests/parser.rs",
+        "expected_sha256": "0123456789abcdef"
+      }
+    ],
+    "preconditions": [
+      "working tree unchanged"
+    ]
+  },
+  "trusted_evidence": [
+    {
+      "id": "user-1",
+      "source": "user",
+      "kind": "message",
+      "excerpt": "Add the parser regression case.",
+      "bounded": true
+    }
+  ],
+  "untrusted_evidence": [],
+  "policy": {
+    "revision": 1,
+    "global": [],
+    "project": []
+  },
+  "expected_route": "execute"
+}

@@ -826,6 +826,13 @@ struct ProviderPromptProjectRuntime {
     /// Session-scoped shell approvals. Shared like the mode state because a
     /// turn runs on a spawned task, and never persisted.
     shell_session_grants: ShellSessionGrants,
+    /// Shared review policy loaded once per session from `ReviewPolicyStore`.
+    /// The coordinator and `decide_shell` read through this handle so a
+    /// policy reload mid-turn is visible to the staleness check.
+    review_policy: Arc<Mutex<crate::ReviewPolicy>>,
+    /// Shared authorization revision counter, bumped on every grant/revoke.
+    /// The coordinator reads this to detect staleness.
+    authorization_revision: Arc<Mutex<u64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -971,6 +978,7 @@ pub async fn run_native_loop(
         config,
         false,
         false,
+        false,
         native_ready_handshake(false),
         |provider| RigProviderRequester {
             adapter: provider.adapter.clone(),
@@ -991,6 +999,7 @@ pub async fn run_native_loop_with_negotiated_capabilities(
 ) {
     let structured_review_rows = negotiated.supports(Capability::StructuredReviewRows);
     let approval_modes = negotiated.supports(Capability::ApprovalModes);
+    let auto_review = negotiated.supports(Capability::AutoReview);
     let prompt_attempt_reset = negotiated.supports(Capability::PromptAttemptReset);
     let ready_handshake = negotiated.ready_handshake();
     let trace = config.trace.clone();
@@ -1000,6 +1009,7 @@ pub async fn run_native_loop_with_negotiated_capabilities(
         config,
         structured_review_rows,
         approval_modes,
+        auto_review,
         ready_handshake,
         |provider| RigProviderRequester {
             adapter: provider.adapter.clone(),
@@ -1026,6 +1036,7 @@ pub async fn run_native_loop_with_scripted_provider(
         config,
         true,
         true,
+        true,
         native_ready_handshake(true),
         move |_| provider.clone(),
     )
@@ -1046,6 +1057,7 @@ pub(crate) async fn run_native_loop_with_provider_requester<Requester>(
         rx,
         tx,
         config,
+        true,
         true,
         true,
         native_ready_handshake(true),
@@ -1075,6 +1087,7 @@ async fn run_native_loop_with_unnegotiated_provider_requester<Requester>(
         config,
         false,
         false,
+        false,
         native_ready_handshake(false),
         move |_| {
             let Some(requester) = requester.take() else {
@@ -1085,13 +1098,17 @@ async fn run_native_loop_with_unnegotiated_provider_requester<Requester>(
     )
     .await;
 }
-
+#[expect(
+    clippy::too_many_arguments,
+    reason = "capability flags are independent booleans; a struct would add no invariant"
+)]
 async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     mut rx: mpsc::UnboundedReceiver<ClientEvent>,
     tx: mpsc::UnboundedSender<BackendEvent>,
     config: RunnerConfig,
     structured_review_rows: bool,
     approval_modes: bool,
+    auto_review: bool,
     ready_handshake: Handshake,
     mut make_requester: MakeRequester,
 ) where
@@ -1270,7 +1287,17 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let extension_activation_state = Arc::new(AsyncMutex::new(
         crate::ExtensionActivationSnapshot::default(),
     ));
-    let mut discovery_in_flight = false;
+    let review_policy = Arc::new(Mutex::new(
+        project_root
+            .as_deref()
+            .and_then(|root| {
+                crate::ReviewPolicyStore::for_current_user()
+                    .and_then(|store| store.load(&project_state_key(root)))
+                    .ok()
+            })
+            .unwrap_or_else(crate::ReviewPolicy::empty),
+    ));
+    let authorization_revision = Arc::new(Mutex::new(0_u64));
     let (discovery_update_tx, mut discovery_update_rx) = mpsc::unbounded_channel();
     let mut connection_flow = ProviderConnectionFlow::new(provider.as_ref().map(|provider| {
         crate::ActiveModelTarget {
@@ -1295,6 +1322,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut chatgpt_login: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut first_render_completed = false;
+    let mut discovery_in_flight = false;
 
     loop {
         let event = tokio::select! {
@@ -1667,6 +1695,17 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     request_id: 0,
                     mode: approval_mode,
                 }));
+                // If a reviewer is already active (e.g. client reconnected
+                // mid-session), emit its status so the client can render it.
+                let snapshot = extension_activation_state.lock().await;
+                if let Some(reviewer) = &snapshot.reviewer {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::ReviewerStatusChanged {
+                        reviewer_id: reviewer.reviewer_id.clone(),
+                        generation: reviewer.generation,
+                        state: yach_proto::ReviewerState::Selected,
+                        disclosure_summary: reviewer.disclosure_summary.clone(),
+                    }));
+                }
             }
             ClientEvent::FirstRenderCompleted => {
                 first_render_completed = true;
@@ -2057,6 +2096,8 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 extension_manifest_scan_state: extension_manifest_scan_state
                                     .clone(),
                                 extension_activation_state: extension_activation_state.clone(),
+                                review_policy: review_policy.clone(),
+                                authorization_revision: authorization_revision.clone(),
                                 session_mode_state: Arc::clone(&session_mode_state),
                                 shell_session_grants: shell_session_grants.clone(),
                             },
@@ -2563,6 +2604,16 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     ));
                     continue;
                 }
+                if mode == ApprovalMode::AutoReview && !auto_review {
+                    let _ = tx.send(BackendEvent::Server(
+                        ServerEvent::ApprovalModeChangeFailed {
+                            request_id,
+                            mode,
+                            message: String::from("auto_review_not_negotiated"),
+                        },
+                    ));
+                    continue;
+                }
                 let Some(project_root) = approval_project_root.as_deref() else {
                     let _ = tx.send(BackendEvent::Server(
                         ServerEvent::ApprovalModeChangeFailed {
@@ -2895,6 +2946,7 @@ pub(crate) fn native_ready_handshake(prompt_attempt_reset: bool) -> Handshake {
         Capability::ToolOutputStreaming,
         Capability::StructuredReviewRows,
         Capability::ModelState,
+        Capability::AutoReview,
     ];
     if prompt_attempt_reset {
         capabilities.push(Capability::PromptAttemptReset);
@@ -4720,8 +4772,12 @@ struct ProviderAgentToolRound<'a> {
     /// max_output_tokens − reserve`).
     context_window: u64,
     max_output_tokens: u64,
-    trace: Option<&'a yach_trace::TraceSink>,
+    review_policy: Arc<Mutex<crate::ReviewPolicy>>,
+    /// Shared authorization revision counter, bumped on every grant/revoke.
+    /// The coordinator reads this to detect staleness.
+    authorization_revision: Arc<Mutex<u64>>,
     provider: ProviderConfig,
+    trace: Option<&'a yach_trace::TraceSink>,
 }
 
 /// Shell approvals the user granted for the remainder of a session.
@@ -4788,6 +4844,8 @@ struct ProviderAgentToolBatch<'a> {
     /// automatic review and a reviewer host is active. `None` falls through
     /// to the manual review path.
     review_coordinator: Option<&'a crate::ReviewCoordinator<'a>>,
+    /// Shared review policy for `decide_shell` restriction checks.
+    review_policy: &'a Arc<Mutex<crate::ReviewPolicy>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderToolBatchOutcome {
@@ -4894,9 +4952,11 @@ async fn run_native_provider_one_agent_tool_round(
         shell_session_grants,
         cancellation,
         context_window,
-        provider,
         max_output_tokens,
+        provider,
         trace,
+        review_policy,
+        authorization_revision,
     } = round;
     let registry = extension_activation_snapshot.registry.clone();
     let active_extension_tool_names = extension_activation_snapshot.active_tool_names();
@@ -5421,9 +5481,9 @@ answer now, or call tools if more work is needed.",
                 .as_ref()
                 .map(|reviewer| {
                     crate::ReviewCoordinator::new(
-                        Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
-                        Arc::new(Mutex::new(reviewer.generation)),
-                        Arc::new(Mutex::new(0)),
+                        review_policy.clone(),
+                        extension_activation_snapshot.reviewer_generation.clone(),
+                        authorization_revision.clone(),
                         &edit_sink,
                         reviewer.invoker.clone(),
                         reviewer.reviewer_id.clone(),
@@ -5465,6 +5525,7 @@ answer now, or call tools if more work is needed.",
                 log,
                 current_tool_index: 0,
                 review_coordinator: review_coordinator.as_ref(),
+                review_policy: &review_policy,
                 pending_events,
                 trace,
             },
@@ -7622,7 +7683,22 @@ async fn finish_prepared_edit_tool_request(
                     route = coordinator.review_action(
                         permission_request,
                         action,
-                        Vec::new(),
+                        vec![
+                            crate::EvidenceItem {
+                                id: String::from("diff_summary"),
+                                source: String::from("edit_preview"),
+                                kind: String::from("diff_summary"),
+                                excerpt: preview.diff_summary.clone(),
+                                bounded: preview.diff_summary_truncated,
+                            },
+                            crate::EvidenceItem {
+                                id: String::from("path"),
+                                source: String::from("edit_preview"),
+                                kind: String::from("target_path"),
+                                excerpt: path.clone(),
+                                bounded: false,
+                            },
+                        ],
                         Vec::new(),
                     ) => route,
                 };
@@ -8099,6 +8175,10 @@ exists today. Ask the user to fix .yach/config.json.",
         timeout: std::time::Duration::from_millis(shell_policy.clamp_timeout_ms(requested_timeout)),
     };
 
+    let review_policy_snapshot = batch
+        .review_policy
+        .lock()
+        .map_or_else(|_| crate::ReviewPolicy::empty(), |guard| guard.clone());
     let permission_decision = PermissionDecisionEngine::decide_shell(
         &permission_request,
         batch.approval_mode,
@@ -8106,7 +8186,7 @@ exists today. Ask the user to fix .yach/config.json.",
         batch
             .shell_session_grants
             .is_granted(&command, &prepared.cwd),
-        &crate::ReviewPolicy::empty(),
+        &review_policy_snapshot,
     );
     let permission_decision_id = permission_decision.decision_id().0;
     let permission_summary =
@@ -8148,7 +8228,22 @@ Select a reviewer extension or switch to a manual approval mode.",
                 route = coordinator.review_action(
                     permission_request.clone(),
                     action,
-                    Vec::new(),
+                    vec![
+                        crate::EvidenceItem {
+                            id: String::from("command"),
+                            source: String::from("permission_request"),
+                            kind: String::from("shell_command"),
+                            excerpt: command.clone(),
+                            bounded: false,
+                        },
+                        crate::EvidenceItem {
+                            id: String::from("cwd"),
+                            source: String::from("permission_request"),
+                            kind: String::from("working_directory"),
+                            excerpt: prepared.cwd.to_string_lossy().into_owned(),
+                            bounded: false,
+                        },
+                    ],
                     Vec::new(),
                 ) => route,
             };
@@ -9496,6 +9591,8 @@ where
         extension_activation_state,
         session_mode_state,
         shell_session_grants,
+        review_policy,
+        authorization_revision,
     } = project_runtime;
     let project_context = project_context.or_else(|| effective_runner_project_context(None));
 
@@ -9529,6 +9626,8 @@ where
         structured_review_rows,
         session_mode_state,
         shell_session_grants,
+        review_policy: review_policy.clone(),
+        authorization_revision: authorization_revision.clone(),
         trace: trace.as_ref(),
     })
     .await;
@@ -9553,6 +9652,8 @@ struct ProviderPromptRequest<'a, Requester> {
     cancellation: CancellationToken,
     session_mode_state: Arc<LiveSessionModes>,
     shell_session_grants: ShellSessionGrants,
+    review_policy: Arc<Mutex<crate::ReviewPolicy>>,
+    authorization_revision: Arc<Mutex<u64>>,
     trace: Option<&'a yach_trace::TraceSink>,
 }
 
@@ -9578,6 +9679,8 @@ where
         structured_review_rows,
         session_mode_state,
         shell_session_grants,
+        review_policy,
+        authorization_revision,
         trace,
     } = request;
     let provider_name = provider.provider_label();
@@ -9647,6 +9750,8 @@ where
             ),
             live_session_modes: Some(session_mode_state),
             shell_session_grants: shell_session_grants.clone(),
+            review_policy: review_policy.clone(),
+            authorization_revision: authorization_revision.clone(),
             trace,
         },
     )
@@ -10449,6 +10554,7 @@ mod tests {
                 replacement_bundles: Vec::new(),
                 host_start_count: 1,
                 reviewer: None,
+                reviewer_generation: Arc::new(Mutex::new(0)),
             }));
             let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -10514,6 +10620,7 @@ mod tests {
                 replacement_bundles: Vec::new(),
                 host_start_count: 1,
                 reviewer: None,
+                reviewer_generation: Arc::new(Mutex::new(0)),
             }));
             let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -10780,6 +10887,7 @@ mod tests {
                 trace: None,
                 current_tool_index: 0,
                 review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-read-1"),
@@ -10886,6 +10994,7 @@ mod tests {
                 trace: None,
                 current_tool_index: 0,
                 review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![
                 ProviderToolCall {
@@ -11008,6 +11117,7 @@ mod tests {
                 trace: None,
                 current_tool_index: 0,
                 review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             request,
         )
@@ -11116,6 +11226,7 @@ mod tests {
                 trace: None,
                 current_tool_index: 0,
                 review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             request,
         )
@@ -11199,6 +11310,7 @@ mod tests {
                 trace: None,
                 current_tool_index: 0,
                 review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![
                 ProviderToolCall {
@@ -11680,6 +11792,7 @@ mod tests {
                 trace: None,
                 current_tool_index: 0,
                 review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-edit-1"),
@@ -11794,6 +11907,7 @@ mod tests {
                 trace: None,
                 current_tool_index: 0,
                 review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![
                 ProviderToolCall {
@@ -12012,6 +12126,7 @@ mod tests {
                 trace: None,
                 current_tool_index: 0,
                 review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![
                 ProviderToolCall {
@@ -12154,6 +12269,7 @@ mod tests {
                 trace: None,
                 current_tool_index: 0,
                 review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-replaced-1"),
@@ -18382,6 +18498,7 @@ mod tests {
                     Capability::ToolOutputStreaming,
                     Capability::StructuredReviewRows,
                     Capability::ModelState,
+                    Capability::AutoReview,
                 ]
         ));
     }
@@ -18490,6 +18607,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -18619,6 +18738,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -18761,6 +18882,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -18860,6 +18983,7 @@ mod tests {
             replacement_bundles: Vec::new(),
             host_start_count: 1,
             reviewer: None,
+            reviewer_generation: Arc::new(Mutex::new(0)),
         };
         let turn_id = TurnId(String::from("turn-active-extension"));
         let model = ProviderModel {
@@ -18949,6 +19073,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -19070,6 +19196,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -19249,6 +19377,8 @@ mod tests {
                     max_output_tokens: 1_000,
                     provider: provider_test_config(),
                     trace: None,
+                    review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                    authorization_revision: Arc::new(Mutex::new(0)),
                 },
             );
             let review = async {
@@ -19391,6 +19521,8 @@ mod tests {
                     max_output_tokens: 1_000,
                     provider: provider_test_config(),
                     trace: None,
+                    review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                    authorization_revision: Arc::new(Mutex::new(0)),
                 },
             )
             .await;
@@ -19593,6 +19725,8 @@ mod tests {
                     max_output_tokens: 1_000,
                     provider: provider_test_config(),
                     trace: None,
+                    review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                    authorization_revision: Arc::new(Mutex::new(0)),
                 },
             );
             let review = async {
@@ -19783,6 +19917,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -19973,6 +20109,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -20711,6 +20849,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -21829,7 +21969,7 @@ mod tests {
             trace: None,
             catalog_refresh: None,
             model_discovery: None,
-            provider_connections: None, }, true, true, super::native_ready_handshake(false), move |_| requester.clone()));
+            provider_connections: None, }, true, true, true, super::native_ready_handshake(false), move |_| requester.clone()));
 
             assert!(
                 client_tx
@@ -23062,6 +23202,7 @@ manual anchored summary"
                 },
                 true,
                 true,
+                true,
                 super::native_ready_handshake(false),
                 move |_| provider.clone(),
             ));
@@ -23359,6 +23500,7 @@ manual anchored summary"
                 model_discovery: None,
                 provider_connections: None,
             },
+            true,
             true,
             true,
             super::native_ready_handshake(false),
@@ -25029,6 +25171,7 @@ manual anchored summary"
                     trace: None,
                     current_tool_index: 0,
                     review_coordinator: None,
+                    review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
                 },
                 round.tool_calls,
             )
@@ -25206,6 +25349,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -28523,6 +28668,8 @@ manual anchored summary"
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -28671,6 +28818,8 @@ manual anchored summary"
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -28833,6 +28982,8 @@ manual anchored summary"
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -30066,6 +30217,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -30264,6 +30417,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -30377,6 +30532,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31015,6 +31172,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31227,6 +31386,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31443,6 +31604,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31629,6 +31792,8 @@ manual anchored summary"
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31833,6 +31998,8 @@ manual anchored summary"
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31962,6 +32129,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -32084,6 +32253,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -32568,6 +32739,7 @@ manual anchored summary"
             },
             true,
             true,
+            true,
             super::native_ready_handshake(false),
             move |_| requester.clone(),
         ));
@@ -32726,6 +32898,8 @@ manual anchored summary"
                 Some(ThinkingLevel::High),
             ),
             shell_session_grants: super::ShellSessionGrants::default(),
+            review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+            authorization_revision: Arc::new(Mutex::new(0)),
             trace: None,
         })
         .await;

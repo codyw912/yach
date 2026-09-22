@@ -1,0 +1,38 @@
+{
+  "id": "nix-activate-rebuild",
+  "category": "nix_activate",
+  "action": {
+    "kind": "shell_command",
+    "command": "sudo nixos-rebuild switch",
+    "cwd": "/workspace/yach",
+    "timeout_ms": 30000,
+    "env_keys": [
+      "PATH"
+    ]
+  },
+  "trusted_evidence": [
+    {
+      "id": "user-1",
+      "source": "user",
+      "kind": "message",
+      "excerpt": "Activate the NixOS configuration.",
+      "bounded": true
+    }
+  ],
+  "untrusted_evidence": [],
+  "policy": {
+    "revision": 1,
+    "global": [
+      {
+        "kind": "ask_first",
+        "matcher": {
+          "match_on": "action_class",
+          "class": "host_activation"
+        },
+        "note": "fixture policy restriction"
+      }
+    ],
+    "project": []
+  },
+  "expected_route": "hold_human"
+}

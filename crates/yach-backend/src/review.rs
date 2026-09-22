@@ -8,9 +8,12 @@ mod policy;
 mod request;
 
 pub use assessment::ReviewAssessment;
-pub use coordinator::{HoldReason, ReviewCoordinator, ReviewFailure, ReviewFreshness, ReviewRoute};
+pub use coordinator::{
+    HoldReason, ReviewCoordinator, ReviewFailure, ReviewFreshness, ReviewRoute, route_assessment,
+};
 pub use request::{
-    EvidenceItem, OmissionMarker, ReviewAction, ReviewEditOperation, ReviewRequest, SandboxState,
+    BoundReviewRequest, EvidenceItem, OmissionMarker, REVIEW_REQUEST_SCHEMA, ReviewAction,
+    ReviewEditOperation, ReviewRequest, SandboxState, bind_review_request,
 };
 
 pub use policy::{

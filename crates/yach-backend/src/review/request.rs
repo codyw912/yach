@@ -1,7 +1,7 @@
 //! Immutable bounded review requests. Core serializes once and refuses to
 //! treat a silently trimmed request as complete.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::PolicyRevision;
 
@@ -9,7 +9,7 @@ pub const REVIEW_REQUEST_SCHEMA: &str = "yach.review-request.v1";
 pub const REVIEW_REQUEST_MAX_BYTES: usize = 64 * 1024;
 
 /// Exact action under review. Environment values never appear here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewAction {
     ShellCommand {
@@ -29,7 +29,7 @@ pub enum ReviewAction {
 }
 
 /// Bounded edit surface copied into a review request. Not an executable plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewEditOperation {
     ModifyTextFile {
@@ -46,7 +46,7 @@ pub enum ReviewEditOperation {
 }
 
 /// One cited piece of evidence. `bounded` is false when the excerpt was cut.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceItem {
     pub id: String,
     pub source: String,
@@ -70,7 +70,7 @@ pub enum OmissionMarker {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SandboxState {
     None,
-    Declared(Vec<String>),
+    Declared { restrictions: Vec<String> },
 }
 
 /// Immutable review request; serialized once and bound to the action.

@@ -192,6 +192,7 @@ pub struct ReviewCoordinator<'a> {
     turn_id: TurnId,
     sandbox_state: SandboxState,
     resources: Arc<dyn ExtensionResourceBroker + Sync>,
+    fixture_reviewer: bool,
     /// Test-only seam: runs after the request is sent and before the response
     /// is read, so a test can revoke policy mid-flight.
     #[cfg(test)]
@@ -215,6 +216,64 @@ impl<'a> ReviewCoordinator<'a> {
         sandbox_state: SandboxState,
         resources: Arc<dyn ExtensionResourceBroker + Sync>,
     ) -> Self {
+        Self::build(
+            policy,
+            reviewer_generation,
+            authorization_revision,
+            sink,
+            reviewer,
+            reviewer_id,
+            session_id,
+            turn_id,
+            sandbox_state,
+            resources,
+            false,
+        )
+    }
+
+    /// Construct a coordinator for an in-process, no-network fixture reviewer.
+    #[expect(clippy::too_many_arguments)]
+    pub fn new_fixture(
+        policy: Arc<Mutex<ReviewPolicy>>,
+        reviewer_generation: Arc<Mutex<u64>>,
+        authorization_revision: Arc<Mutex<u64>>,
+        sink: &'a (dyn SessionEventSink + Sync),
+        reviewer: Arc<Mutex<Box<dyn crate::ExtensionHostInvoker>>>,
+        reviewer_id: impl Into<String>,
+        session_id: SessionId,
+        turn_id: TurnId,
+        sandbox_state: SandboxState,
+        resources: Arc<dyn ExtensionResourceBroker + Sync>,
+    ) -> Self {
+        Self::build(
+            policy,
+            reviewer_generation,
+            authorization_revision,
+            sink,
+            reviewer,
+            reviewer_id,
+            session_id,
+            turn_id,
+            sandbox_state,
+            resources,
+            true,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn build(
+        policy: Arc<Mutex<ReviewPolicy>>,
+        reviewer_generation: Arc<Mutex<u64>>,
+        authorization_revision: Arc<Mutex<u64>>,
+        sink: &'a (dyn SessionEventSink + Sync),
+        reviewer: Arc<Mutex<Box<dyn crate::ExtensionHostInvoker>>>,
+        reviewer_id: impl Into<String>,
+        session_id: SessionId,
+        turn_id: TurnId,
+        sandbox_state: SandboxState,
+        resources: Arc<dyn ExtensionResourceBroker + Sync>,
+        fixture_reviewer: bool,
+    ) -> Self {
         let reviewer_id = reviewer_id.into();
         Self {
             policy,
@@ -227,6 +286,7 @@ impl<'a> ReviewCoordinator<'a> {
             turn_id,
             sandbox_state,
             resources,
+            fixture_reviewer,
             #[cfg(test)]
             after_send: Mutex::new(None),
         }
@@ -243,22 +303,13 @@ impl<'a> ReviewCoordinator<'a> {
         trusted: Vec<EvidenceItem>,
         untrusted: Vec<EvidenceItem>,
     ) -> ReviewRoute {
-        // The reviewer call is synchronous; the deadline is enforced by the
-        // transport timeout, not by tokio. The async signature is kept for
-        // the caller's `tokio::select!` cancellation arm.
-        match tokio::time::timeout(
-            REVIEW_DEADLINE,
-            std::future::ready(self.review_within_deadline(&request, &action, trusted, untrusted)),
-        )
-        .await
-        {
-            Ok(route) => route,
-            Err(_elapsed) => ReviewRoute::ReviewFailed {
-                reason: ReviewFailure::TimedOut,
-            },
-        }
+        // The reviewer call blocks on a subprocess; `spawn_blocking` inside
+        // `review_within_deadline` keeps the runtime thread free. The
+        // deadline is enforced by the transport timeout.
+        self.review_within_deadline(&request, &action, trusted, untrusted)
+            .await
     }
-    fn review_within_deadline(
+    async fn review_within_deadline(
         &self,
         request: &PermissionRequest,
         action: &ReviewAction,
@@ -322,18 +373,23 @@ impl<'a> ReviewCoordinator<'a> {
         {
             hook();
         }
-        let assessment = {
-            let Ok(mut reviewer) = self.reviewer.lock() else {
+        let reviewer = self.reviewer.clone();
+        let resources = self.resources.clone();
+        let request_id = review_request.request_id.clone();
+        let assessment = match tokio::task::spawn_blocking(move || {
+            let Ok(mut reviewer) = reviewer.lock() else {
+                return Err(ExtensionHostProtocolError::SpawnFailed);
+            };
+            reviewer.review(&request_id, payload, REVIEW_DEADLINE, resources.as_ref())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_join_error) => {
                 return ReviewRoute::ReviewFailed {
                     reason: ReviewFailure::Unavailable,
                 };
-            };
-            reviewer.review(
-                &review_request.request_id,
-                payload,
-                REVIEW_DEADLINE,
-                self.resources.as_ref(),
-            )
+            }
         };
         let assessment = match assessment {
             Ok(value) => value,
@@ -391,7 +447,7 @@ impl<'a> ReviewCoordinator<'a> {
             };
         }
         let route = route_assessment(&assessment);
-        let route = gate_execution(route);
+        let route = self.gate_execution(route);
         let recorded = SessionEvent::ReviewAssessmentRecorded {
             request_id: BoundedReviewText::new(&review_request.request_id),
             assessment: ReviewAssessmentSummary {
@@ -417,6 +473,17 @@ impl<'a> ReviewCoordinator<'a> {
             authorization_revision,
             reviewer_generation,
         })
+    }
+    fn gate_execution(&self, route: ReviewRoute) -> ReviewRoute {
+        if AUTO_REVIEW_EXECUTION_ENABLED || cfg!(test) || self.fixture_reviewer {
+            return route;
+        }
+        match route {
+            ReviewRoute::Execute | ReviewRoute::Hold { .. } => ReviewRoute::ReviewFailed {
+                reason: ReviewFailure::Disabled,
+            },
+            failed @ ReviewRoute::ReviewFailed { .. } => failed,
+        }
     }
 }
 
@@ -461,18 +528,6 @@ pub fn route_assessment(assessment: &ReviewAssessment) -> ReviewRoute {
         };
     }
     ReviewRoute::Execute
-}
-
-fn gate_execution(route: ReviewRoute) -> ReviewRoute {
-    if AUTO_REVIEW_EXECUTION_ENABLED || cfg!(test) {
-        return route;
-    }
-    match route {
-        ReviewRoute::Execute | ReviewRoute::Hold { .. } => ReviewRoute::ReviewFailed {
-            reason: ReviewFailure::Disabled,
-        },
-        failed @ ReviewRoute::ReviewFailed { .. } => failed,
-    }
 }
 
 fn route_reason(route: &ReviewRoute) -> &'static str {

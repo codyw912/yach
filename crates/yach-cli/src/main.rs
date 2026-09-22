@@ -3801,6 +3801,7 @@ fn native_backend_capabilities(provider_connections_available: bool) -> Vec<Capa
         Capability::ApprovalModes,
         Capability::ModelState,
         Capability::PromptAttemptReset,
+        Capability::AutoReview,
     ];
     if provider_connections_available {
         capabilities.push(Capability::ProviderConnections);
