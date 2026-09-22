@@ -4436,6 +4436,7 @@ fn run_extension_trust_command(selector: &str) -> CommandResult {
                 extension_id,
                 &record.manifest.version,
                 &record.manifest.contributes.tools,
+                record.manifest.contributes.reviewer.as_ref(),
                 ExtensionDecisionSurface::Cli,
             ) {
                 Ok(None) => extension_capability_management_result(

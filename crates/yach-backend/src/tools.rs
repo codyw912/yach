@@ -2760,6 +2760,12 @@ fn extension_host_error_label(error: &crate::ExtensionHostProtocolError) -> &'st
         crate::ExtensionHostProtocolError::ToolRiskMismatch { .. } => {
             "extension_host_tool_risk_mismatch"
         }
+        crate::ExtensionHostProtocolError::ReviewerContractMismatch => {
+            "extension_host_reviewer_contract_mismatch"
+        }
+        crate::ExtensionHostProtocolError::MissingReviewReady => {
+            "extension_host_missing_review_ready"
+        }
     }
 }
 

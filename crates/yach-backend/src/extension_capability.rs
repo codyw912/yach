@@ -11,7 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::extension::{ExtensionToolContribution, ExtensionToolRisk};
+use crate::extension::{
+    ExtensionReviewerContribution, ExtensionToolContribution, ExtensionToolRisk,
+};
 
 mod store;
 pub use store::{ExtensionAuthorityError, ExtensionAuthorityStore, ExtensionDecisionSurface};
@@ -57,13 +59,15 @@ impl ExtensionCapabilityGrantStatus {
     }
 }
 
-/// The capability set a manifest's tools request, derived rather than
-/// declared separately so the summary cannot understate the tools.
+/// The capability set a manifest requests, derived from its tools and, when
+/// present, a remote reviewer. Derived rather than declared separately so the
+/// summary cannot understate either.
 #[must_use]
 pub fn requested_capabilities(
     tools: &[ExtensionToolContribution],
+    reviewer: Option<&ExtensionReviewerContribution>,
 ) -> BTreeSet<ExtensionCapability> {
-    tools
+    let mut capabilities = tools
         .iter()
         .filter_map(|tool| match tool.risk {
             ExtensionToolRisk::UsesNetwork => Some(ExtensionCapability::UsesNetwork),
@@ -72,7 +76,11 @@ pub fn requested_capabilities(
             | ExtensionToolRisk::ReadsLocalContent
             | ExtensionToolRisk::MutatesLocalState => None,
         })
-        .collect()
+        .collect::<BTreeSet<_>>();
+    if reviewer.is_some_and(|reviewer| reviewer.remote) {
+        capabilities.insert(ExtensionCapability::UsesNetwork);
+    }
+    capabilities
 }
 
 /// A recorded user grant.
@@ -132,18 +140,20 @@ pub fn load_grant(extension_id: &str) -> Option<ExtensionCapabilityGrant> {
         .ok()?
 }
 
-/// Approve the capabilities requested by `tools`. Writes nothing when the
-/// extension requests none, so an absent grant stays absent.
+/// Approve the capabilities requested by `tools` and a remote reviewer.
+/// Writes nothing when the extension requests none, so an absent grant stays absent.
 pub fn grant_requested(
     extension_id: &str,
     version: &str,
     tools: &[ExtensionToolContribution],
+    reviewer: Option<&ExtensionReviewerContribution>,
     surface: ExtensionDecisionSurface,
 ) -> Result<Option<ExtensionCapabilityGrant>, ExtensionAuthorityError> {
     ExtensionAuthorityStore::for_current_user()?.grant_requested(
         extension_id,
         version,
         tools,
+        reviewer,
         surface,
     )
 }
@@ -290,7 +300,7 @@ mod tests {
             tool("fetch", ExtensionToolRisk::UsesNetwork),
         ];
         assert_eq!(
-            requested_capabilities(&tools),
+            requested_capabilities(&tools, None),
             BTreeSet::from([ExtensionCapability::UsesNetwork]),
             "file-scoped risks must not require a grant"
         );
@@ -299,7 +309,7 @@ mod tests {
     #[test]
     fn file_scoped_extensions_request_nothing() {
         let tools = vec![tool("read", ExtensionToolRisk::ReadsLocalContent)];
-        assert!(requested_capabilities(&tools).is_empty());
+        assert!(requested_capabilities(&tools, None).is_empty());
     }
 
     #[test]

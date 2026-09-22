@@ -544,6 +544,7 @@ fn schedule_native_extension_trust(
             extension_id,
             &record.manifest.version,
             &record.manifest.contributes.tools,
+            record.manifest.contributes.reviewer.as_ref(),
             crate::ExtensionDecisionSurface::Lifecycle,
         ) {
             Ok(None) => (
