@@ -3811,6 +3811,7 @@ dependencies = [
  "yach-catalog",
  "yach-connections",
  "yach-hashline-extension",
+ "yach-jev-reviewer",
  "yach-proto",
  "yach-trace",
  "yach-ui",
@@ -3889,6 +3890,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "yach-jev-reviewer"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
