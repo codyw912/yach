@@ -1032,6 +1032,9 @@ pub enum ServerEvent {
         reviewer_id: String,
         generation: u64,
         state: ReviewerState,
+        /// Human-readable disclosure summary from the reviewer manifest.
+        /// Shown at selection time so the user knows what the reviewer sees.
+        disclosure_summary: String,
     },
     DialogRequested(DialogRequest),
     ToolReviewRequested {
@@ -1398,6 +1401,7 @@ mod tests {
             reviewer_id: String::from("jev-typesafe"),
             generation: 7,
             state: ReviewerState::Reloaded,
+            disclosure_summary: String::from("sends bounded action context to api.example"),
         };
         let wire = event.to_jsonl();
         assert!(wire.is_ok());
