@@ -2,7 +2,14 @@
 //!
 //! Design: `docs/project/specs/2026-09-21-intent-aware-auto-review-design.md`.
 
+mod assessment;
+mod coordinator;
 mod policy;
+mod request;
+
+pub use assessment::ReviewAssessment;
+pub use coordinator::{HoldReason, ReviewCoordinator, ReviewFailure, ReviewRoute};
+pub use request::{EvidenceItem, OmissionMarker, ReviewAction, ReviewRequest, SandboxState};
 
 pub use policy::{
     ActionClass, PolicyRevision, RestrictionMatcher, ReviewPolicy, ReviewPolicyError,

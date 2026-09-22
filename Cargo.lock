@@ -3834,6 +3834,7 @@ dependencies = [
  "similar",
  "tokio",
  "tokio-util",
+ "toml",
  "toml_edit",
  "uuid",
  "yach-connections",

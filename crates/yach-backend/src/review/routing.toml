@@ -1,0 +1,22 @@
+schema = "yach-review-routing.v1"
+
+# Thresholds are per question type. Noul probabilities and Choice labels are
+# never compared against a shared cutoff. Consequence is a 0..=3 score, not a
+# probability: destructive_level is the score at which the action holds even
+# when authorization is exact.
+
+[choice.authorization]
+# exact_authorized and substantive_authorized execute; the other labels hold.
+
+[noul.restriction]
+restrict_threshold = 0.5
+
+[score.consequence]
+consequence_threshold = 2.0
+destructive_level = 3.0
+
+[noul.evidence]
+evidence_threshold = 0.8
+
+[noul.origin_confusion]
+origin_threshold = 0.5
