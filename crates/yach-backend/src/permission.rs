@@ -593,12 +593,10 @@ impl PermissionDecisionEngine {
     }
 }
 
-fn selected_restriction<'a>(
-    policy: &'a ReviewPolicy,
-    request: &PermissionRequest,
+fn merge_precedence<'a>(
+    global: Option<&'a ReviewRestriction>,
+    project: Option<&'a ReviewRestriction>,
 ) -> Option<&'a ReviewRestriction> {
-    let global = strongest_match(&policy.global, request);
-    let project = strongest_match(&policy.project, request);
     match (global, project) {
         (Some(global @ ReviewRestriction::HumanPerforms { .. }), _) => Some(global),
         (_, Some(project @ ReviewRestriction::HumanPerforms { .. })) => Some(project),
@@ -607,13 +605,23 @@ fn selected_restriction<'a>(
     }
 }
 
-fn strongest_match<'a>(
-    restrictions: &'a [ReviewRestriction],
+fn selected_restriction<'a>(
+    policy: &'a ReviewPolicy,
     request: &PermissionRequest,
+) -> Option<&'a ReviewRestriction> {
+    merge_precedence(
+        strongest_match(&policy.global, request),
+        strongest_match(&policy.project, request),
+    )
+}
+
+fn strongest_by<'a>(
+    restrictions: &'a [ReviewRestriction],
+    matches: impl Fn(&ReviewRestriction) -> bool,
 ) -> Option<&'a ReviewRestriction> {
     let mut selected: Option<&ReviewRestriction> = None;
     for restriction in restrictions {
-        if !restriction_matches(restriction, request) {
+        if !matches(restriction) {
             continue;
         }
         let replace = match selected {
@@ -630,6 +638,43 @@ fn strongest_match<'a>(
         }
     }
     selected
+}
+
+fn strongest_match<'a>(
+    restrictions: &'a [ReviewRestriction],
+    request: &PermissionRequest,
+) -> Option<&'a ReviewRestriction> {
+    strongest_by(restrictions, |restriction| {
+        restriction_matches(restriction, request)
+    })
+}
+
+/// Strongest restriction matching an action class, using the same precedence
+/// as [`PermissionDecisionEngine::check_restrictions`]: any `HumanPerforms`
+/// beats any `AskFirst`, and global beats project within the same kind.
+#[must_use]
+pub fn restriction_for_class(
+    policy: &ReviewPolicy,
+    class: ActionClass,
+) -> Option<&ReviewRestriction> {
+    let is_class = |restriction: &ReviewRestriction| {
+        matches!(
+            restriction,
+            ReviewRestriction::AskFirst {
+                matcher: RestrictionMatcher::ActionClass { class: c },
+                ..
+            }
+            | ReviewRestriction::HumanPerforms {
+                matcher: RestrictionMatcher::ActionClass { class: c },
+                ..
+            }
+            if *c == class
+        )
+    };
+    merge_precedence(
+        strongest_by(&policy.global, is_class),
+        strongest_by(&policy.project, is_class),
+    )
 }
 
 fn restriction_matches(restriction: &ReviewRestriction, request: &PermissionRequest) -> bool {
@@ -1099,6 +1144,32 @@ mod tests {
             return;
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn restriction_for_class_uses_global_human_performs_precedence() {
+        let policy = ReviewPolicy {
+            revision: crate::PolicyRevision(1),
+            global: vec![crate::ReviewRestriction::AskFirst {
+                matcher: crate::RestrictionMatcher::ActionClass {
+                    class: crate::ActionClass::PersistentInstall,
+                },
+                note: String::from("g"),
+            }],
+            project: vec![crate::ReviewRestriction::HumanPerforms {
+                matcher: crate::RestrictionMatcher::ActionClass {
+                    class: crate::ActionClass::PersistentInstall,
+                },
+                note: String::from("p"),
+            }],
+        };
+        assert!(matches!(
+            super::restriction_for_class(&policy, crate::ActionClass::PersistentInstall),
+            Some(crate::ReviewRestriction::HumanPerforms { note, .. }) if note == "p"
+        ));
+        assert!(
+            super::restriction_for_class(&policy, crate::ActionClass::ExternalPublish).is_none()
+        );
     }
 
     fn human_performs(prefix: &str) -> crate::ReviewRestriction {

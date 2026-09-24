@@ -6,18 +6,20 @@ mod assessment;
 mod coordinator;
 mod policy;
 mod request;
+mod routing;
 mod signals;
 
 pub use assessment::ReviewAssessment;
 pub use coordinator::{
     HoldReason, ReviewCoordinator, ReviewFailure, ReviewFreshness, ReviewRoute,
-    bump_authorization_revision, route_assessment,
+    bump_authorization_revision,
 };
 pub use request::{
     BoundReviewRequest, EvidenceItem, OmissionMarker, REVIEW_REQUEST_SCHEMA, ReviewAction,
     ReviewEditOperation, ReviewRequest, SandboxState, USER_MESSAGE_BUDGET_BYTES,
     UserMessageEvidence, bind_review_request, user_message_evidence,
 };
+pub use routing::route_assessment;
 pub use signals::ReviewSignal;
 
 pub use policy::{

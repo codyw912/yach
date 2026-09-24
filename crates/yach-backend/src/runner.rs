@@ -8300,11 +8300,11 @@ Select a reviewer extension or switch to a manual approval mode.",
             match route {
                 crate::ReviewRoute::Execute => {}
                 crate::ReviewRoute::Hold { reason, .. } => {
-                    let hold_reason = match reason {
+                    let hold_reason = match &reason {
                         crate::HoldReason::EvidenceOverBudget => "evidence_over_budget",
                         crate::HoldReason::SignificantRisk => "reviewer_hold_risk",
                         crate::HoldReason::NeedsClarification => "reviewer_hold_evidence",
-                        crate::HoldReason::RestrictionApplies => "restriction_ask_first",
+                        crate::HoldReason::RestrictionApplies { .. } => "restriction_ask_first",
                     };
                     if !batch.structured_review_rows {
                         return finish_failed(
@@ -8322,11 +8322,11 @@ structured review rows.",
                             command: command.clone(),
                             workdir: workdir.clone(),
                             timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
-                            review_origin: Some(match reason {
+                            review_origin: Some(match &reason {
                                 crate::HoldReason::SignificantRisk => {
                                     yach_proto::ReviewOrigin::Risk
                                 }
-                                crate::HoldReason::RestrictionApplies => {
+                                crate::HoldReason::RestrictionApplies { .. } => {
                                     yach_proto::ReviewOrigin::HumanPerforms
                                 }
                                 _ => yach_proto::ReviewOrigin::Risk,

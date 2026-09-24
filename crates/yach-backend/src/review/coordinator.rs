@@ -40,12 +40,14 @@ pub fn bump_authorization_revision(revision: &Mutex<u64>) {
 pub(crate) const AUTO_REVIEW_EXECUTION_ENABLED: bool = false;
 
 /// Why a reviewed action is held for a person.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HoldReason {
     EvidenceOverBudget,
     SignificantRisk,
     NeedsClarification,
-    RestrictionApplies,
+    RestrictionApplies {
+        restriction: crate::ReviewRestriction,
+    },
 }
 
 /// Why automatic review could not produce a route.
@@ -360,7 +362,20 @@ impl<'a> ReviewCoordinator<'a> {
                 reason: ReviewFailure::Stale,
             };
         }
-        let route = route_assessment(&assessment);
+        let Ok(policy) = self.policy.lock().map(|policy| policy.clone()) else {
+            return ReviewRoute::ReviewFailed {
+                reason: ReviewFailure::Unavailable,
+            };
+        };
+        // A policy swap landing between the freshness check and this lock
+        // would route on a revision different from the one validated and
+        // persisted in ReviewRequestRecorded.
+        if policy.revision != freshness.policy_revision {
+            return ReviewRoute::ReviewFailed {
+                reason: ReviewFailure::Stale,
+            };
+        }
+        let route = super::routing::route_assessment(&review_request, &assessment, &policy);
         let route = self.gate_execution(route);
         let recorded = SessionEvent::ReviewAssessmentRecorded {
             request_id: BoundedReviewText::new(&review_request.request_id),
@@ -407,19 +422,6 @@ impl<'a> ReviewCoordinator<'a> {
     }
 }
 
-/// Route from typed answers. Probabilities are compared, never multiplied.
-#[must_use]
-pub fn route_assessment(assessment: &ReviewAssessment) -> ReviewRoute {
-    if assessment.signals.values().any(|v| *v >= 0.5) {
-        ReviewRoute::Hold {
-            reason: HoldReason::SignificantRisk,
-            evidence_refs: assessment.evidence_refs.clone(),
-        }
-    } else {
-        ReviewRoute::Execute
-    }
-}
-
 fn route_reason(route: &ReviewRoute) -> &'static str {
     match route {
         ReviewRoute::Execute => "execute",
@@ -436,7 +438,17 @@ fn route_reason(route: &ReviewRoute) -> &'static str {
             ..
         } => "reviewer_hold_evidence",
         ReviewRoute::Hold {
-            reason: HoldReason::RestrictionApplies,
+            reason:
+                HoldReason::RestrictionApplies {
+                    restriction: crate::ReviewRestriction::HumanPerforms { .. },
+                },
+            ..
+        } => "restriction_human_performs",
+        ReviewRoute::Hold {
+            reason:
+                HoldReason::RestrictionApplies {
+                    restriction: crate::ReviewRestriction::AskFirst { .. },
+                },
             ..
         } => "restriction_ask_first",
         ReviewRoute::ReviewFailed {
@@ -626,7 +638,7 @@ mod tests {
 
     fn trusted() -> Vec<EvidenceItem> {
         vec![EvidenceItem {
-            id: String::from("user-1"),
+            id: String::from("user:e1"),
             source: String::from("user"),
             kind: String::from("message"),
             excerpt: String::from("run the tests"),
@@ -647,7 +659,7 @@ mod tests {
             "authorization": "exact_authorized",
             "signals": signals,
             "confidence": {"authorization": 0.9},
-            "evidence_refs": ["user-1"],
+            "evidence_refs": ["user:e1"],
             "adapter_error": null,
             "usage": {"input_tokens": 10, "output_tokens": 4},
             "duration_ms": 12
@@ -772,6 +784,32 @@ mod tests {
             _ => None,
         });
         assert_eq!(model.as_deref(), Some("jev-1.13.0"));
+    }
+
+    #[tokio::test]
+    async fn publish_signal_holds_as_risk_through_coordinator() {
+        let mut assessment = clear_assessment("perm-1");
+        assessment["signals"]["publish"] = json!(0.9);
+        let built = fixture(Ok(review_result(assessment)));
+        let route = coordinator(&built)
+            .review_action(
+                permission_request(),
+                shell_action(),
+                trusted(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(
+                route,
+                ReviewRoute::Hold {
+                    reason: HoldReason::SignificantRisk,
+                    ..
+                }
+            ),
+            "a firing publish signal holds as risk with an empty policy, got {route:?}"
+        );
     }
 
     #[tokio::test]

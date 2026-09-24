@@ -111,13 +111,22 @@ fn run_review_route(ctx: &RunCtx, with_reviewer: bool) -> Result<Measured, Strin
             timeout_ms: 5000,
             env_keys: vec![String::from("PATH")],
         };
-        let trusted = vec![EvidenceItem {
-            id: String::from("cmd"),
-            source: String::from("permission_request"),
-            kind: String::from("shell_command"),
-            excerpt: String::from("true"),
-            truncated: false,
-        }];
+        let trusted = vec![
+            EvidenceItem {
+                id: String::from("user:perf"),
+                source: String::from("user"),
+                kind: String::from("message"),
+                excerpt: String::from("run true"),
+                truncated: false,
+            },
+            EvidenceItem {
+                id: String::from("cmd"),
+                source: String::from("permission_request"),
+                kind: String::from("shell_command"),
+                excerpt: String::from("true"),
+                truncated: false,
+            },
+        ];
         let start = std::time::Instant::now();
         let route = if with_reviewer {
             runtime.block_on(coordinator.review_action(
@@ -177,7 +186,14 @@ fn run_review_route(ctx: &RunCtx, with_reviewer: bool) -> Result<Measured, Strin
                     return Err(String::from("request over budget"));
                 }
             };
-            yach_backend::route_assessment(&assessment)
+            let yach_backend::BoundReviewRequest::Ready(bound_request) = &bound else {
+                return Err(String::from("request over budget"));
+            };
+            yach_backend::route_assessment(
+                bound_request.as_ref(),
+                &assessment,
+                &ReviewPolicy::empty(),
+            )
         };
         let _ = route;
         samples.push(start.elapsed());
