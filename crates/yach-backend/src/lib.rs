@@ -3570,6 +3570,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::for_edit_mode(PermissionMode::Allow),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -3627,6 +3629,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::default_local_edit(),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -3685,6 +3689,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::default_local_edit(),
                 edit_policy: EditPolicy::extension_proposal(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
             proposal,
@@ -3777,6 +3783,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::default_local_edit(),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -3825,6 +3833,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::default_local_edit(),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -3910,6 +3920,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::default_local_edit(),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -3979,6 +3991,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::default_local_edit(),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -4033,6 +4047,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::default_local_edit(),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -4115,6 +4131,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::for_edit_mode(PermissionMode::Allow),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -4184,6 +4202,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::default_local_edit(),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -4269,6 +4289,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::default_local_edit(),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -4329,6 +4351,8 @@ mod tests {
                 turn_id: TurnId(String::from("turn-1")),
                 permission_policy: PermissionPolicy::for_edit_mode(PermissionMode::Allow),
                 edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
             },
             request,
         );
@@ -6454,6 +6478,8 @@ mod tests {
             permission_policy: PermissionPolicy::for_edit_mode(PermissionMode::Allow),
             edit_policy: EditPolicy::test(),
             tool_request_id: Some(ToolRequestId(String::from("tool-request-1"))),
+            review_policy: crate::ReviewPolicy::empty(),
+            authorization_revision: 0,
         };
 
         let preview = access.prepare(

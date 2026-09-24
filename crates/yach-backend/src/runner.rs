@@ -7512,6 +7512,14 @@ async fn execute_native_provider_extension_tool_request(
                         current_edit_permission_mode(batch),
                     ),
                     edit_policy: EditPolicy::extension_proposal(),
+                    review_policy: batch
+                        .review_policy
+                        .lock()
+                        .map_or_else(|_| crate::ReviewPolicy::empty(), |guard| guard.clone()),
+                    authorization_revision: batch
+                        .review_coordinator
+                        .and_then(crate::ReviewCoordinator::snapshot)
+                        .map_or(0, |freshness| freshness.authorization_revision),
                 },
                 request,
                 proposal,
@@ -7611,6 +7619,14 @@ async fn execute_native_provider_edit_tool_request(
             turn_id: batch.turn_id.clone(),
             permission_policy: PermissionPolicy::for_edit_mode(current_edit_permission_mode(batch)),
             edit_policy: EditPolicy::conservative(),
+            review_policy: batch
+                .review_policy
+                .lock()
+                .map_or_else(|_| crate::ReviewPolicy::empty(), |guard| guard.clone()),
+            authorization_revision: batch
+                .review_coordinator
+                .and_then(crate::ReviewCoordinator::snapshot)
+                .map_or(0, |freshness| freshness.authorization_revision),
         },
         request,
     );
@@ -7674,6 +7690,12 @@ async fn finish_prepared_edit_tool_request(
                     requested_reviewer: Some(PermissionReviewer::AutoReview),
                     command: None,
                 };
+                if let Some(freshness) = coordinator.snapshot() {
+                    let _ = batch.edit_access.rebind_reviewer_generation(
+                        &preview.preview_id,
+                        freshness.reviewer_generation,
+                    );
+                }
                 let route = tokio::select! {
                     () = batch.cancellation.cancelled() => {
                         return Err(ProviderRoundError::Cancelled(String::from(

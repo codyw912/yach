@@ -70,6 +70,8 @@ pub(super) fn handle_native_local_edit_prepare(
         permission_policy: PermissionPolicy::default_local_edit(),
         edit_policy: EditPolicy::conservative(),
         tool_request_id: None,
+        review_policy: crate::ReviewPolicy::empty(),
+        authorization_revision: 0,
     };
 
     match edit_access.prepare(edit_root, request, context, &mut log) {

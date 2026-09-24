@@ -29,6 +29,10 @@ pub struct AgentEditToolContext {
     pub turn_id: TurnId,
     pub permission_policy: PermissionPolicy,
     pub edit_policy: EditPolicy,
+    /// Live user review restrictions applied to the permission decision.
+    pub review_policy: crate::ReviewPolicy,
+    /// Authorization revision captured at prepare time for staleness checks.
+    pub authorization_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,6 +373,8 @@ pub fn prepare_agent_edit_tool_request(
         permission_policy: context.permission_policy.clone(),
         edit_policy: context.edit_policy,
         tool_request_id: Some(tool_request_id),
+        review_policy: context.review_policy.clone(),
+        authorization_revision: context.authorization_revision,
     };
 
     let prepare_started = Instant::now();
@@ -610,6 +616,8 @@ pub fn prepare_extension_edit_proposal(
         permission_policy: context.permission_policy.clone(),
         edit_policy: context.edit_policy,
         tool_request_id: Some(tool_request_id),
+        review_policy: context.review_policy.clone(),
+        authorization_revision: context.authorization_revision,
     };
     let mut prepare_log = SessionLog::default();
     let preview = match edit_access.prepare_with_diagnostics(

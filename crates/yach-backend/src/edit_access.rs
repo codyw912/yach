@@ -26,6 +26,10 @@ pub struct EditAccessContext {
     pub permission_policy: PermissionPolicy,
     pub edit_policy: EditPolicy,
     pub tool_request_id: Option<ToolRequestId>,
+    /// Live user review restrictions applied to the permission decision.
+    pub review_policy: crate::ReviewPolicy,
+    /// Authorization revision captured at prepare time for staleness checks.
+    pub authorization_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +155,20 @@ impl EditAccess {
             preconditions: Vec::new(),
         })
     }
+
+    /// Bind the reviewer generation that will judge this preview. Called by the
+    /// coordinator path immediately before review; manual review leaves it 0.
+    pub fn rebind_reviewer_generation(
+        &mut self,
+        preview_id: &EditPreviewId,
+        generation: u64,
+    ) -> bool {
+        let Some(pending) = self.pending.get_mut(&preview_id.0) else {
+            return false;
+        };
+        pending.reviewer_generation = generation;
+        true
+    }
 }
 
 impl EditAccess {
@@ -182,9 +200,10 @@ impl EditAccess {
         let decision = PermissionDecisionEngine::decide(
             &permission_request,
             &context.permission_policy,
-            &crate::ReviewPolicy::empty(),
+            &context.review_policy,
         );
-        let permission_summary = decision.summary(&permission_request, false);
+        let mut permission_summary = decision.summary(&permission_request, false);
+        permission_summary.authorization_revision = context.authorization_revision;
         log.record_permission_decision(
             context.session_id.clone(),
             context.turn_id.clone(),
@@ -652,6 +671,8 @@ mod tests {
             permission_policy: PermissionPolicy::for_edit_mode(mode),
             edit_policy: EditPolicy::test(),
             tool_request_id: None,
+            review_policy: crate::ReviewPolicy::empty(),
+            authorization_revision: 0,
         }
     }
 
@@ -1114,5 +1135,104 @@ mod tests {
                 .as_deref(),
             Some("hello\n")
         );
+    }
+
+    #[test]
+    fn prepare_applies_user_restrictions_to_agent_edits() {
+        let project = TempProject::new("restriction-edit");
+        write_file(&project, "file.txt", "hello\n");
+        let Some(root) = resource_root(&project) else {
+            return;
+        };
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
+        let mut context = context(PermissionMode::Allow);
+        context.review_policy = crate::ReviewPolicy {
+            revision: crate::PolicyRevision(3),
+            global: vec![crate::ReviewRestriction::AskFirst {
+                matcher: crate::RestrictionMatcher::PathPrefix {
+                    prefix: String::from("file.txt"),
+                },
+                note: String::from("ask before touching file.txt"),
+            }],
+            project: Vec::new(),
+        };
+        let outcome = access.prepare_with_diagnostics(&root, modify_request(), context, &mut log);
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else { return };
+        assert_eq!(
+            outcome.preview.review_state,
+            EditAccessReviewState::NeedsUserApproval
+        );
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::PermissionDecisionRecorded { summary, .. }
+                if summary.reason == "restriction_ask_first"
+                    && summary.policy_revision == crate::PolicyRevision(3)
+        )));
+    }
+
+    #[test]
+    fn pending_preview_binds_live_revisions_and_rebinds_generation() {
+        let project = TempProject::new("freshness-binding");
+        write_file(&project, "file.txt", "hello\n");
+        let Some(root) = resource_root(&project) else {
+            return;
+        };
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
+        let mut context = context(PermissionMode::Ask);
+        context.authorization_revision = 4;
+        let preview = access.prepare(&root, modify_request(), context, &mut log);
+        assert!(preview.is_ok());
+        let Ok(preview) = preview else { return };
+        assert!(access.rebind_reviewer_generation(&preview.preview_id, 2));
+        let fresh = crate::ReviewFreshness {
+            policy_revision: crate::PolicyRevision(0),
+            authorization_revision: 4,
+            reviewer_generation: 2,
+        };
+        let store = crate::JsonlSessionStore::new(project.root().join("session.jsonl"));
+        let applied = access.apply_with_evidence_sink_and_freshness(
+            &preview.preview_id,
+            &preview.permission_decision_id,
+            &store,
+            Some(fresh),
+        );
+        assert!(
+            applied.is_ok(),
+            "matching live revisions apply: {applied:?}"
+        );
+    }
+
+    #[test]
+    fn pending_preview_is_stale_after_a_new_user_message() {
+        let project = TempProject::new("freshness-stale");
+        write_file(&project, "file.txt", "hello\n");
+        let Some(root) = resource_root(&project) else {
+            return;
+        };
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
+        let mut context = context(PermissionMode::Ask);
+        context.authorization_revision = 4;
+        let preview = access.prepare(&root, modify_request(), context, &mut log);
+        let Ok(preview) = preview else {
+            unreachable!("prepare succeeds")
+        };
+        let _ = access.rebind_reviewer_generation(&preview.preview_id, 2);
+        let moved = crate::ReviewFreshness {
+            policy_revision: crate::PolicyRevision(0),
+            authorization_revision: 5,
+            reviewer_generation: 2,
+        };
+        let store = crate::JsonlSessionStore::new(project.root().join("session.jsonl"));
+        let applied = access.apply_with_evidence_sink_and_freshness(
+            &preview.preview_id,
+            &preview.permission_decision_id,
+            &store,
+            Some(moved),
+        );
+        assert!(matches!(applied, Err(EditAccessError::StaleAuthorization)));
     }
 }
