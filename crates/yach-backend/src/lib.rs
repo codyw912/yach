@@ -74,6 +74,10 @@ pub use thinking_config::*;
 pub use provider_connections::*;
 pub use resource::*;
 pub use runner::*;
+#[cfg(feature = "bench")]
+pub use runner::{
+    ShellHoldDisposition, shell_disposition_for_decision, shell_disposition_for_hold,
+};
 pub use sensitive_paths::*;
 pub use session::*;
 pub use session_store::*;

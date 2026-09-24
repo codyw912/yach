@@ -8161,14 +8161,14 @@ fn persist_shell_review_resolution(
 
 /// What the shell path does with a held or asked action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShellHoldDisposition {
+pub enum ShellHoldDisposition {
     /// Show a one-action approval row with this origin.
     AskUser(Option<yach_proto::ReviewOrigin>),
     /// Never run; hand off to the user outside the agent.
     HumanPerforms,
 }
 
-pub(crate) fn shell_disposition_for_decision(reason: &str) -> ShellHoldDisposition {
+pub fn shell_disposition_for_decision(reason: &str) -> ShellHoldDisposition {
     if reason == crate::RESTRICTION_HUMAN_PERFORMS_REASON {
         ShellHoldDisposition::HumanPerforms
     } else {
@@ -8176,7 +8176,7 @@ pub(crate) fn shell_disposition_for_decision(reason: &str) -> ShellHoldDispositi
     }
 }
 
-pub(crate) fn shell_disposition_for_hold(reason: &crate::HoldReason) -> ShellHoldDisposition {
+pub fn shell_disposition_for_hold(reason: &crate::HoldReason) -> ShellHoldDisposition {
     match reason {
         crate::HoldReason::RestrictionApplies {
             restriction: crate::ReviewRestriction::HumanPerforms { .. },
