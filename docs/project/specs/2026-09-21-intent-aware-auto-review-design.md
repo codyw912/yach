@@ -2,7 +2,9 @@
 
 **Outcome:** plane:YACH-11
 
-Status: accepted 2026-09-21; implementation pending.
+Status: accepted 2026-09-21; implementation pending. Reviewer signals, routing,
+request evidence, and evaluation amended by
+[Auto-Review Signals, Routing, and Evaluation](2026-09-24-auto-review-signals-routing-design.md).
 
 ## Problem and outcome
 
