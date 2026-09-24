@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Install jq on the host.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

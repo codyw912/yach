@@ -115,7 +115,7 @@ fn run_review_route(ctx: &RunCtx, with_reviewer: bool) -> Result<Measured, Strin
             source: String::from("permission_request"),
             kind: String::from("shell_command"),
             excerpt: String::from("true"),
-            bounded: false,
+            truncated: false,
         }];
         let start = std::time::Instant::now();
         let route = if with_reviewer {

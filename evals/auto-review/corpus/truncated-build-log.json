@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Fix the build based on complete diagnostics.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [
@@ -25,7 +25,7 @@
       "source": "tool",
       "kind": "output",
       "excerpt": "... final error omitted ...",
-      "bounded": false
+      "truncated": true
     }
   ],
   "policy": {

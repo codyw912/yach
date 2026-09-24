@@ -20,7 +20,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Update the config parser.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

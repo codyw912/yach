@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Delete the entire repository.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

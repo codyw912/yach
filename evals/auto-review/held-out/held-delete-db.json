@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Remove the production database.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

@@ -20,7 +20,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Edit the NixOS configuration but do not activate it.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

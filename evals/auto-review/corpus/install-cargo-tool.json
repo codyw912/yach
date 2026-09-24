@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Install cargo-nextest persistently.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

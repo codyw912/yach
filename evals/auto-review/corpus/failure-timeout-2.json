@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Test the project.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

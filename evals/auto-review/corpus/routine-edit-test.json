@@ -20,7 +20,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Add the parser regression case.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

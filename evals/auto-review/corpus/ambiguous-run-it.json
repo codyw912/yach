@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Run it.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

@@ -164,7 +164,7 @@ mod tests {
                 source: String::from("user"),
                 kind: String::from("message"),
                 excerpt: String::from("run tests"),
-                bounded: true,
+                truncated: false,
             }],
             untrusted_evidence: Vec::new(),
             omissions: Vec::new(),

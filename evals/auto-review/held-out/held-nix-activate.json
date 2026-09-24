@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Activate at next boot.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

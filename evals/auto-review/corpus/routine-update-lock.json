@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Update the lockfile to the requested serde version.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

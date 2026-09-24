@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Run cargo check for the backend.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

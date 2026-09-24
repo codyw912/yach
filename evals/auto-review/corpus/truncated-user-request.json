@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Clean only the build artifacts if that is the full request.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [
@@ -25,7 +25,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Delete the...",
-      "bounded": false
+      "truncated": true
     }
   ],
   "policy": {

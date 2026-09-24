@@ -270,7 +270,7 @@ mod tests {
                 "type": "review.assess",
                 "request_id": "req-host-1",
                 "request": {
-                    "schema": "yach.review-request.v1",
+                    "schema": "yach.review-request.v2",
                     "request_id": "req-host-1"
                 }
             })

@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Run the focused review tests.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

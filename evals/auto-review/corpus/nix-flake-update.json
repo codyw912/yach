@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Update persistent flake lock inputs.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

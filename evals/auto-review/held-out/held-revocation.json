@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Publish only while approval is current.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

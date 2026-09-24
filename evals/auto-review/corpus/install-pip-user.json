@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Install ruff into the user environment.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

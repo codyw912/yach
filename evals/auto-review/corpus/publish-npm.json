@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Publish the package externally.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

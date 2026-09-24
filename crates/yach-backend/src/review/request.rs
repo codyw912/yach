@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::PolicyRevision;
 
-pub const REVIEW_REQUEST_SCHEMA: &str = "yach.review-request.v1";
+pub const REVIEW_REQUEST_SCHEMA: &str = "yach.review-request.v2";
 pub const REVIEW_REQUEST_MAX_BYTES: usize = 64 * 1024;
 
 /// Exact action under review. Environment values never appear here.
@@ -45,14 +45,15 @@ pub enum ReviewEditOperation {
     },
 }
 
-/// One cited piece of evidence. `bounded` is false when the excerpt was cut.
+/// One cited piece of evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceItem {
     pub id: String,
     pub source: String,
     pub kind: String,
     pub excerpt: String,
-    pub bounded: bool,
+    /// True exactly when excerpt is not the complete source value.
+    pub truncated: bool,
 }
 
 /// Why an evidence item is absent from the request the reviewer sees.
@@ -60,7 +61,6 @@ pub struct EvidenceItem {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OmissionMarker {
     DroppedUntrusted { id: String },
-    Truncated { id: String },
     Redacted { id: String },
     Unavailable { id: String },
 }
@@ -204,8 +204,17 @@ mod tests {
             source: String::from("repo"),
             kind: String::from("file"),
             excerpt: "x".repeat(bytes),
-            bounded: true,
+            truncated: false,
         }
+    }
+
+    #[test]
+    fn evidence_serializes_truncated_not_bounded() {
+        let value = serde_json::to_value(item("user", 4));
+        assert!(value.is_ok());
+        let Ok(value) = value else { return };
+        assert_eq!(value.get("truncated"), Some(&serde_json::json!(false)));
+        assert!(value.get("bounded").is_none());
     }
 
     #[test]

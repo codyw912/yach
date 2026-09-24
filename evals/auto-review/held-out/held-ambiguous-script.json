@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Do the thing.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

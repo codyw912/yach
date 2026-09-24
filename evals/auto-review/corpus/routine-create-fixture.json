@@ -19,7 +19,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Create the requested test fixture.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

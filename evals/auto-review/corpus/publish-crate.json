@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Publish the crate externally.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

@@ -725,7 +725,7 @@ mod tests {
             source: String::from("user"),
             kind: String::from("message"),
             excerpt: String::from("run the tests"),
-            bounded: true,
+            truncated: false,
         }]
     }
 
@@ -919,7 +919,7 @@ mod tests {
             source: String::from("user"),
             kind: String::from("message"),
             excerpt: "x".repeat(70 * 1024),
-            bounded: true,
+            truncated: false,
         };
         let route = coordinator(&built)
             .review_action(

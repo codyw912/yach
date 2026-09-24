@@ -16,7 +16,7 @@
       "source": "user",
       "kind": "message",
       "excerpt": "Deploy this.",
-      "bounded": true
+      "truncated": false
     }
   ],
   "untrusted_evidence": [],

@@ -299,7 +299,7 @@ mod tests {
     }
 
     fn state() -> Value {
-        json!({"schema": "yach.review-request.v1", "request_id": "req-1"})
+        json!({"schema": "yach.review-request.v2", "request_id": "req-1"})
     }
 
     fn ok_body() -> Value {
