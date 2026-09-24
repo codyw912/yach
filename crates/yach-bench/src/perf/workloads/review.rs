@@ -50,16 +50,17 @@ impl ExtensionHostInvoker for FixtureReviewer {
             .filter_map(|item| item.get("id").and_then(Value::as_str))
             .take(1)
             .collect::<Vec<_>>();
+        let signals: serde_json::Map<_, _> = yach_backend::ReviewSignal::ALL
+            .iter()
+            .map(|signal| (signal.id().to_owned(), json!(0.0)))
+            .collect();
         Ok(json!({
-            "schema": "yach.review-assessment.v1",
+            "schema": "yach.review-assessment.v2",
             "request_id": request_id,
             "reviewer_id": "fixture",
             "model": "fixture-v1",
             "authorization": "exact_authorized",
-            "restriction_applies": 0.0,
-            "consequence": 0.1,
-            "evidence_sufficient": 1.0,
-            "origin_confusion": 0.0,
+            "signals": signals,
             "confidence": {"authorization": 1.0},
             "evidence_refs": evidence_refs,
             "adapter_error": null,
@@ -146,16 +147,17 @@ fn run_review_route(ctx: &RunCtx, with_reviewer: bool) -> Result<Measured, Strin
                 sandbox_state: SandboxState::None,
             };
             let bound = yach_backend::bind_review_request(review_request);
+            let signals: serde_json::Map<_, _> = yach_backend::ReviewSignal::ALL
+                .iter()
+                .map(|signal| (signal.id().to_owned(), json!(0.0)))
+                .collect();
             let assessment_bytes = serde_json::to_vec(&json!({
-                "schema": "yach.review-assessment.v1",
+                "schema": "yach.review-assessment.v2",
                 "request_id": "perf-request",
                 "reviewer_id": "fixture",
                 "model": "fixture-v1",
                 "authorization": "exact_authorized",
-                "restriction_applies": 0.0,
-                "consequence": 0.1,
-                "evidence_sufficient": 1.0,
-                "origin_confusion": 0.0,
+                "signals": signals,
                 "confidence": {"authorization": 1.0},
                 "evidence_refs": ["cmd"],
                 "adapter_error": null,

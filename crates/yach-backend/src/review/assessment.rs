@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use super::request::ReviewRequest;
 
-pub const REVIEW_ASSESSMENT_SCHEMA: &str = "yach.review-assessment.v1";
+pub const REVIEW_ASSESSMENT_SCHEMA: &str = "yach.review-assessment.v2";
 pub const REVIEW_ASSESSMENT_MAX_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub struct AssessmentUsage {
     pub output_tokens: u64,
 }
 
-/// Assessment as emitted by a reviewer adapter (`yach.review-assessment.v1`).
+/// Assessment as emitted by a reviewer adapter (`yach.review-assessment.v2`).
 ///
 /// `model` is the concrete model the adapter recorded. An adapter error is a
 /// failed review, not an authorization.
@@ -36,10 +36,7 @@ pub struct ReviewAssessment {
     pub reviewer_id: String,
     pub model: Option<String>,
     pub authorization: String,
-    pub restriction_applies: f64,
-    pub consequence: f64,
-    pub evidence_sufficient: f64,
-    pub origin_confusion: f64,
+    pub signals: BTreeMap<String, f64>,
     #[serde(default)]
     pub confidence: BTreeMap<String, f64>,
     #[serde(default)]
@@ -82,11 +79,13 @@ impl ReviewAssessment {
             return Err(AssessmentValidationError::AdapterFailed);
         }
         assessment.authorization_answer()?;
-        if !unit_interval(assessment.restriction_applies)
-            || !unit_interval(assessment.evidence_sufficient)
-            || !unit_interval(assessment.origin_confusion)
-            || !assessment.consequence.is_finite()
-            || !(0.0..=3.0).contains(&assessment.consequence)
+        if assessment.signals.len() != super::signals::ReviewSignal::ALL.len()
+            || super::signals::ReviewSignal::ALL.iter().any(|signal| {
+                assessment
+                    .signals
+                    .get(signal.id())
+                    .is_none_or(|value| !unit_interval(*value))
+            })
         {
             return Err(AssessmentValidationError::Malformed);
         }
@@ -113,6 +112,12 @@ impl ReviewAssessment {
         Ok(assessment)
     }
 
+    /// Validated signal value; `1.0` when missing so an unvalidated map fails
+    /// closed.
+    #[must_use]
+    pub fn signal(&self, signal: super::signals::ReviewSignal) -> f64 {
+        self.signals.get(signal.id()).copied().unwrap_or(1.0)
+    }
     pub fn authorization_answer(&self) -> Result<AuthorizationAnswer, AssessmentValidationError> {
         match self.authorization.as_str() {
             "exact_authorized" => Ok(AuthorizationAnswer::ExactAuthorized),
@@ -173,22 +178,72 @@ mod tests {
     }
 
     fn body() -> serde_json::Value {
+        let signals: serde_json::Map<_, _> = crate::review::ReviewSignal::ALL
+            .iter()
+            .map(|signal| (signal.id().to_owned(), json!(0.05)))
+            .collect();
         json!({
-            "schema": "yach.review-assessment.v1",
+            "schema": "yach.review-assessment.v2",
             "request_id": "req-1",
             "reviewer_id": "jev-typesafe",
             "model": "jev-1.13.0",
             "authorization": "substantive_authorized",
-            "restriction_applies": 0.1,
-            "consequence": 1.0,
-            "evidence_sufficient": 0.9,
-            "origin_confusion": 0.05,
+            "signals": signals,
             "confidence": {"authorization": 0.8},
             "evidence_refs": ["user-1"],
             "adapter_error": null,
             "usage": {"input_tokens": 1, "output_tokens": 1},
             "duration_ms": 3
         })
+    }
+
+    #[test]
+    fn missing_signal_is_malformed() {
+        let mut value = body();
+        let removed = value["signals"]
+            .as_object_mut()
+            .map(|s| s.remove("scope_conflict"));
+        assert!(removed.is_some());
+        let bytes = serde_json::to_vec(&value).unwrap_or_default();
+        assert!(matches!(
+            ReviewAssessment::validate_against(&bytes, &request()),
+            Err(AssessmentValidationError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn extra_signal_is_malformed() {
+        let mut value = body();
+        value["signals"]["evidence_sufficient"] = json!(0.9);
+        let bytes = serde_json::to_vec(&value).unwrap_or_default();
+        assert!(matches!(
+            ReviewAssessment::validate_against(&bytes, &request()),
+            Err(AssessmentValidationError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn out_of_range_signal_is_malformed() {
+        for bad in [json!(1.01), json!(-0.1), json!("NaN")] {
+            let mut value = body();
+            value["signals"]["publish"] = bad;
+            let bytes = serde_json::to_vec(&value).unwrap_or_default();
+            assert!(matches!(
+                ReviewAssessment::validate_against(&bytes, &request()),
+                Err(AssessmentValidationError::Malformed)
+            ));
+        }
+    }
+
+    #[test]
+    fn valid_v2_assessment_exposes_typed_signals() {
+        let mut value = body();
+        value["signals"]["publish"] = json!(0.93);
+        let bytes = serde_json::to_vec(&value).unwrap_or_default();
+        let parsed = ReviewAssessment::validate_against(&bytes, &request());
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else { return };
+        assert!((parsed.signal(crate::review::ReviewSignal::Publish) - 0.93).abs() < f64::EPSILON);
     }
 
     #[test]

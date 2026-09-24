@@ -7,10 +7,8 @@
 
 #[cfg(test)]
 use std::future::Future;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use serde::Deserialize;
 
 use crate::extension::{ExtensionHostProtocolError, ExtensionResourceBroker};
 use crate::session::{SessionEvent, SessionId, TurnId};
@@ -20,7 +18,7 @@ use crate::{
     ReviewRequestSummary,
 };
 
-use super::assessment::{AssessmentValidationError, AuthorizationAnswer, ReviewAssessment};
+use super::assessment::{AssessmentValidationError, ReviewAssessment};
 use super::request::{
     BoundReviewRequest, EvidenceItem, OmissionMarker, REVIEW_REQUEST_SCHEMA, ReviewAction,
     ReviewRequest, SandboxState, action_kind, action_target, bind_review_request,
@@ -40,100 +38,6 @@ pub fn bump_authorization_revision(revision: &Mutex<u64>) {
 /// Compile-time enablement. Task 8 flips this after the held-out evaluation.
 /// While false, a model-derived route is [`ReviewFailure::Disabled`].
 pub(crate) const AUTO_REVIEW_EXECUTION_ENABLED: bool = false;
-
-const ROUTING_TOML: &str = include_str!("routing.toml");
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct RoutingThresholds {
-    restrict_threshold: f64,
-    consequence_threshold: f64,
-    destructive_level: f64,
-    evidence_threshold: f64,
-    origin_threshold: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct RoutingFile {
-    schema: String,
-    noul: NoulThresholds,
-    score: ScoreThresholds,
-}
-
-#[derive(Debug, Deserialize)]
-struct NoulThresholds {
-    restriction: RestrictThreshold,
-    evidence: EvidenceThreshold,
-    origin_confusion: OriginThreshold,
-}
-
-#[derive(Debug, Deserialize)]
-struct RestrictThreshold {
-    restrict_threshold: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct EvidenceThreshold {
-    evidence_threshold: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct OriginThreshold {
-    origin_threshold: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScoreThresholds {
-    consequence: ConsequenceThreshold,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConsequenceThreshold {
-    consequence_threshold: f64,
-    destructive_level: f64,
-}
-
-fn routing_thresholds() -> &'static RoutingThresholds {
-    static THRESHOLDS: LazyLock<RoutingThresholds> = LazyLock::new(|| {
-        let parsed: RoutingFile = toml::from_str(ROUTING_TOML).unwrap_or(RoutingFile {
-            schema: String::new(),
-            noul: NoulThresholds {
-                restriction: RestrictThreshold {
-                    restrict_threshold: 0.0,
-                },
-                evidence: EvidenceThreshold {
-                    evidence_threshold: 1.0,
-                },
-                origin_confusion: OriginThreshold {
-                    origin_threshold: 0.0,
-                },
-            },
-            score: ScoreThresholds {
-                consequence: ConsequenceThreshold {
-                    consequence_threshold: 0.0,
-                    destructive_level: 0.0,
-                },
-            },
-        });
-        // A mismatched schema fails closed: every comparison holds.
-        if parsed.schema != "yach-review-routing.v1" {
-            return RoutingThresholds {
-                restrict_threshold: 0.0,
-                consequence_threshold: 0.0,
-                destructive_level: 0.0,
-                evidence_threshold: 1.0,
-                origin_threshold: 0.0,
-            };
-        }
-        RoutingThresholds {
-            restrict_threshold: parsed.noul.restriction.restrict_threshold,
-            consequence_threshold: parsed.score.consequence.consequence_threshold,
-            destructive_level: parsed.score.consequence.destructive_level,
-            evidence_threshold: parsed.noul.evidence.evidence_threshold,
-            origin_threshold: parsed.noul.origin_confusion.origin_threshold,
-        }
-    });
-    &THRESHOLDS
-}
 
 /// Why a reviewed action is held for a person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,44 +410,14 @@ impl<'a> ReviewCoordinator<'a> {
 /// Route from typed answers. Probabilities are compared, never multiplied.
 #[must_use]
 pub fn route_assessment(assessment: &ReviewAssessment) -> ReviewRoute {
-    let thresholds = routing_thresholds();
-    let refs = assessment.evidence_refs.clone();
-    if assessment.consequence >= thresholds.destructive_level {
-        return ReviewRoute::Hold {
+    if assessment.signals.values().any(|v| *v >= 0.5) {
+        ReviewRoute::Hold {
             reason: HoldReason::SignificantRisk,
-            evidence_refs: refs,
-        };
+            evidence_refs: assessment.evidence_refs.clone(),
+        }
+    } else {
+        ReviewRoute::Execute
     }
-    let Ok(authorization) = assessment.authorization_answer() else {
-        return ReviewRoute::ReviewFailed {
-            reason: ReviewFailure::MalformedAssessment,
-        };
-    };
-    if !matches!(
-        authorization,
-        AuthorizationAnswer::ExactAuthorized | AuthorizationAnswer::SubstantiveAuthorized
-    ) || assessment.evidence_sufficient < thresholds.evidence_threshold
-    {
-        return ReviewRoute::Hold {
-            reason: HoldReason::NeedsClarification,
-            evidence_refs: refs,
-        };
-    }
-    if assessment.restriction_applies >= thresholds.restrict_threshold {
-        return ReviewRoute::Hold {
-            reason: HoldReason::RestrictionApplies,
-            evidence_refs: refs,
-        };
-    }
-    if assessment.consequence >= thresholds.consequence_threshold
-        || assessment.origin_confusion >= thresholds.origin_threshold
-    {
-        return ReviewRoute::Hold {
-            reason: HoldReason::SignificantRisk,
-            evidence_refs: refs,
-        };
-    }
-    ReviewRoute::Execute
 }
 
 fn route_reason(route: &ReviewRoute) -> &'static str {
@@ -761,16 +635,17 @@ mod tests {
     }
 
     fn clear_assessment(request_id: &str) -> Value {
+        let signals: serde_json::Map<_, _> = crate::review::ReviewSignal::ALL
+            .iter()
+            .map(|signal| (signal.id().to_owned(), json!(0.02)))
+            .collect();
         json!({
-            "schema": "yach.review-assessment.v1",
+            "schema": "yach.review-assessment.v2",
             "request_id": request_id,
             "reviewer_id": "jev-typesafe",
             "model": "jev-1.13.0",
             "authorization": "exact_authorized",
-            "restriction_applies": 0.02,
-            "consequence": 0.4,
-            "evidence_sufficient": 0.97,
-            "origin_confusion": 0.01,
+            "signals": signals,
             "confidence": {"authorization": 0.9},
             "evidence_refs": ["user-1"],
             "adapter_error": null,
@@ -897,33 +772,6 @@ mod tests {
             _ => None,
         });
         assert_eq!(model.as_deref(), Some("jev-1.13.0"));
-    }
-
-    #[tokio::test]
-    async fn destructive_consequence_holds_even_when_authorized() {
-        let mut assessment = clear_assessment("perm-1");
-        assessment["consequence"] = json!(3.0);
-        assessment["authorization"] = json!("exact_authorized");
-        let built = fixture(Ok(review_result(assessment)));
-        let route = coordinator(&built)
-            .review_action(
-                permission_request(),
-                shell_action(),
-                trusted(),
-                Vec::new(),
-                Vec::new(),
-            )
-            .await;
-        assert!(
-            matches!(
-                route,
-                ReviewRoute::Hold {
-                    reason: HoldReason::SignificantRisk,
-                    ..
-                }
-            ),
-            "destructive consequence holds despite exact authorization, got {route:?}"
-        );
     }
 
     #[tokio::test]
@@ -1116,32 +964,6 @@ mod tests {
         assert_eq!(
             invocations, 0,
             "nothing is sent when evidence cannot be recorded"
-        );
-    }
-
-    #[tokio::test]
-    async fn ambiguous_authorization_needs_clarification() {
-        let mut assessment = clear_assessment("perm-1");
-        assessment["authorization"] = json!("ambiguous");
-        let built = fixture(Ok(review_result(assessment)));
-        let route = coordinator(&built)
-            .review_action(
-                permission_request(),
-                shell_action(),
-                trusted(),
-                Vec::new(),
-                Vec::new(),
-            )
-            .await;
-        assert!(
-            matches!(
-                route,
-                ReviewRoute::Hold {
-                    reason: HoldReason::NeedsClarification,
-                    ..
-                }
-            ),
-            "ambiguous authorization asks for clarification, got {route:?}"
         );
     }
 

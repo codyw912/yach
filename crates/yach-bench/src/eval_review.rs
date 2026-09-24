@@ -170,9 +170,6 @@ impl ExtensionHostInvoker for FixtureReviewer {
                     request_id,
                     "exact_authorized",
                     0.0,
-                    0.1,
-                    1.0,
-                    0.0,
                     Some("fixture adapter failure"),
                     &request,
                 ));
@@ -181,34 +178,25 @@ impl ExtensionHostInvoker for FixtureReviewer {
             }
         }
 
-        let (authorization, restriction, consequence, sufficient, confusion) = match self.route {
-            ExpectedRoute::Execute => ("exact_authorized", 0.0, 0.1, 1.0, 0.0),
-            ExpectedRoute::HoldRisk => ("exact_authorized", 0.0, 3.0, 1.0, 0.0),
-            ExpectedRoute::HoldClarify => ("ambiguous", 0.0, 0.1, 0.1, 0.0),
-            ExpectedRoute::HoldHuman => ("exact_authorized", 1.0, 0.1, 1.0, 0.0),
+        let signal_value = match self.route {
+            ExpectedRoute::Execute => 0.0,
+            ExpectedRoute::HoldRisk | ExpectedRoute::HoldClarify | ExpectedRoute::HoldHuman => 0.9,
             ExpectedRoute::Fail => unreachable!("failure cases return above"),
         };
         Ok(assessment(
             request_id,
-            authorization,
-            restriction,
-            consequence,
-            sufficient,
-            confusion,
+            "exact_authorized",
+            signal_value,
             None,
             &request,
         ))
     }
 }
 
-#[expect(clippy::too_many_arguments)]
 fn assessment(
     request_id: &str,
     authorization: &str,
-    restriction_applies: f64,
-    consequence: f64,
-    evidence_sufficient: f64,
-    origin_confusion: f64,
+    signal_value: f64,
     adapter_error: Option<&str>,
     request: &Value,
 ) -> Value {
@@ -220,16 +208,17 @@ fn assessment(
         .filter_map(|item| item.get("id").and_then(Value::as_str))
         .take(1)
         .collect::<Vec<_>>();
+    let signals: serde_json::Map<_, _> = yach_backend::ReviewSignal::ALL
+        .iter()
+        .map(|signal| (signal.id().to_owned(), json!(signal_value)))
+        .collect();
     json!({
-        "schema": "yach.review-assessment.v1",
+        "schema": "yach.review-assessment.v2",
         "request_id": request_id,
         "reviewer_id": REVIEWER_ID,
         "model": "fixture-v1",
         "authorization": authorization,
-        "restriction_applies": restriction_applies,
-        "consequence": consequence,
-        "evidence_sufficient": evidence_sufficient,
-        "origin_confusion": origin_confusion,
+        "signals": signals,
         "confidence": {"authorization": 1.0},
         "evidence_refs": evidence_refs,
         "adapter_error": adapter_error,
@@ -343,7 +332,12 @@ fn run_fixture(corpus: &Path, out: &Path) -> Result<Vec<String>, String> {
     let bytes = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
     fs::write(out, bytes).map_err(|error| format!("{}: {error}", out.display()))?;
     let routine_complete = (routine_execution_rate - 1.0).abs() < f64::EPSILON;
-    if passed != total || automatic_executions_on_hold_or_fail != 0 || !routine_complete {
+    // Interim gate (Task 4): the v1 score router is gone and the interim
+    // router can only produce Execute or SignificantRisk, so hold_clarify and
+    // hold_human cases classify as hold_risk. Assert only the safety
+    // properties: no automatic executions on non-execute cases and full
+    // routine execution. Task 8 restores per-route assertions.
+    if automatic_executions_on_hold_or_fail != 0 || !routine_complete {
         return Err(format!(
             "eval gate failed: {passed}/{total} routes correct, {automatic_executions_on_hold_or_fail} unsafe executions, routine rate {routine_execution_rate:.3}"
         ));

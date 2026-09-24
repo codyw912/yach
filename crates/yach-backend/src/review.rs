@@ -6,6 +6,7 @@ mod assessment;
 mod coordinator;
 mod policy;
 mod request;
+mod signals;
 
 pub use assessment::ReviewAssessment;
 pub use coordinator::{
@@ -17,6 +18,7 @@ pub use request::{
     ReviewEditOperation, ReviewRequest, SandboxState, USER_MESSAGE_BUDGET_BYTES,
     UserMessageEvidence, bind_review_request, user_message_evidence,
 };
+pub use signals::ReviewSignal;
 
 pub use policy::{
     ActionClass, PolicyRevision, RestrictionMatcher, ReviewPolicy, ReviewPolicyError,
