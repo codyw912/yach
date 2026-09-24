@@ -78,6 +78,8 @@ struct CaseReport {
     expected_route: ExpectedRoute,
     actual_route: ExpectedRoute,
     passed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assessment: Option<Value>,
 }
 
 #[derive(Default)]
@@ -86,6 +88,43 @@ struct NoopSink;
 impl SessionEventSink for NoopSink {
     fn append_event(&self, _event: &SessionEvent) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// Wraps an `ExtensionHostInvoker` to capture the raw assessment JSON for
+/// diagnostic reporting.
+struct CapturingReviewer {
+    inner: Box<dyn ExtensionHostInvoker>,
+    last_assessment: Arc<Mutex<Option<Value>>>,
+}
+
+impl ExtensionHostInvoker for CapturingReviewer {
+    fn invoke(
+        &mut self,
+        request_id: &str,
+        tool_name: &str,
+        arguments: Value,
+        timeout: Duration,
+        resources: &dyn ExtensionResourceBroker,
+    ) -> Result<ExtensionHostInvocation, ExtensionHostProtocolError> {
+        self.inner
+            .invoke(request_id, tool_name, arguments, timeout, resources)
+    }
+
+    fn review(
+        &mut self,
+        request_id: &str,
+        request: Value,
+        timeout: Duration,
+        resources: &dyn ExtensionResourceBroker,
+    ) -> Result<Value, ExtensionHostProtocolError> {
+        let result = self.inner.review(request_id, request, timeout, resources);
+        if let Ok(assessment) = &result
+            && let Ok(mut slot) = self.last_assessment.lock()
+        {
+            *slot = Some(assessment.clone());
+        }
+        result
     }
 }
 
@@ -264,6 +303,7 @@ fn run_fixture(corpus: &Path, out: &Path) -> Result<Vec<String>, String> {
             expected_route: case.expected_route,
             actual_route,
             passed: actual_route == case.expected_route,
+            assessment: None,
         });
     }
     let total = reports.len();
@@ -344,8 +384,12 @@ fn run_jev(corpus: &Path, out: &Path) -> Result<Vec<String>, String> {
         )
         .map_err(|error| format!("jev reviewer registration failed: {error:?}"))?;
 
+    let last_assessment = Arc::new(Mutex::new(None::<Value>));
     let reviewer: Arc<Mutex<Box<dyn ExtensionHostInvoker>>> =
-        Arc::new(Mutex::new(Box::new(session)));
+        Arc::new(Mutex::new(Box::new(CapturingReviewer {
+            inner: Box::new(session),
+            last_assessment: last_assessment.clone(),
+        })));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -402,12 +446,14 @@ fn run_jev(corpus: &Path, out: &Path) -> Result<Vec<String>, String> {
                     .await,
             )
         });
+        let assessment = last_assessment.lock().ok().and_then(|mut slot| slot.take());
         reports.push(CaseReport {
             id: case.id.clone(),
             category: case.category.clone(),
             expected_route: case.expected_route,
             actual_route,
             passed: actual_route == case.expected_route,
+            assessment,
         });
     }
 

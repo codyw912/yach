@@ -41,3 +41,6 @@ result-*
 
 # env files
 .env*
+
+# scratch files
+SCRATCHPAD.md
