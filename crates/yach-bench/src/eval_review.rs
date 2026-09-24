@@ -355,7 +355,7 @@ fn run_jev(corpus: &Path, out: &Path) -> Result<Vec<String>, String> {
     for case in &cases {
         let generation = Arc::new(Mutex::new(1u64));
         let sink = NoopSink;
-        let coordinator = ReviewCoordinator::new(
+        let coordinator = ReviewCoordinator::new_fixture(
             Arc::new(Mutex::new(case.policy.clone().into())),
             generation,
             Arc::new(Mutex::new(1)),

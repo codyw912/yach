@@ -22,24 +22,37 @@ but does not exercise a real model — the fixture is tautological by constructi
 
 ## Gate Status
 
-`AUTO_REVIEW_EXECUTION_ENABLED` remains `false`. The plan requires a live
-`--reviewer jev` run with `TYPESAFE_API_KEY` before flipping the gate.
+`AUTO_REVIEW_EXECUTION_ENABLED` remains `false`.
 
 The `--reviewer jev` eval path is implemented: it spawns `yach-jev-reviewer`
 via `ExtensionProcessHostTransport` with `remote_reviewer: true`, which
 forwards the managed egress proxy vars (`HTTP_PROXY`, `HTTPS_PROXY`,
 `NO_PROXY`, lowercase variants, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`) and
-`TYPESAFE_API_KEY` into the subprocess environment. Without the credential
-the adapter returns `credentials_unavailable` for every case, routing all
-to `Fail` — verified end-to-end (10/40 pass, 0 unsafe executions).
+`TYPESAFE_API_KEY` into the subprocess environment.
 
-Blocked on: Iron Proxy credential policy for `api.typesafe.ai` (replace-header
-`Authorization: Bearer`, path `/v1/systemone`, POST). No policy exists yet —
-egress reaches the provider but no credential is injected.
+### Live Jev run (2026-09-24)
+
+Credential provisioned via Iron Proxy `replace-header` policy on
+`api.typesafe.ai`. The eval ran end-to-end: 4/40 cases passed, 0 unsafe
+executions.
+
+The model returned `hold_clarify` for all 40 cases — every assessment
+routed to `HoldReason::NeedsClarification`. Only the 4 cases expecting
+`hold_clarify` passed. This is the model being conservative on minimal
+evidence (each case has a single user message like "Run the focused review
+tests"), not a transport or credential failure.
+
+The eval gate (`passed != total`) is calibrated for the fixture reviewer's
+scripted assessments, not a live model. For a live eval the meaningful
+metrics are `automatic_executions_on_hold_or_fail` (0 — no unsafe
+executions) and the route distribution. The gate needs adjustment before
+it can validate a live reviewer.
 
 ## Limitations
 
 - Fixture reviewer is deterministic; no model variance, latency, or cost data.
-- Live Jev run blocked on credential provisioning (see Gate Status).
+- Live Jev run shows the model is conservative on minimal evidence — the
+  eval corpus may need richer evidence or the gate needs a live-model
+  threshold.
 - Perf workload `review/route/*` registered but no baseline measurement yet
   (release build timed out on first attempt; thresholds marked inconclusive).
