@@ -38,6 +38,9 @@ pub enum EditAccessReviewState {
     Allowed,
     NeedsUserApproval,
     AutoReviewUnavailable,
+    /// A `human_performs` restriction matched: never an approvable row; the
+    /// action is handed off to the user outside the agent.
+    HumanPerforms,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +217,11 @@ impl EditAccess {
         let review_state = match &decision {
             PermissionDecision::Allowed { .. } => EditAccessReviewState::Allowed,
             PermissionDecision::NeedsUserReview { reason, .. }
+                if reason == crate::RESTRICTION_HUMAN_PERFORMS_REASON =>
+            {
+                EditAccessReviewState::HumanPerforms
+            }
+            PermissionDecision::NeedsUserReview { reason, .. }
                 if reason == "route_to_reviewer"
                     || reason == "auto_review_unavailable_fallback_ask" =>
             {
@@ -320,12 +328,13 @@ impl EditAccess {
             return Err(EditAccessError::DecisionMismatch);
         }
 
-        record_user_permission_override(
+        record_permission_override(
             log,
             &pending.context,
             &pending.permission_summary,
             PermissionDecisionOutcome::Allowed,
             "user_approved",
+            true,
         );
         let transaction_id = pending.prepared.transaction_id.clone();
         match EditEngine::apply(
@@ -400,12 +409,13 @@ impl EditAccess {
 
         let transaction_id = pending.prepared.transaction_id.clone();
         let mut write_ahead_log = SessionLog::default();
-        record_user_permission_override(
+        record_permission_override(
             &mut write_ahead_log,
             &pending.context,
             &pending.permission_summary,
             PermissionDecisionOutcome::Allowed,
             "user_approved",
+            true,
         );
         write_ahead_log.push(SessionEvent::EditTransactionFinished {
             session_id: pending.context.session_id.clone(),
@@ -461,6 +471,20 @@ impl EditAccess {
         decision_id: &PermissionDecisionId,
         log: &mut SessionLog,
     ) -> Result<(), EditAccessError> {
+        self.reject_with_reason(preview_id, decision_id, "user_rejected", true, log)
+    }
+
+    /// Reject a pending preview recording `reason` instead of a user
+    /// rejection. `user_override` is false when no user decision happened
+    /// (e.g. a `human_performs` restriction handoff).
+    pub fn reject_with_reason(
+        &mut self,
+        preview_id: &EditPreviewId,
+        decision_id: &PermissionDecisionId,
+        reason: &str,
+        user_override: bool,
+        log: &mut SessionLog,
+    ) -> Result<(), EditAccessError> {
         let pending = self
             .pending
             .remove(&preview_id.0)
@@ -470,12 +494,13 @@ impl EditAccess {
             return Err(EditAccessError::DecisionMismatch);
         }
 
-        record_user_permission_override(
+        record_permission_override(
             log,
             &pending.context,
             &pending.permission_summary,
             PermissionDecisionOutcome::Denied,
-            "user_rejected",
+            reason,
+            user_override,
         );
         log.push(SessionEvent::EditTransactionFinished {
             session_id: pending.context.session_id.clone(),
@@ -483,7 +508,7 @@ impl EditAccess {
             tool_request_id: pending.context.tool_request_id.clone(),
             transaction_id: Some(pending.prepared.transaction_id.clone()),
             outcome: EditEvidenceOutcome::Failed,
-            reason: Some(String::from("user_rejected")),
+            reason: Some(String::from(reason)),
             summary: Some(edit_prepared_evidence_summary(&pending.prepared)),
         });
         Ok(())
@@ -495,12 +520,13 @@ impl EditAccess {
     }
 }
 
-fn record_user_permission_override(
+fn record_permission_override(
     log: &mut SessionLog,
     context: &EditAccessContext,
     summary: &PermissionDecisionSummary,
     outcome: PermissionDecisionOutcome,
     reason: &str,
+    user_override: bool,
 ) {
     if summary.outcome != PermissionDecisionOutcome::NeedsUserReview {
         return;
@@ -508,7 +534,7 @@ fn record_user_permission_override(
     let mut summary = summary.clone();
     summary.outcome = outcome;
     reason.clone_into(&mut summary.reason);
-    summary.user_override = true;
+    summary.user_override = user_override;
     summary.rationale = None;
     log.record_permission_decision(context.session_id.clone(), context.turn_id.clone(), summary);
 }
@@ -1169,6 +1195,67 @@ mod tests {
             SessionEvent::PermissionDecisionRecorded { summary, .. }
                 if summary.reason == "restriction_ask_first"
                     && summary.policy_revision == crate::PolicyRevision(3)
+        )));
+    }
+
+    #[test]
+    fn prepare_maps_human_performs_restriction_to_handoff_state() {
+        let project = TempProject::new("human-performs-edit");
+        write_file(&project, "file.txt", "hello\n");
+        let Some(root) = resource_root(&project) else {
+            return;
+        };
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
+        let mut context = context(PermissionMode::Allow);
+        context.review_policy = crate::ReviewPolicy {
+            revision: crate::PolicyRevision(5),
+            global: vec![crate::ReviewRestriction::HumanPerforms {
+                matcher: crate::RestrictionMatcher::PathPrefix {
+                    prefix: String::from("file.txt"),
+                },
+                note: String::from("the user edits file.txt"),
+            }],
+            project: Vec::new(),
+        };
+        let outcome = access.prepare_with_diagnostics(&root, modify_request(), context, &mut log);
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else { return };
+        assert_eq!(
+            outcome.preview.review_state,
+            EditAccessReviewState::HumanPerforms
+        );
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::PermissionDecisionRecorded { summary, .. }
+                if summary.reason == crate::RESTRICTION_HUMAN_PERFORMS_REASON
+        )));
+
+        // The handoff rejection records the restriction reason, not a user
+        // rejection, and is not a user override.
+        let mut reject_log = SessionLog::default();
+        assert!(
+            access
+                .reject_with_reason(
+                    &outcome.preview.preview_id,
+                    &outcome.preview.permission_decision_id,
+                    crate::RESTRICTION_HUMAN_PERFORMS_REASON,
+                    false,
+                    &mut reject_log,
+                )
+                .is_ok()
+        );
+        assert!(reject_log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::PermissionDecisionRecorded { summary, .. }
+                if summary.reason == crate::RESTRICTION_HUMAN_PERFORMS_REASON
+                    && summary.outcome == PermissionDecisionOutcome::Denied
+                    && !summary.user_override
+        )));
+        assert!(reject_log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::EditTransactionFinished { reason, .. }
+                if reason.as_deref() == Some(crate::RESTRICTION_HUMAN_PERFORMS_REASON)
         )));
     }
 

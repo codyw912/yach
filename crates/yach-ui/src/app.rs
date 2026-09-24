@@ -321,6 +321,7 @@ fn local_edit_review_status_message(review_state: LocalEditReviewState) -> &'sta
         LocalEditReviewState::AutoReviewUnavailable => {
             "auto-review unavailable; user approval required"
         }
+        LocalEditReviewState::HumanPerforms => "reserved for the user to perform",
     }
 }
 

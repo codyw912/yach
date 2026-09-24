@@ -108,9 +108,11 @@ replaces the same transcript row with its terminal output and may include a stru
 
 `CommandReviewSummary` and `LocalEditPreviewSummary` optionally carry `review_origin`. An omitted
 field (or `null` when decoding) means the ordinary user-ask path. `risk` means the automatic
-reviewer flagged risk, `reviewer_error` means review was unavailable and fell back to a person, and
-`human_performs` means the action is reserved for the user. Serializers omit the field for the
-ordinary user-ask path so older clients continue to decode review payloads.
+reviewer flagged risk or a standing `ask_first` restriction applies, `reviewer_error` means review
+was unavailable and fell back to a person, and `human_performs` is reserved for actions only the
+user may perform — backends hand those off without emitting a review row, so clients should not
+expect to render it. Serializers omit the field for the ordinary user-ask path so older clients
+continue to decode review payloads.
 
 When `auto_review` is negotiated, `ReviewerStatusChanged` reports `reviewer_id`, monotonically
 ordered `generation`, `state` (`selected`, `unavailable`, or `reloaded`), and

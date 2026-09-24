@@ -700,6 +700,8 @@ pub enum LocalEditReviewState {
     Allowed,
     NeedsUserApproval,
     AutoReviewUnavailable,
+    /// Reserved for the user to perform; never an approvable review row.
+    HumanPerforms,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -30,7 +30,7 @@ use yach_proto::{
 use crate::agent_edit_tools::{
     AgentEditToolContext, AgentEditToolPrepared, PendingAgentEditToolReview,
     apply_agent_edit_tool_review, prepare_agent_edit_tool_request, prepare_extension_edit_proposal,
-    reject_agent_edit_tool_review,
+    reject_agent_edit_tool_review, reject_agent_edit_tool_review_for_human_performs,
 };
 use crate::provider_connections::{
     ConnectionFlowEffect, ConnectionListOutcome, ConnectionMutationOperation,
@@ -7670,6 +7670,43 @@ async fn finish_prepared_edit_tool_request(
             path,
             operation,
         } => {
+            if preview.review_state == crate::EditAccessReviewState::HumanPerforms {
+                // A deterministic human-performs restriction is never an
+                // approvable review row: reject the pending preview and hand
+                // off to the user.
+                let rejected = reject_agent_edit_tool_review_for_human_performs(
+                    batch.edit_access,
+                    batch.edit_sink,
+                    PendingAgentEditToolReview {
+                        trace_id: trace_id.clone(),
+                        session_id: batch.session_id.clone(),
+                        turn_id: batch.turn_id.clone(),
+                        request_id: request_id.clone(),
+                        provider_call_id,
+                        preview_id: preview.preview_id.clone(),
+                        permission_decision_id: preview.permission_decision_id.clone(),
+                        path,
+                        operation,
+                    },
+                );
+                drain_edit_sink_events(batch)?;
+                let result = rejected.map_err(|error| {
+                    ProviderRoundError::ToolContinuation(tool_round_error_label(&error))
+                })?;
+                batch.edit_traces.push(ProviderContinuationEditTrace {
+                    trace_id,
+                    tool_name,
+                    tool_request_id: ToolRequestId(request_id),
+                    provider_call_id: result.provider_call_id.clone(),
+                    preview_id: Some(preview.preview_id),
+                    permission_decision_id: Some(preview.permission_decision_id),
+                });
+                batch
+                    .budget
+                    .record_tool_result(&result.tool_request_id, result.byte_count)
+                    .map_err(|error| provider_tool_batch_result_budget_failure(error).0)?;
+                return Ok(result);
+            }
             if preview.review_state == crate::EditAccessReviewState::AutoReviewUnavailable
                 && let Some(coordinator) = batch.review_coordinator
             {
@@ -7764,6 +7801,48 @@ async fn finish_prepared_edit_tool_request(
                             provider_call_id: Some(
                                 result.provider_call_id.clone().unwrap_or_default(),
                             ),
+                            preview_id: Some(preview.preview_id),
+                            permission_decision_id: Some(preview.permission_decision_id),
+                        });
+                        batch
+                            .budget
+                            .record_tool_result(&result.tool_request_id, result.byte_count)
+                            .map_err(|error| provider_tool_batch_result_budget_failure(error).0)?;
+                        return Ok(result);
+                    }
+                    crate::ReviewRoute::Hold {
+                        reason:
+                            crate::HoldReason::RestrictionApplies {
+                                restriction: crate::ReviewRestriction::HumanPerforms { .. },
+                            },
+                        ..
+                    } => {
+                        // A human-performs restriction is never an approvable
+                        // review row: reject the pending preview and hand off.
+                        let rejected = reject_agent_edit_tool_review_for_human_performs(
+                            batch.edit_access,
+                            batch.edit_sink,
+                            PendingAgentEditToolReview {
+                                trace_id: trace_id.clone(),
+                                session_id: batch.session_id.clone(),
+                                turn_id: batch.turn_id.clone(),
+                                request_id: request_id.clone(),
+                                provider_call_id,
+                                preview_id: preview.preview_id.clone(),
+                                permission_decision_id: preview.permission_decision_id.clone(),
+                                path,
+                                operation,
+                            },
+                        );
+                        drain_edit_sink_events(batch)?;
+                        let result = rejected.map_err(|error| {
+                            ProviderRoundError::ToolContinuation(tool_round_error_label(&error))
+                        })?;
+                        batch.edit_traces.push(ProviderContinuationEditTrace {
+                            trace_id,
+                            tool_name,
+                            tool_request_id: ToolRequestId(request_id),
+                            provider_call_id: result.provider_call_id.clone(),
                             preview_id: Some(preview.preview_id),
                             permission_decision_id: Some(preview.permission_decision_id),
                         });
@@ -8080,6 +8159,32 @@ fn persist_shell_review_resolution(
     )
 }
 
+/// What the shell path does with a held or asked action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellHoldDisposition {
+    /// Show a one-action approval row with this origin.
+    AskUser(Option<yach_proto::ReviewOrigin>),
+    /// Never run; hand off to the user outside the agent.
+    HumanPerforms,
+}
+
+pub(crate) fn shell_disposition_for_decision(reason: &str) -> ShellHoldDisposition {
+    if reason == crate::RESTRICTION_HUMAN_PERFORMS_REASON {
+        ShellHoldDisposition::HumanPerforms
+    } else {
+        ShellHoldDisposition::AskUser(None)
+    }
+}
+
+pub(crate) fn shell_disposition_for_hold(reason: &crate::HoldReason) -> ShellHoldDisposition {
+    match reason {
+        crate::HoldReason::RestrictionApplies {
+            restriction: crate::ReviewRestriction::HumanPerforms { .. },
+        } => ShellHoldDisposition::HumanPerforms,
+        _ => ShellHoldDisposition::AskUser(Some(yach_proto::ReviewOrigin::Risk)),
+    }
+}
+
 async fn wait_for_command_review_decision(
     review_decisions: &mut AgentEditDecisionReceiver,
     request_id: &str,
@@ -8169,6 +8274,31 @@ async fn execute_native_provider_bash_tool_request(
         );
 
         Ok(result)
+    };
+
+    // A human-performs restriction never reaches a review row: record the
+    // denial and hand off with guidance instead of offering an approve
+    // button that would run the action.
+    let human_performs_handoff = |batch: &mut ProviderAgentToolBatch<'_>,
+                                  permission_summary: PermissionDecisionSummary|
+     -> Result<ProviderToolResult, ProviderRoundError> {
+        let mut summary = permission_summary;
+        summary.outcome = PermissionDecisionOutcome::Denied;
+        summary.reason = String::from(crate::RESTRICTION_HUMAN_PERFORMS_REASON);
+        persist_tool_review_event(
+            batch,
+            SessionEvent::PermissionDecisionRecorded {
+                session_id: batch.session_id.clone(),
+                turn_id: batch.turn_id.clone(),
+                summary,
+            },
+        )?;
+        finish_failed(
+            batch,
+            crate::RESTRICTION_HUMAN_PERFORMS_REASON,
+            "This action is reserved for the user to perform outside the agent. \
+Describe the exact command so the user can run it, then continue.",
+        )
     };
 
     // Resolve the working directory inside the project root.
@@ -8306,6 +8436,12 @@ Select a reviewer extension or switch to a manual approval mode.",
                         crate::HoldReason::NeedsClarification => "reviewer_hold_evidence",
                         crate::HoldReason::RestrictionApplies { .. } => "restriction_ask_first",
                     };
+                    let review_origin = match shell_disposition_for_hold(&reason) {
+                        ShellHoldDisposition::HumanPerforms => {
+                            return human_performs_handoff(batch, permission_summary);
+                        }
+                        ShellHoldDisposition::AskUser(origin) => origin,
+                    };
                     if !batch.structured_review_rows {
                         return finish_failed(
                             batch,
@@ -8322,15 +8458,7 @@ structured review rows.",
                             command: command.clone(),
                             workdir: workdir.clone(),
                             timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
-                            review_origin: Some(match &reason {
-                                crate::HoldReason::SignificantRisk => {
-                                    yach_proto::ReviewOrigin::Risk
-                                }
-                                crate::HoldReason::RestrictionApplies { .. } => {
-                                    yach_proto::ReviewOrigin::HumanPerforms
-                                }
-                                _ => yach_proto::ReviewOrigin::Risk,
-                            }),
+                            review_origin,
                         },
                     };
                     persist_tool_review_event(
@@ -8518,7 +8646,10 @@ or take a different approach.",
                 }
             }
         }
-        PermissionDecision::NeedsUserReview { .. } => {
+        PermissionDecision::NeedsUserReview { ref reason, .. } => {
+            if shell_disposition_for_decision(reason) == ShellHoldDisposition::HumanPerforms {
+                return human_performs_handoff(batch, permission_summary);
+            }
             if !batch.structured_review_rows {
                 return finish_failed(
                     batch,
@@ -33029,5 +33160,49 @@ manual anchored summary"
         let inactive = turn_permission_policy(&registry, &[]);
         assert_eq!(inactive.authorize(&fetch), ToolPermissionState::Denied);
         assert!(!inactive.allows_provider_advertising(&fetch));
+    }
+
+    #[test]
+    fn human_performs_decision_is_handed_off_not_asked() {
+        assert_eq!(
+            super::shell_disposition_for_decision(crate::RESTRICTION_HUMAN_PERFORMS_REASON),
+            super::ShellHoldDisposition::HumanPerforms
+        );
+        assert_eq!(
+            super::shell_disposition_for_decision(crate::RESTRICTION_ASK_FIRST_REASON),
+            super::ShellHoldDisposition::AskUser(None)
+        );
+    }
+
+    #[test]
+    fn reviewer_restriction_holds_split_by_restriction_kind() {
+        let human = crate::HoldReason::RestrictionApplies {
+            restriction: crate::ReviewRestriction::HumanPerforms {
+                matcher: crate::RestrictionMatcher::ActionClass {
+                    class: crate::ActionClass::HostActivation,
+                },
+                note: String::from("I run rebuilds"),
+            },
+        };
+        let ask = crate::HoldReason::RestrictionApplies {
+            restriction: crate::ReviewRestriction::AskFirst {
+                matcher: crate::RestrictionMatcher::ActionClass {
+                    class: crate::ActionClass::ExternalPublish,
+                },
+                note: String::from("ask before publishing"),
+            },
+        };
+        assert_eq!(
+            super::shell_disposition_for_hold(&human),
+            super::ShellHoldDisposition::HumanPerforms
+        );
+        assert_eq!(
+            super::shell_disposition_for_hold(&ask),
+            super::ShellHoldDisposition::AskUser(Some(yach_proto::ReviewOrigin::Risk))
+        );
+        assert_eq!(
+            super::shell_disposition_for_hold(&crate::HoldReason::SignificantRisk),
+            super::ShellHoldDisposition::AskUser(Some(yach_proto::ReviewOrigin::Risk))
+        );
     }
 }

@@ -584,9 +584,19 @@ fn classify_route(route: &ReviewRoute) -> ExpectedRoute {
             ..
         } => ExpectedRoute::HoldClarify,
         ReviewRoute::Hold {
-            reason: HoldReason::RestrictionApplies { .. },
+            reason:
+                HoldReason::RestrictionApplies {
+                    restriction: ReviewRestriction::HumanPerforms { .. },
+                },
             ..
         } => ExpectedRoute::HoldHuman,
+        ReviewRoute::Hold {
+            reason:
+                HoldReason::RestrictionApplies {
+                    restriction: ReviewRestriction::AskFirst { .. },
+                },
+            ..
+        } => ExpectedRoute::HoldRisk,
         ReviewRoute::ReviewFailed {
             reason: ReviewFailure::Disabled,
             ..

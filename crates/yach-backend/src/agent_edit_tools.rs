@@ -549,16 +549,16 @@ pub fn prepare_agent_edit_tool_request(
             let result = apply_agent_edit_tool_review(edit_access, sink, pending, None)?;
             Ok(AgentEditToolPrepared::Completed { trace_id, result })
         }
-        EditAccessReviewState::NeedsUserApproval | EditAccessReviewState::AutoReviewUnavailable => {
-            Ok(AgentEditToolPrepared::NeedsUserReview {
-                trace_id,
-                request_id: request.request_id,
-                provider_call_id,
-                preview,
-                path: normalized.path,
-                operation: normalized.operation,
-            })
-        }
+        EditAccessReviewState::NeedsUserApproval
+        | EditAccessReviewState::AutoReviewUnavailable
+        | EditAccessReviewState::HumanPerforms => Ok(AgentEditToolPrepared::NeedsUserReview {
+            trace_id,
+            request_id: request.request_id,
+            provider_call_id,
+            preview,
+            path: normalized.path,
+            operation: normalized.operation,
+        }),
     }
 }
 pub fn prepare_extension_edit_proposal(
@@ -692,16 +692,16 @@ pub fn prepare_extension_edit_proposal(
             let result = apply_agent_edit_tool_review(edit_access, sink, pending, None)?;
             Ok(AgentEditToolPrepared::Completed { trace_id, result })
         }
-        EditAccessReviewState::NeedsUserApproval | EditAccessReviewState::AutoReviewUnavailable => {
-            Ok(AgentEditToolPrepared::NeedsUserReview {
-                trace_id,
-                request_id: request.request_id,
-                provider_call_id,
-                preview,
-                path,
-                operation,
-            })
-        }
+        EditAccessReviewState::NeedsUserApproval
+        | EditAccessReviewState::AutoReviewUnavailable
+        | EditAccessReviewState::HumanPerforms => Ok(AgentEditToolPrepared::NeedsUserReview {
+            trace_id,
+            request_id: request.request_id,
+            provider_call_id,
+            preview,
+            path,
+            operation,
+        }),
     }
 }
 
@@ -853,6 +853,74 @@ pub fn reject_agent_edit_tool_review(
         tool_request_id: ToolRequestId(pending.request_id),
         outcome: ToolOutcome::Completed,
         reason: Some(String::from("user_rejected")),
+        result_summary: Some(result_summary(&result)),
+        result_content: Some(result.content.clone()),
+    });
+    append_events(sink, &log.events)?;
+    Ok(result)
+}
+
+/// A `human_performs` restriction hold is never shown as an approvable
+/// review row: the pending preview is rejected and the tool result tells the
+/// agent to hand the change to the user.
+pub fn reject_agent_edit_tool_review_for_human_performs(
+    edit_access: &mut EditAccess,
+    sink: &impl SessionEventSink,
+    pending: PendingAgentEditToolReview,
+) -> Result<ProviderToolResult, ToolContinuationError> {
+    let mut log = SessionLog::default();
+    let reject_started = Instant::now();
+    edit_access
+        .reject_with_reason(
+            &pending.preview_id,
+            &pending.permission_decision_id,
+            crate::RESTRICTION_HUMAN_PERFORMS_REASON,
+            false,
+            &mut log,
+        )
+        .map_err(|_| ToolContinuationError::Execution(ToolExecutionError::MalformedResult))?;
+    let reason = String::from(crate::RESTRICTION_HUMAN_PERFORMS_REASON);
+    let result = provider_result(
+        &pending.request_id,
+        Some(pending.provider_call_id.clone()),
+        ToolOutcome::Failed,
+        crate::tool_text::verdict_with_guidance(
+            &format!("error: {reason}"),
+            "This action is reserved for the user to perform outside the agent. \
+Describe the exact change so the user can make it, then continue.",
+        ),
+        Some(reason.clone()),
+    );
+    record_review_trace(
+        &mut log,
+        ReviewTraceInput {
+            pending: &pending,
+            phase: EditTracePhase::Reject,
+            outcome: EditTraceOutcome::Rejected,
+            started: reject_started,
+            reason_label: Some(reason.clone()),
+            transaction_id: None,
+            attributes: trace_operation_attributes(Some(&pending.operation)),
+        },
+    );
+    record_review_trace(
+        &mut log,
+        ReviewTraceInput {
+            pending: &pending,
+            phase: EditTracePhase::ResultShaping,
+            outcome: EditTraceOutcome::Rejected,
+            started: Instant::now(),
+            reason_label: Some(reason.clone()),
+            transaction_id: None,
+            attributes: trace_operation_attributes(Some(&pending.operation)),
+        },
+    );
+    log.push(SessionEvent::ToolExecutionFinished {
+        session_id: pending.session_id,
+        turn_id: pending.turn_id,
+        tool_request_id: ToolRequestId(pending.request_id),
+        outcome: ToolOutcome::Failed,
+        reason: Some(reason),
         result_summary: Some(result_summary(&result)),
         result_content: Some(result.content.clone()),
     });
@@ -1361,6 +1429,7 @@ fn review_state_label(review_state: &EditAccessReviewState) -> &'static str {
         EditAccessReviewState::Allowed => "allowed",
         EditAccessReviewState::NeedsUserApproval => "needs_user_approval",
         EditAccessReviewState::AutoReviewUnavailable => "auto_review_unavailable",
+        EditAccessReviewState::HumanPerforms => "human_performs",
     }
 }
 

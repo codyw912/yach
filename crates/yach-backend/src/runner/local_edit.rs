@@ -256,6 +256,7 @@ const fn local_edit_review_state(review_state: &EditAccessReviewState) -> LocalE
         EditAccessReviewState::Allowed => LocalEditReviewState::Allowed,
         EditAccessReviewState::NeedsUserApproval => LocalEditReviewState::NeedsUserApproval,
         EditAccessReviewState::AutoReviewUnavailable => LocalEditReviewState::AutoReviewUnavailable,
+        EditAccessReviewState::HumanPerforms => LocalEditReviewState::HumanPerforms,
     }
 }
 
