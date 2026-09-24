@@ -1,4 +1,4 @@
-mod questions;
+pub mod questions;
 mod typesafe;
 
 use std::io::{self, BufRead, Write};
@@ -13,7 +13,7 @@ const PROTOCOL: &str = "yach.extension-host.v2";
 const EXTENSION_ID: &str = "yach.jev-reviewer";
 const REVIEWER_ID: &str = "jev-typesafe";
 const CONTRACT: &str = "yach.review.v1";
-const ASSESSMENT_SCHEMA: &str = "yach.review-assessment.v1";
+const ASSESSMENT_SCHEMA: &str = "yach.review-assessment.v2";
 
 pub fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
@@ -127,16 +127,17 @@ fn success_assessment(request_id: &str, assessment: &typesafe::JevAssessment) ->
     for (id, value) in &assessment.confidence {
         confidence.insert(id.clone(), json!(value));
     }
+    let mut signals = serde_json::Map::new();
+    for (id, value) in &assessment.signals {
+        signals.insert(id.clone(), json!(value));
+    }
     json!({
         "schema": ASSESSMENT_SCHEMA,
         "request_id": request_id,
         "reviewer_id": REVIEWER_ID,
         "model": assessment.model_returned,
         "authorization": assessment.authorization,
-        "restriction_applies": assessment.restriction_applies,
-        "consequence": assessment.consequence,
-        "evidence_sufficient": assessment.evidence_sufficient,
-        "origin_confusion": assessment.origin_confusion,
+        "signals": signals,
         "confidence": confidence,
         "evidence_refs": [],
         "adapter_error": Value::Null,
@@ -148,17 +149,20 @@ fn success_assessment(request_id: &str, assessment: &typesafe::JevAssessment) ->
     })
 }
 
+/// Failed review. Every signal is emitted at `1.0` so the shape stays
+/// fail-closed even though the core rejects on `adapter_error` first.
 fn error_assessment(request_id: &str, adapter_error: &str) -> Value {
+    let mut signals = serde_json::Map::new();
+    for id in questions::SIGNAL_IDS {
+        signals.insert(id.to_owned(), json!(1.0));
+    }
     json!({
         "schema": ASSESSMENT_SCHEMA,
         "request_id": request_id,
         "reviewer_id": REVIEWER_ID,
         "model": Value::Null,
         "authorization": "insufficient",
-        "restriction_applies": 1.0,
-        "consequence": 3.0,
-        "evidence_sufficient": 0.0,
-        "origin_confusion": 1.0,
+        "signals": signals,
         "confidence": {},
         "evidence_refs": [],
         "adapter_error": adapter_error,
@@ -226,15 +230,17 @@ mod tests {
                         },
                         "confidence": 0.8
                     },
-                    "restriction": {"type": "noul", "noul": 0.0},
-                    "consequence": {
-                        "type": "score",
-                        "score": 0.2,
-                        "probabilities": {"0": 0.8, "1": 0.2, "2": 0.0, "3": 0.0},
-                        "confidence": 0.7
-                    },
-                    "evidence": {"type": "noul", "noul": 0.99},
-                    "origin_confusion": {"type": "noul", "noul": 0.0}
+                    "install": {"type": "noul", "noul": 0.0},
+                    "activation": {"type": "noul", "noul": 0.0},
+                    "publish": {"type": "noul", "noul": 0.0},
+                    "disclosure": {"type": "noul", "noul": 0.0},
+                    "delete": {"type": "noul", "noul": 0.0},
+                    "irreversible_loss": {"type": "noul", "noul": 0.0},
+                    "privilege": {"type": "noul", "noul": 0.0},
+                    "remote_code": {"type": "noul", "noul": 0.0},
+                    "opaque_effect": {"type": "noul", "noul": 0.0},
+                    "origin_confusion": {"type": "noul", "noul": 0.0},
+                    "scope_conflict": {"type": "noul", "noul": 0.0}
                 },
                 "usage": {"input_tokens": 10, "output_tokens": 4}
             })
@@ -303,6 +309,12 @@ mod tests {
             "substantive_authorized"
         );
         assert!(messages[2]["assessment"]["adapter_error"].is_null());
+        assert_eq!(
+            messages[2]["assessment"]["schema"],
+            "yach.review-assessment.v2"
+        );
+        let signals = messages[2]["assessment"]["signals"].as_object();
+        assert_eq!(signals.map(serde_json::Map::len), Some(11));
         let _ = Duration::from_millis(0);
     }
 }

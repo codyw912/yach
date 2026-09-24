@@ -4,10 +4,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::questions::{
-    AUTHORIZATION_CRITERIA, AUTHORIZATION_ID, CONSEQUENCE_ID, CONSEQUENCE_LEVELS, EVIDENCE_ID,
-    ORIGIN_CONFUSION_ID, RESTRICTION_ID, review_questions,
-};
+use crate::questions::{AUTHORIZATION_CRITERIA, AUTHORIZATION_ID, SIGNAL_IDS, review_questions};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 pub const DEFAULT_MODEL: &str = "jev-latest";
@@ -32,10 +29,7 @@ pub struct Usage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct JevAssessment {
     pub authorization: String,
-    pub restriction_applies: f64,
-    pub consequence: f64,
-    pub evidence_sufficient: f64,
-    pub origin_confusion: f64,
+    pub signals: BTreeMap<String, f64>,
     pub confidence: BTreeMap<String, f64>,
     pub model_returned: String,
     pub usage: Usage,
@@ -129,19 +123,8 @@ fn parse_assessment(
     body: SystemOneResponse,
     duration: Duration,
 ) -> Result<JevAssessment, AdapterError> {
-    if body.model.is_empty() || body.answers.len() != 5 {
+    if body.model.is_empty() || body.answers.len() != SIGNAL_IDS.len() + 1 {
         return Err(AdapterError::MalformedResponse);
-    }
-    for id in [
-        AUTHORIZATION_ID,
-        RESTRICTION_ID,
-        CONSEQUENCE_ID,
-        EVIDENCE_ID,
-        ORIGIN_CONFUSION_ID,
-    ] {
-        if !body.answers.contains_key(id) {
-            return Err(AdapterError::MalformedResponse);
-        }
     }
 
     let authorization = choice_answer(
@@ -150,41 +133,23 @@ fn parse_assessment(
             .ok_or(AdapterError::MalformedResponse)?,
         &AUTHORIZATION_CRITERIA,
     )?;
-    let restriction_applies = noul_answer(
-        body.answers
-            .get(RESTRICTION_ID)
-            .ok_or(AdapterError::MalformedResponse)?,
-    )?;
-    let (consequence, consequence_confidence) = score_answer(
-        body.answers
-            .get(CONSEQUENCE_ID)
-            .ok_or(AdapterError::MalformedResponse)?,
-        CONSEQUENCE_LEVELS.len(),
-    )?;
-    let evidence_sufficient = noul_answer(
-        body.answers
-            .get(EVIDENCE_ID)
-            .ok_or(AdapterError::MalformedResponse)?,
-    )?;
-    let origin_confusion = noul_answer(
-        body.answers
-            .get(ORIGIN_CONFUSION_ID)
-            .ok_or(AdapterError::MalformedResponse)?,
-    )?;
 
+    let mut signals = BTreeMap::new();
     let mut confidence = BTreeMap::new();
     confidence.insert(AUTHORIZATION_ID.to_owned(), authorization.confidence);
-    confidence.insert(RESTRICTION_ID.to_owned(), restriction_applies);
-    confidence.insert(CONSEQUENCE_ID.to_owned(), consequence_confidence);
-    confidence.insert(EVIDENCE_ID.to_owned(), evidence_sufficient);
-    confidence.insert(ORIGIN_CONFUSION_ID.to_owned(), origin_confusion);
+    for id in SIGNAL_IDS {
+        let value = noul_answer(
+            body.answers
+                .get(id)
+                .ok_or(AdapterError::MalformedResponse)?,
+        )?;
+        signals.insert(id.to_owned(), value);
+        confidence.insert(id.to_owned(), value);
+    }
 
     Ok(JevAssessment {
         authorization: authorization.label,
-        restriction_applies,
-        consequence,
-        evidence_sufficient,
-        origin_confusion,
+        signals,
         confidence,
         model_returned: body.model,
         usage: Usage {
@@ -235,34 +200,6 @@ fn noul_answer(value: &Value) -> Result<f64, AdapterError> {
         return Err(AdapterError::MalformedResponse);
     }
     noul.as_f64().ok_or(AdapterError::MalformedResponse)
-}
-
-fn score_answer(value: &Value, level_count: usize) -> Result<(f64, f64), AdapterError> {
-    if value.get("type").and_then(Value::as_str) != Some("score") {
-        return Err(AdapterError::MalformedResponse);
-    }
-    let score = value.get("score").ok_or(AdapterError::MalformedResponse)?;
-    let Some(score) = score.as_f64() else {
-        return Err(AdapterError::MalformedResponse);
-    };
-    let max = f64::from(u32::try_from(level_count.saturating_sub(1)).unwrap_or(u32::MAX));
-    if !score.is_finite() || !(0.0..=max).contains(&score) {
-        return Err(AdapterError::MalformedResponse);
-    }
-    let probabilities = value
-        .get("probabilities")
-        .and_then(Value::as_object)
-        .ok_or(AdapterError::MalformedResponse)?;
-    for (key, probability) in probabilities {
-        let Ok(index) = key.parse::<usize>() else {
-            return Err(AdapterError::MalformedResponse);
-        };
-        if index >= level_count || !finite_unit(probability) {
-            return Err(AdapterError::MalformedResponse);
-        }
-    }
-    let confidence = required_unit(value, "confidence")?;
-    Ok((score, confidence))
 }
 
 fn required_unit(value: &Value, field: &str) -> Result<f64, AdapterError> {
@@ -317,21 +254,17 @@ mod tests {
                     },
                     "confidence": 0.84
                 },
-                "restriction": {"type": "noul", "noul": 0.02},
-                "consequence": {
-                    "type": "score",
-                    "score": 1.05,
-                    "legend": {
-                        "0": "routine",
-                        "1": "reversible",
-                        "2": "costly_to_reverse",
-                        "3": "destructive_or_disclosing"
-                    },
-                    "probabilities": {"0": 0.0, "1": 0.95, "2": 0.05, "3": 0.0},
-                    "confidence": 0.91
-                },
-                "evidence": {"type": "noul", "noul": 0.97},
-                "origin_confusion": {"type": "noul", "noul": 0.01}
+                "install": {"type": "noul", "noul": 0.02},
+                "activation": {"type": "noul", "noul": 0.03},
+                "publish": {"type": "noul", "noul": 0.93},
+                "disclosure": {"type": "noul", "noul": 0.04},
+                "delete": {"type": "noul", "noul": 0.05},
+                "irreversible_loss": {"type": "noul", "noul": 0.06},
+                "privilege": {"type": "noul", "noul": 0.07},
+                "remote_code": {"type": "noul", "noul": 0.08},
+                "opaque_effect": {"type": "noul", "noul": 0.09},
+                "origin_confusion": {"type": "noul", "noul": 0.01},
+                "scope_conflict": {"type": "noul", "noul": 0.10}
             },
             "usage": {"input_tokens": 120, "output_tokens": 40}
         })
@@ -380,20 +313,20 @@ mod tests {
         };
         assert_eq!(assessment.model_returned, "jev-1.13.0");
         assert_eq!(assessment.authorization, "exact_authorized");
-        assert!((assessment.restriction_applies - 0.02).abs() < f64::EPSILON);
-        assert!((assessment.consequence - 1.05).abs() < f64::EPSILON);
-        assert!((assessment.evidence_sufficient - 0.97).abs() < f64::EPSILON);
-        assert!((assessment.origin_confusion - 0.01).abs() < f64::EPSILON);
+        assert_eq!(assessment.signals.len(), 11);
+        assert_eq!(assessment.signals.get("publish").copied(), Some(0.93));
+        assert_eq!(assessment.signals.get("install").copied(), Some(0.02));
+        assert_eq!(
+            assessment.signals.get("scope_conflict").copied(),
+            Some(0.10)
+        );
         assert_eq!(assessment.usage.input_tokens, 120);
         assert_eq!(assessment.usage.output_tokens, 40);
         assert_eq!(
             assessment.confidence.get("authorization").copied(),
             Some(0.84)
         );
-        assert_eq!(
-            assessment.confidence.get("consequence").copied(),
-            Some(0.91)
-        );
+        assert_eq!(assessment.confidence.get("publish").copied(), Some(0.93));
     }
 
     #[test]
@@ -415,11 +348,27 @@ mod tests {
     }
 
     #[test]
-    fn assess_rejects_missing_answer_id() {
+    fn assess_rejects_missing_signal_answer() {
         let mut body = ok_body();
         body["answers"]
             .as_object_mut()
-            .and_then(|answers| answers.remove("evidence"));
+            .and_then(|answers| answers.remove("scope_conflict"));
+        let base_url = serve("200 OK", &body.to_string());
+        assert_eq!(
+            assess(&config(base_url), &state()),
+            Err(AdapterError::MalformedResponse)
+        );
+    }
+
+    #[test]
+    fn assess_rejects_extra_answer() {
+        let mut body = ok_body();
+        if let Some(answers) = body["answers"].as_object_mut() {
+            answers.insert(
+                String::from("evidence"),
+                json!({"type": "noul", "noul": 0.5}),
+            );
+        }
         let base_url = serve("200 OK", &body.to_string());
         assert_eq!(
             assess(&config(base_url), &state()),
@@ -442,7 +391,7 @@ mod tests {
     #[test]
     fn assess_rejects_answer_type_mismatch() {
         let mut body = ok_body();
-        body["answers"]["restriction"] = json!({"type": "choice", "choice": "yes"});
+        body["answers"]["install"] = json!({"type": "choice", "choice": "yes"});
         let base_url = serve("200 OK", &body.to_string());
         assert_eq!(
             assess(&config(base_url), &state()),

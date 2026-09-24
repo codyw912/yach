@@ -12,7 +12,7 @@
   "contributes": {
     "reviewer": {
       "reviewer_id": "jev-typesafe",
-      "disclosure_summary": "Bounded action context is sent to the configured TypeSafe endpoint for assessment.",
+      "disclosure_summary": "Recent user messages and the proposed action are sent to the configured TypeSafe endpoint for assessment.",
       "remote": true
     }
   }
