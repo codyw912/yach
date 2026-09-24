@@ -147,6 +147,61 @@ pub fn action_kind(action: &ReviewAction) -> &'static str {
     }
 }
 
+/// Byte budget for trusted user-message evidence in one review request.
+pub const USER_MESSAGE_BUDGET_BYTES: usize = 16 * 1024;
+
+/// Trusted user messages fitted into the budget, or a signal that the
+/// message that triggered this review cannot be represented.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserMessageEvidence {
+    Ready {
+        items: Vec<EvidenceItem>,
+        omissions: Vec<OmissionMarker>,
+    },
+    IssuingTurnOverBudget,
+}
+
+/// Collect durable user messages for a review request. The issuing turn's
+/// message leads, then older messages newest-first while they fit whole.
+#[must_use]
+pub fn user_message_evidence(
+    log: &crate::SessionLog,
+    issuing_turn: &crate::TurnId,
+) -> UserMessageEvidence {
+    let messages = log.user_messages_newest_first();
+    let evidence = |entry: &crate::EntryId, text: &str| EvidenceItem {
+        id: format!("user:{}", entry.0),
+        source: String::from("user"),
+        kind: String::from("message"),
+        excerpt: text.to_owned(),
+        truncated: false,
+    };
+    let mut items = Vec::new();
+    let mut used = 0_usize;
+    if let Some((entry, _, text)) = messages.iter().find(|(_, turn, _)| *turn == issuing_turn) {
+        if text.len() > USER_MESSAGE_BUDGET_BYTES {
+            return UserMessageEvidence::IssuingTurnOverBudget;
+        }
+        used = text.len();
+        items.push(evidence(entry, text));
+    }
+    let mut omissions = Vec::new();
+    for (entry, turn, text) in &messages {
+        if *turn == issuing_turn {
+            continue;
+        }
+        if used.saturating_add(text.len()) > USER_MESSAGE_BUDGET_BYTES {
+            omissions.push(OmissionMarker::Unavailable {
+                id: format!("user:{}", entry.0),
+            });
+            continue;
+        }
+        used += text.len();
+        items.push(evidence(entry, text));
+    }
+    UserMessageEvidence::Ready { items, omissions }
+}
+
 #[must_use]
 pub fn action_target(action: &ReviewAction) -> String {
     match action {
@@ -171,7 +226,8 @@ fn edit_operation_path(operation: &ReviewEditOperation) -> String {
 mod tests {
     use super::{
         BoundReviewRequest, EvidenceItem, OmissionMarker, REVIEW_REQUEST_MAX_BYTES,
-        REVIEW_REQUEST_SCHEMA, ReviewAction, ReviewRequest, SandboxState, bind_review_request,
+        REVIEW_REQUEST_SCHEMA, ReviewAction, ReviewRequest, SandboxState,
+        USER_MESSAGE_BUDGET_BYTES, UserMessageEvidence, bind_review_request, user_message_evidence,
     };
     use crate::PolicyRevision;
 
@@ -239,5 +295,92 @@ mod tests {
     fn trusted_overflow_holds_without_dropping_the_item() {
         let bound = bind_review_request(request(vec![item("user", 70 * 1024)], Vec::new()));
         assert!(matches!(bound, BoundReviewRequest::OverBudget { .. }));
+    }
+
+    fn user_entry(entry: &str, turn: &str, text: &str) -> crate::SessionEvent {
+        crate::SessionEvent::EntryAppended {
+            session_id: crate::SessionId(String::from("s")),
+            entry_id: crate::EntryId(entry.to_owned()),
+            parent_entry_id: None,
+            turn_id: crate::TurnId(turn.to_owned()),
+            role: crate::Role::User,
+            text: text.to_owned(),
+            provider: None,
+        }
+    }
+
+    #[test]
+    fn issuing_turn_message_is_first_then_older_newest_first() {
+        let mut log = crate::SessionLog::default();
+        log.push(user_entry("e1", "turn-1", "first"));
+        log.push(user_entry("e2", "turn-2", "second"));
+        log.push(user_entry("e3", "turn-3", "third"));
+        let UserMessageEvidence::Ready { items, omissions } =
+            user_message_evidence(&log, &crate::TurnId(String::from("turn-2")))
+        else {
+            unreachable!("fits the budget")
+        };
+        let ids: Vec<_> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["user:e2", "user:e3", "user:e1"]);
+        assert!(omissions.is_empty());
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.truncated && item.source == "user")
+        );
+    }
+
+    #[test]
+    fn older_messages_drop_whole_with_unavailable_markers() {
+        let mut log = crate::SessionLog::default();
+        log.push(user_entry("old", "turn-1", &"o".repeat(12 * 1024)));
+        log.push(user_entry("mid", "turn-2", &"m".repeat(6 * 1024)));
+        log.push(user_entry("now", "turn-3", &"n".repeat(6 * 1024)));
+        let UserMessageEvidence::Ready { items, omissions } =
+            user_message_evidence(&log, &crate::TurnId(String::from("turn-3")))
+        else {
+            unreachable!("issuing turn fits")
+        };
+        let ids: Vec<_> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["user:now", "user:mid"]);
+        assert!(
+            omissions
+                .iter()
+                .any(|m| matches!(m, OmissionMarker::Unavailable { id } if id == "user:old"))
+        );
+    }
+
+    #[test]
+    fn oversized_issuing_turn_message_is_over_budget() {
+        let mut log = crate::SessionLog::default();
+        log.push(user_entry(
+            "now",
+            "turn-1",
+            &"n".repeat(USER_MESSAGE_BUDGET_BYTES + 1),
+        ));
+        assert!(matches!(
+            user_message_evidence(&log, &crate::TurnId(String::from("turn-1"))),
+            UserMessageEvidence::IssuingTurnOverBudget
+        ));
+    }
+
+    #[test]
+    fn a_large_message_does_not_block_smaller_older_ones() {
+        let mut log = crate::SessionLog::default();
+        log.push(user_entry("tiny", "turn-1", "keep the tests green"));
+        log.push(user_entry("big", "turn-2", &"b".repeat(16 * 1024)));
+        log.push(user_entry("now", "turn-3", "run them"));
+        let UserMessageEvidence::Ready { items, omissions } =
+            user_message_evidence(&log, &crate::TurnId(String::from("turn-3")))
+        else {
+            unreachable!()
+        };
+        let ids: Vec<_> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["user:now", "user:tiny"]);
+        assert!(
+            omissions
+                .iter()
+                .any(|m| matches!(m, OmissionMarker::Unavailable { id } if id == "user:big"))
+        );
     }
 }

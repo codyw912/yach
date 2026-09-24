@@ -22,12 +22,20 @@ use crate::{
 
 use super::assessment::{AssessmentValidationError, AuthorizationAnswer, ReviewAssessment};
 use super::request::{
-    BoundReviewRequest, EvidenceItem, REVIEW_REQUEST_SCHEMA, ReviewAction, ReviewRequest,
-    SandboxState, action_kind, action_target, bind_review_request,
+    BoundReviewRequest, EvidenceItem, OmissionMarker, REVIEW_REQUEST_SCHEMA, ReviewAction,
+    ReviewRequest, SandboxState, action_kind, action_target, bind_review_request,
 };
 
 /// End-to-end deadline covering persistence, invocation, and validation.
 pub const REVIEW_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Advance the authorization revision after a trusted user message or a
+/// user review decision. In-flight reviews compare against it and go stale.
+pub fn bump_authorization_revision(revision: &Mutex<u64>) {
+    if let Ok(mut value) = revision.lock() {
+        *value = value.saturating_add(1);
+    }
+}
 
 /// Compile-time enablement. Task 8 flips this after the held-out evaluation.
 /// While false, a model-derived route is [`ReviewFailure::Disabled`].
@@ -302,11 +310,12 @@ impl<'a> ReviewCoordinator<'a> {
         action: ReviewAction,
         trusted: Vec<EvidenceItem>,
         untrusted: Vec<EvidenceItem>,
+        omissions: Vec<OmissionMarker>,
     ) -> ReviewRoute {
         // The reviewer call blocks on a subprocess; `spawn_blocking` inside
         // `review_within_deadline` keeps the runtime thread free. The
         // deadline is enforced by the transport timeout.
-        self.review_within_deadline(&request, &action, trusted, untrusted)
+        self.review_within_deadline(&request, &action, trusted, untrusted, omissions)
             .await
     }
     async fn review_within_deadline(
@@ -315,6 +324,7 @@ impl<'a> ReviewCoordinator<'a> {
         action: &ReviewAction,
         trusted: Vec<EvidenceItem>,
         untrusted: Vec<EvidenceItem>,
+        omissions: Vec<OmissionMarker>,
     ) -> ReviewRoute {
         let Some(freshness) = self.snapshot() else {
             return ReviewRoute::ReviewFailed {
@@ -333,7 +343,7 @@ impl<'a> ReviewCoordinator<'a> {
             action: action.clone(),
             trusted_evidence: trusted,
             untrusted_evidence: untrusted,
-            omissions: Vec::new(),
+            omissions,
             sandbox_state: self.sandbox_state.clone(),
         };
         let review_request = match bind_review_request(review_request) {
@@ -485,6 +495,12 @@ impl<'a> ReviewCoordinator<'a> {
             failed @ ReviewRoute::ReviewFailed { .. } => failed,
         }
     }
+
+    /// Shared revision so the runner can invalidate in-flight reviews when a
+    /// trusted user message or user review decision lands.
+    pub(crate) fn authorization_revision_handle(&self) -> &Arc<Mutex<u64>> {
+        &self.authorization_revision
+    }
 }
 
 /// Route from typed answers. Probabilities are compared, never multiplied.
@@ -564,6 +580,7 @@ impl ReviewCoordinator<'_> {
         action: ReviewAction,
         trusted: Vec<EvidenceItem>,
         untrusted: Vec<EvidenceItem>,
+        omissions: Vec<OmissionMarker>,
         observe: F,
     ) -> impl Future<Output = ReviewRoute> + '_
     where
@@ -572,7 +589,7 @@ impl ReviewCoordinator<'_> {
         if let Ok(mut hook) = self.after_send.lock() {
             *hook = Some(Box::new(observe));
         }
-        self.review_action(request, action, trusted, untrusted)
+        self.review_action(request, action, trusted, untrusted, omissions)
     }
 }
 
@@ -598,8 +615,8 @@ mod tests {
     };
 
     use super::{
-        EvidenceItem, HoldReason, ReviewAction, ReviewCoordinator, ReviewFailure, ReviewRoute,
-        SandboxState,
+        EvidenceItem, HoldReason, OmissionMarker, ReviewAction, ReviewCoordinator, ReviewFailure,
+        ReviewRoute, SandboxState,
     };
 
     struct MemorySink {
@@ -646,6 +663,7 @@ mod tests {
     struct ScriptedTransport {
         received: Mutex<Vec<Result<ExtensionHostServerMessage, ExtensionHostProtocolError>>>,
         invocations: Arc<AtomicUsize>,
+        sent: Mutex<Vec<Value>>,
     }
 
     impl ScriptedTransport {
@@ -655,20 +673,33 @@ mod tests {
             Self {
                 received: Mutex::new(received),
                 invocations: Arc::new(AtomicUsize::new(0)),
+                sent: Mutex::new(Vec::new()),
             }
         }
 
         fn invocations(&self) -> usize {
             self.invocations.load(Ordering::SeqCst)
         }
+
+        fn sent_requests(&self) -> Vec<Value> {
+            self.sent
+                .lock()
+                .map(|sent| sent.clone())
+                .unwrap_or_default()
+        }
     }
 
     impl ExtensionHostTransport for ScriptedTransport {
         fn send(
             &mut self,
-            _message: ExtensionHostClientMessage,
+            message: ExtensionHostClientMessage,
         ) -> Result<(), ExtensionHostProtocolError> {
             self.invocations.fetch_add(1, Ordering::SeqCst);
+            if let ExtensionHostClientMessage::ReviewAssess { request, .. } = message
+                && let Ok(mut sent) = self.sent.lock()
+            {
+                sent.push(request);
+            }
             Ok(())
         }
 
@@ -841,7 +872,13 @@ mod tests {
     async fn authorized_low_risk_routes_to_execute() {
         let built = fixture(Ok(review_result(clear_assessment("perm-1"))));
         let route = coordinator(&built)
-            .review_action(permission_request(), shell_action(), trusted(), Vec::new())
+            .review_action(
+                permission_request(),
+                shell_action(),
+                trusted(),
+                Vec::new(),
+                Vec::new(),
+            )
             .await;
         assert!(
             matches!(route, ReviewRoute::Execute),
@@ -869,7 +906,13 @@ mod tests {
         assessment["authorization"] = json!("exact_authorized");
         let built = fixture(Ok(review_result(assessment)));
         let route = coordinator(&built)
-            .review_action(permission_request(), shell_action(), trusted(), Vec::new())
+            .review_action(
+                permission_request(),
+                shell_action(),
+                trusted(),
+                Vec::new(),
+                Vec::new(),
+            )
             .await;
         assert!(
             matches!(
@@ -892,6 +935,7 @@ mod tests {
                 permission_request(),
                 shell_action(),
                 trusted(),
+                Vec::new(),
                 Vec::new(),
                 move || {
                     if let Ok(mut policy) = policy.lock() {
@@ -927,6 +971,7 @@ mod tests {
                 shell_action(),
                 vec![oversized],
                 Vec::new(),
+                Vec::new(),
             )
             .await;
         assert!(
@@ -955,7 +1000,13 @@ mod tests {
         assessment["evidence_refs"] = json!(["e99"]);
         let built = fixture(Ok(review_result(assessment)));
         let route = coordinator(&built)
-            .review_action(permission_request(), shell_action(), trusted(), Vec::new())
+            .review_action(
+                permission_request(),
+                shell_action(),
+                trusted(),
+                Vec::new(),
+                Vec::new(),
+            )
             .await;
         assert!(
             matches!(
@@ -972,7 +1023,13 @@ mod tests {
     async fn timeout_is_review_failed() {
         let built = fixture(Err(ExtensionHostProtocolError::TimedOut));
         let route = coordinator(&built)
-            .review_action(permission_request(), shell_action(), trusted(), Vec::new())
+            .review_action(
+                permission_request(),
+                shell_action(),
+                trusted(),
+                Vec::new(),
+                Vec::new(),
+            )
             .await;
         assert!(
             matches!(
@@ -991,7 +1048,13 @@ mod tests {
             status: Some(1),
         }));
         let route = coordinator(&built)
-            .review_action(permission_request(), shell_action(), trusted(), Vec::new())
+            .review_action(
+                permission_request(),
+                shell_action(),
+                trusted(),
+                Vec::new(),
+                Vec::new(),
+            )
             .await;
         assert!(
             matches!(
@@ -1028,7 +1091,13 @@ mod tests {
             Arc::new(NoResources),
         );
         let route = failing
-            .review_action(permission_request(), shell_action(), trusted(), Vec::new())
+            .review_action(
+                permission_request(),
+                shell_action(),
+                trusted(),
+                Vec::new(),
+                Vec::new(),
+            )
             .await;
         assert!(
             matches!(
@@ -1056,7 +1125,13 @@ mod tests {
         assessment["authorization"] = json!("ambiguous");
         let built = fixture(Ok(review_result(assessment)));
         let route = coordinator(&built)
-            .review_action(permission_request(), shell_action(), trusted(), Vec::new())
+            .review_action(
+                permission_request(),
+                shell_action(),
+                trusted(),
+                Vec::new(),
+                Vec::new(),
+            )
             .await;
         assert!(
             matches!(
@@ -1080,6 +1155,7 @@ mod tests {
                 shell_action(),
                 trusted(),
                 Vec::new(),
+                Vec::new(),
                 move || {
                     if let Ok(mut generation) = generation.lock() {
                         *generation = generation.saturating_add(1);
@@ -1095,6 +1171,59 @@ mod tests {
                 }
             ),
             "a reviewer reload between send and response is stale, got {route:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn omissions_passed_by_caller_reach_the_request() {
+        let built = fixture(Ok(review_result(clear_assessment("perm-1"))));
+        let _ = coordinator(&built)
+            .review_action(
+                permission_request(),
+                shell_action(),
+                trusted(),
+                Vec::new(),
+                vec![OmissionMarker::Unavailable {
+                    id: String::from("user:old"),
+                }],
+            )
+            .await;
+        let sent = built
+            .transport
+            .lock()
+            .map(|t| t.sent_requests())
+            .unwrap_or_default();
+        assert!(sent.iter().any(|request| {
+            request["omissions"]
+                .as_array()
+                .is_some_and(|markers| markers.iter().any(|m| m["id"] == "user:old"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn new_user_message_during_review_is_stale() {
+        let built = fixture(Ok(review_result(clear_assessment("perm-1"))));
+        let authorization = built.authorization.clone();
+        let route = coordinator(&built)
+            .review_action_observing(
+                permission_request(),
+                shell_action(),
+                trusted(),
+                Vec::new(),
+                Vec::new(),
+                move || {
+                    super::bump_authorization_revision(&authorization);
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                route,
+                ReviewRoute::ReviewFailed {
+                    reason: ReviewFailure::Stale
+                }
+            ),
+            "a user message between send and response is stale, got {route:?}"
         );
     }
 }

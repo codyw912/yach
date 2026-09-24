@@ -442,6 +442,7 @@ fn run_jev(corpus: &Path, out: &Path) -> Result<Vec<String>, String> {
                         case.action.clone(),
                         case.trusted_evidence.clone(),
                         case.untrusted_evidence.clone(),
+                        Vec::new(),
                     )
                     .await,
             )
@@ -571,6 +572,7 @@ async fn run_case(case: &EvalCase) -> ExpectedRoute {
                 case.action.clone(),
                 case.trusted_evidence.clone(),
                 case.untrusted_evidence.clone(),
+                Vec::new(),
             )
             .await,
     )

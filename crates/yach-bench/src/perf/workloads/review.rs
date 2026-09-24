@@ -119,7 +119,13 @@ fn run_review_route(ctx: &RunCtx, with_reviewer: bool) -> Result<Measured, Strin
         }];
         let start = std::time::Instant::now();
         let route = if with_reviewer {
-            runtime.block_on(coordinator.review_action(request, action, trusted, Vec::new()))
+            runtime.block_on(coordinator.review_action(
+                request,
+                action,
+                trusted,
+                Vec::new(),
+                Vec::new(),
+            ))
         } else {
             // Deterministic path: build the request, bind it, validate a
             // canned assessment, and route it — the full code-owned path

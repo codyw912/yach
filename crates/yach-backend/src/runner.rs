@@ -2079,6 +2079,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     ) else {
                         continue;
                     };
+                    crate::bump_authorization_revision(&authorization_revision);
                     mark_turn(trace.as_ref(), &started_prompt.turn, "prompt_received");
                     let turn_id = started_prompt.turn.clone();
                     let requester = make_requester(&provider);
@@ -2145,6 +2146,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         prompt_turn_index,
                         prompt_started,
                     );
+                    crate::bump_authorization_revision(&authorization_revision);
                 }
             }
             ClientEvent::ModelActivationRequested {
@@ -7696,33 +7698,42 @@ async fn finish_prepared_edit_tool_request(
                         freshness.reviewer_generation,
                     );
                 }
-                let route = tokio::select! {
-                    () = batch.cancellation.cancelled() => {
-                        return Err(ProviderRoundError::Cancelled(String::from(
-                            "native provider prompt cancelled",
-                        )));
+                let route = match crate::user_message_evidence(batch.log, &batch.turn_id) {
+                    crate::UserMessageEvidence::IssuingTurnOverBudget => crate::ReviewRoute::Hold {
+                        reason: crate::HoldReason::EvidenceOverBudget,
+                        evidence_refs: Vec::new(),
+                    },
+                    crate::UserMessageEvidence::Ready { items, omissions } => {
+                        let mut trusted = items;
+                        trusted.push(crate::EvidenceItem {
+                            id: String::from("diff_summary"),
+                            source: String::from("edit_preview"),
+                            kind: String::from("diff_summary"),
+                            excerpt: preview.diff_summary.clone(),
+                            truncated: preview.diff_summary_truncated,
+                        });
+                        trusted.push(crate::EvidenceItem {
+                            id: String::from("path"),
+                            source: String::from("edit_preview"),
+                            kind: String::from("target_path"),
+                            excerpt: path.clone(),
+                            truncated: false,
+                        });
+                        tokio::select! {
+                            () = batch.cancellation.cancelled() => {
+                                return Err(ProviderRoundError::Cancelled(String::from(
+                                    "native provider prompt cancelled",
+                                )));
+                            }
+                            route = coordinator.review_action(
+                                permission_request,
+                                action,
+                                trusted,
+                                Vec::new(),
+                                omissions,
+                            ) => route,
+                        }
                     }
-                    route = coordinator.review_action(
-                        permission_request,
-                        action,
-                        vec![
-                            crate::EvidenceItem {
-                                id: String::from("diff_summary"),
-                                source: String::from("edit_preview"),
-                                kind: String::from("diff_summary"),
-                                excerpt: preview.diff_summary.clone(),
-                                truncated: preview.diff_summary_truncated,
-                            },
-                            crate::EvidenceItem {
-                                id: String::from("path"),
-                                source: String::from("edit_preview"),
-                                kind: String::from("target_path"),
-                                excerpt: path.clone(),
-                                truncated: false,
-                            },
-                        ],
-                        Vec::new(),
-                    ) => route,
                 };
                 match route {
                     crate::ReviewRoute::Execute => {
@@ -7874,6 +7885,11 @@ async fn finish_prepared_edit_tool_request(
                             decision,
                         },
                     )?;
+                    if let Some(coordinator) = batch.review_coordinator {
+                        crate::bump_authorization_revision(
+                            coordinator.authorization_revision_handle(),
+                        );
+                    }
                     decision
                 }
                 Err(error) => {
@@ -8041,6 +8057,9 @@ fn persist_shell_review_resolution(
         }
         ToolReviewDecision::Reject => PermissionDecisionOutcome::Denied,
     };
+    if let Some(coordinator) = batch.review_coordinator {
+        crate::bump_authorization_revision(coordinator.authorization_revision_handle());
+    }
     summary.reviewer = PermissionReviewer::User;
     // Distinct reasons so an audit can tell a one-off approval from the
     // decision that also created a session grant.
@@ -8241,33 +8260,42 @@ Select a reviewer extension or switch to a manual approval mode.",
                 timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
                 env_keys: shell_policy.config.env_allow.clone(),
             };
-            let route = tokio::select! {
-                () = batch.cancellation.cancelled() => {
-                    return Err(ProviderRoundError::Cancelled(String::from(
-                        "native provider prompt cancelled",
-                    )));
+            let route = match crate::user_message_evidence(batch.log, &batch.turn_id) {
+                crate::UserMessageEvidence::IssuingTurnOverBudget => crate::ReviewRoute::Hold {
+                    reason: crate::HoldReason::EvidenceOverBudget,
+                    evidence_refs: Vec::new(),
+                },
+                crate::UserMessageEvidence::Ready { items, omissions } => {
+                    let mut trusted = items;
+                    trusted.push(crate::EvidenceItem {
+                        id: String::from("command"),
+                        source: String::from("permission_request"),
+                        kind: String::from("shell_command"),
+                        excerpt: command.clone(),
+                        truncated: false,
+                    });
+                    trusted.push(crate::EvidenceItem {
+                        id: String::from("cwd"),
+                        source: String::from("permission_request"),
+                        kind: String::from("working_directory"),
+                        excerpt: prepared.cwd.to_string_lossy().into_owned(),
+                        truncated: false,
+                    });
+                    tokio::select! {
+                        () = batch.cancellation.cancelled() => {
+                            return Err(ProviderRoundError::Cancelled(String::from(
+                                "native provider prompt cancelled",
+                            )));
+                        }
+                        route = coordinator.review_action(
+                            permission_request.clone(),
+                            action,
+                            trusted,
+                            Vec::new(),
+                            omissions,
+                        ) => route,
+                    }
                 }
-                route = coordinator.review_action(
-                    permission_request.clone(),
-                    action,
-                    vec![
-                        crate::EvidenceItem {
-                            id: String::from("command"),
-                            source: String::from("permission_request"),
-                            kind: String::from("shell_command"),
-                            excerpt: command.clone(),
-                            truncated: false,
-                        },
-                        crate::EvidenceItem {
-                            id: String::from("cwd"),
-                            source: String::from("permission_request"),
-                            kind: String::from("working_directory"),
-                            excerpt: prepared.cwd.to_string_lossy().into_owned(),
-                            truncated: false,
-                        },
-                    ],
-                    Vec::new(),
-                ) => route,
             };
             match route {
                 crate::ReviewRoute::Execute => {}

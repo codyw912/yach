@@ -569,6 +569,27 @@ impl SessionLog {
         })
     }
 
+    /// Trusted user messages from the durable log, newest first, with the
+    /// entry and turn that produced them. Compaction summaries are
+    /// `Role::Assistant`/system material and never appear here.
+    #[must_use]
+    pub fn user_messages_newest_first(&self) -> Vec<(&EntryId, &TurnId, &str)> {
+        self.events
+            .iter()
+            .rev()
+            .filter_map(|event| match event {
+                SessionEvent::EntryAppended {
+                    role: Role::User,
+                    entry_id,
+                    turn_id,
+                    text,
+                    ..
+                } => Some((entry_id, turn_id, text.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn transcript_messages(&self) -> Vec<TranscriptMessage> {
         self.events
