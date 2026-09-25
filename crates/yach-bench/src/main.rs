@@ -17,7 +17,7 @@ fn main() -> ExitCode {
         },
         _ => (
             vec![String::from(
-                "usage: yach-bench perf run|worker|ab|report|host-fingerprint … | eval-review --suite e1|e2|e3|e4 --corpus <dir> --reviewer fixture|jev [--runs <n>] --out <json>",
+                "usage: yach-bench perf run|worker|ab|report|host-fingerprint … | eval-review --suite e1|e2|e3|e4 --corpus <dir> --reviewer fixture|jev [--runs <n>] --out <json> | eval-review validate <dir>",
             )],
             2,
         ),

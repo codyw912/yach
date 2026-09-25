@@ -28,6 +28,10 @@ supersedes the v1 gate in
   `31bc50c5`). The E2–E4 corpora are unchanged at PR head `a4e248af`.
 - E1 (23 cases) ran on the final-fixes change `ktnkumyp`, published commit
   `a4e248af3a40f0c72529f4912a7ea0c41169d859`.
+- The E2–E4 corpora have since moved, byte-identical, to `codyw912/yach-evals`
+  `auto-review/corpora/<suite>/{dev,held-out}/` (old `e3/` is `e3/dev/`,
+  `e3-held-out/` is `e3/held-out/`, `e4/` is `e4/dev/`). The paths below are
+  the ones the runs used.
 
 ## Method
 

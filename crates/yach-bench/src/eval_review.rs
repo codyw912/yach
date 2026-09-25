@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -787,6 +787,12 @@ fn prepare_edit_case(case: &EvalCase) -> Result<PreparedEditCase, ObservedOutcom
 }
 
 pub fn dispatch(args: &[String]) -> Result<Vec<String>, String> {
+    if let [command, dir] = args
+        && command == "validate"
+    {
+        let cases = load_corpus(Path::new(dir))?;
+        return Ok(vec![format!("{}: {} cases valid", dir, cases.len())]);
+    }
     let mut suite = None;
     let mut corpus = None;
     let mut reviewer = None;
@@ -869,6 +875,54 @@ pub fn load_cases(dir: &Path) -> Result<Vec<EvalCase>, String> {
             Ok(case)
         })
         .collect()
+}
+
+/// Loads a live-suite corpus and enforces its data invariants: signal labels
+/// name known signals, and a `held-out` split shares no case id and no
+/// (action target, issuing message) pair with its sibling `dev` split.
+pub fn load_corpus(dir: &Path) -> Result<Vec<EvalCase>, String> {
+    let cases = load_cases(dir)?;
+    for case in &cases {
+        if let EvalExpected::Signals { signals } = &case.expected {
+            for key in signals.keys() {
+                if !ReviewSignal::ALL.iter().any(|signal| signal.id() == key) {
+                    return Err(format!("{}: unknown signal label {key}", case.id));
+                }
+            }
+        }
+    }
+    let split = |name: &str| dir.file_name().is_some_and(|file| file == name);
+    let (dev, held) = match dir.parent() {
+        Some(parent) if split("held-out") && parent.join("dev").is_dir() => {
+            (load_cases(&parent.join("dev"))?, cases.clone())
+        }
+        Some(parent) if split("dev") && parent.join("held-out").is_dir() => {
+            (cases.clone(), load_cases(&parent.join("held-out"))?)
+        }
+        _ => return Ok(cases),
+    };
+    let ids: BTreeSet<&str> = dev.iter().map(|case| case.id.as_str()).collect();
+    let keys: BTreeSet<(String, String)> = dev.iter().map(split_key).collect();
+    for case in &held {
+        if ids.contains(case.id.as_str()) || keys.contains(&split_key(case)) {
+            return Err(format!("held-out case {} duplicates a dev case", case.id));
+        }
+    }
+    Ok(cases)
+}
+
+fn split_key(case: &EvalCase) -> (String, String) {
+    let target = match &case.action {
+        ReviewAction::ShellCommand { command, .. } => command.clone(),
+        ReviewAction::EditTransaction { operations, .. }
+        | ReviewAction::ExtensionProposal { operations, .. } => format!("{operations:?}"),
+    };
+    let message = case
+        .user_messages
+        .last()
+        .map(|message| message.text.clone())
+        .unwrap_or_default();
+    (target, message)
 }
 
 /// E1: every case runs once through the production decision/coordinator seams
@@ -1086,7 +1140,7 @@ fn spawn_jev_reviewer() -> Result<JevReviewer, String> {
 /// E3/E4: live Jev reviewer, `runs` repetitions per case; a case passes only
 /// when every run matches the expected route.
 fn run_routes(suite: &str, corpus: &Path, runs: usize, out: &Path) -> Result<Vec<String>, String> {
-    let cases = load_cases(corpus)?;
+    let cases = load_corpus(corpus)?;
     let (reviewer, last_assessment, runtime) = spawn_jev_reviewer()?;
     let mut reports = Vec::with_capacity(cases.len());
     let mut model_returned = None;
@@ -1307,7 +1361,7 @@ struct CoverageReport {
 /// E2: live Jev reviewer, per-signal scoring against labels. No routing gate
 /// on dev; held-out fails on any false negative on a hold-driving signal.
 fn run_signals(suite: &str, corpus: &Path, runs: usize, out: &Path) -> Result<Vec<String>, String> {
-    let cases = load_cases(corpus)?;
+    let cases = load_corpus(corpus)?;
     let thresholds = signal_thresholds();
     let (reviewer, last_assessment, runtime) = spawn_jev_reviewer()?;
 
@@ -1603,7 +1657,6 @@ fn write_report_with_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -1631,15 +1684,19 @@ mod tests {
 
     #[test]
     fn reviewer_visible_request_never_contains_case_id() {
-        let cases = load_cases(&repo_root().join("evals/auto-review/e3"));
-        assert!(cases.is_ok());
-        let Ok(cases) = cases else { return };
+        let cases = load_cases(&repo_root().join("evals/auto-review/e1"));
+        let Ok(cases) = cases else {
+            unreachable!("e1 corpus loads")
+        };
+        let mut built = 0;
         for case in &cases {
             let request = build_review_request(case, 0);
             let Ok(request) = request else { continue }; // deterministic-hold cases build none
+            built += 1;
             let text = serde_json::to_string(&request).unwrap_or_default();
             assert!(!text.contains(&case.id), "{} leaks into request", case.id);
         }
+        assert!(built > 0, "no e1 case reached the reviewer request");
     }
 
     #[test]
@@ -1668,63 +1725,53 @@ mod tests {
         }
     }
 
-    #[test]
-    fn e2_cases_label_only_known_signals() {
-        for split in ["dev", "held-out"] {
-            let cases = load_cases(&repo_root().join("evals/auto-review/e2").join(split));
-            let Ok(cases) = cases else {
-                unreachable!("{split} loads")
-            };
-            assert!(!cases.is_empty());
-            for case in &cases {
-                let EvalExpected::Signals { signals } = &case.expected else {
-                    unreachable!("{} must use signal labels", case.id)
-                };
-                for key in signals.keys() {
-                    assert!(
-                        yach_backend::ReviewSignal::ALL
-                            .iter()
-                            .any(|s| s.id() == key),
-                        "{}: {key}",
-                        case.id
-                    );
-                }
-            }
-        }
+    fn write_case(dir: &Path, id: &str, command: &str, message: &str, signal: &str) {
+        let body = json!({
+            "schema": CASE_SCHEMA,
+            "id": id,
+            "category": "c",
+            "action": {
+                "kind": "shell_command",
+                "command": command,
+                "cwd": "/w",
+                "timeout_ms": 1,
+                "env_keys": [],
+            },
+            "user_messages": [{ "text": message }],
+            "policy": { "revision": 1 },
+            "expected": { "kind": "signals", "signals": { signal: true } },
+        });
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(dir.join(format!("{id}.json")), body.to_string());
     }
 
+    /// Live corpora live outside this repo, so their invariants are enforced
+    /// on every load: known signal labels, and held-out disjoint from dev by
+    /// id and by (action target, issuing message).
     #[test]
-    fn e2_splits_are_disjoint_by_action_and_message() {
-        let key = |case: &EvalCase| {
-            let target = match &case.action {
-                ReviewAction::ShellCommand { command, .. } => command.clone(),
-                ReviewAction::EditTransaction { operations, .. }
-                | ReviewAction::ExtensionProposal { operations, .. } => {
-                    format!("{operations:?}")
-                }
-            };
-            let message = case
-                .user_messages
-                .last()
-                .map(|m| m.text.clone())
-                .unwrap_or_default();
-            (target, message)
-        };
-        let root = repo_root().join("evals/auto-review/e2");
-        let (Ok(dev), Ok(held)) = (
-            load_cases(&root.join("dev")),
-            load_cases(&root.join("held-out")),
-        ) else {
-            unreachable!("both splits load")
-        };
-        let dev_keys: BTreeSet<_> = dev.iter().map(key).collect();
-        for case in &held {
-            assert!(
-                !dev_keys.contains(&key(case)),
-                "{} duplicates a dev case",
-                case.id
-            );
-        }
+    fn load_corpus_rejects_unknown_signals_and_split_overlap() {
+        let root = std::env::temp_dir().join(format!("yach-corpus-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (dev, held) = (root.join("s/dev"), root.join("s/held-out"));
+        write_case(&dev, "a", "cargo install x", "Install x.", "install");
+        write_case(&held, "b", "cargo install y", "Install y.", "install");
+        assert!(load_corpus(&held).is_ok());
+        assert!(load_corpus(&dev).is_ok());
+
+        write_case(&held, "c", "cargo install x", "Install x.", "install");
+        let overlap = load_corpus(&held);
+        assert!(matches!(&overlap, Err(message) if message.contains("c duplicates")));
+        assert!(load_corpus(&dev).is_err(), "dev side sees the overlap too");
+        let _ = fs::remove_file(held.join("c.json"));
+
+        write_case(&held, "a", "cargo install z", "Install z.", "install");
+        assert!(load_corpus(&held).is_err(), "reused id");
+        let _ = fs::remove_file(held.join("a.json"));
+
+        write_case(&dev, "d", "rm -rf /", "Clean up.", "delet");
+        let unknown = load_corpus(&dev);
+        assert!(matches!(&unknown, Err(message) if message.contains("unknown signal label delet")));
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Per-signal scoring: TP/FP/TN/FN counts, null labels ignored, and the
@@ -1805,19 +1852,6 @@ mod tests {
             "unused.json".into(),
         ]);
         assert!(matches!(result, Err(message) if message.contains("--runs")));
-    }
-
-    #[test]
-    fn e3_held_out_is_disjoint_from_e3() {
-        let root = repo_root().join("evals/auto-review");
-        let corpus = load_cases(&root.join("e3"));
-        assert!(corpus.is_ok());
-        let Ok(corpus) = corpus else { return };
-        let held = load_cases(&root.join("e3-held-out"));
-        assert!(held.is_ok());
-        let Ok(held) = held else { return };
-        let corpus_ids: BTreeSet<_> = corpus.iter().map(|case| &case.id).collect();
-        assert!(held.iter().all(|case| !corpus_ids.contains(&case.id)));
     }
 
     /// The E3/E4 path must observe the pre-gate route: with
