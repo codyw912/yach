@@ -147,6 +147,10 @@ pub fn action_kind(action: &ReviewAction) -> &'static str {
     }
 }
 
+/// `EvidenceItem::source` for trusted user messages; shared by routing and
+/// the bench so the intent-presence check and builders cannot drift.
+pub const USER_EVIDENCE_SOURCE: &str = "user";
+
 /// Byte budget for trusted user-message evidence in one review request.
 pub const USER_MESSAGE_BUDGET_BYTES: usize = 16 * 1024;
 
@@ -171,21 +175,34 @@ pub fn user_message_evidence(
     let messages = log.user_messages_newest_first();
     let evidence = |entry: &crate::EntryId, text: &str| EvidenceItem {
         id: format!("user:{}", entry.0),
-        source: String::from("user"),
+        source: String::from(USER_EVIDENCE_SOURCE),
         kind: String::from("message"),
         excerpt: text.to_owned(),
         truncated: false,
     };
     let mut items = Vec::new();
-    let mut used = 0_usize;
-    if let Some((entry, _, text)) = messages.iter().find(|(_, turn, _)| *turn == issuing_turn) {
-        if text.len() > USER_MESSAGE_BUDGET_BYTES {
-            return UserMessageEvidence::IssuingTurnOverBudget;
-        }
-        used = text.len();
-        items.push(evidence(entry, text));
-    }
     let mut omissions = Vec::new();
+    let mut used = 0_usize;
+    let mut issuing_included: Option<&crate::EntryId> = None;
+    for (entry, turn, text) in &messages {
+        if *turn != issuing_turn {
+            continue;
+        }
+        if issuing_included.is_none() {
+            if text.len() > USER_MESSAGE_BUDGET_BYTES {
+                return UserMessageEvidence::IssuingTurnOverBudget;
+            }
+            used = text.len();
+            issuing_included = Some(*entry);
+            items.push(evidence(entry, text));
+            continue;
+        }
+        // A second issuing-turn user entry is never cited; mark it so the
+        // reviewer sees it existed instead of silently dropping it.
+        omissions.push(OmissionMarker::Unavailable {
+            id: format!("user:{}", entry.0),
+        });
+    }
     for (entry, turn, text) in &messages {
         if *turn == issuing_turn {
             continue;
@@ -381,6 +398,27 @@ mod tests {
             omissions
                 .iter()
                 .any(|m| matches!(m, OmissionMarker::Unavailable { id } if id == "user:big"))
+        );
+    }
+
+    #[test]
+    fn extra_issuing_turn_user_entries_get_unavailable_markers() {
+        let mut log = crate::SessionLog::default();
+        log.push(user_entry("older", "turn-1", "earlier turn"));
+        log.push(user_entry("first", "turn-2", "first in issuing turn"));
+        log.push(user_entry("newest", "turn-2", "newest in issuing turn"));
+        let UserMessageEvidence::Ready { items, omissions } =
+            user_message_evidence(&log, &crate::TurnId(String::from("turn-2")))
+        else {
+            unreachable!("fits the budget")
+        };
+        let ids: Vec<_> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["user:newest", "user:older"]);
+        assert!(
+            omissions
+                .iter()
+                .any(|m| matches!(m, OmissionMarker::Unavailable { id } if id == "user:first")),
+            "skipped issuing-turn entry must be marked: {omissions:?}"
         );
     }
 }

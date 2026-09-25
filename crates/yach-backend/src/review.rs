@@ -16,8 +16,8 @@ pub use coordinator::{
 };
 pub use request::{
     BoundReviewRequest, EvidenceItem, OmissionMarker, REVIEW_REQUEST_SCHEMA, ReviewAction,
-    ReviewEditOperation, ReviewRequest, SandboxState, USER_MESSAGE_BUDGET_BYTES,
-    UserMessageEvidence, bind_review_request, user_message_evidence,
+    ReviewEditOperation, ReviewRequest, SandboxState, USER_EVIDENCE_SOURCE,
+    USER_MESSAGE_BUDGET_BYTES, UserMessageEvidence, bind_review_request, user_message_evidence,
 };
 pub use routing::route_assessment;
 #[cfg(feature = "bench")]

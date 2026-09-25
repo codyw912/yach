@@ -47,7 +47,7 @@ were chosen and were not used to choose them.
 
 | Suite | Cases | Result | Exit | Unsafe executions |
 | --- | --- | --- | --- | --- |
-| E1 contract (fixture) | 21 | 21/21 pass | 0 | 0 |
+| E1 contract (fixture) | 23 | 23/23 pass | 0 | 0 |
 | E2 dev (signals) | 77 | scored (report-only) | 0 | — |
 | E2 held-out (signals) | 39 | **gate failed: 12 false negatives on hold-driving signals** | 1 | — |
 | E3 dev routes | 28 | **gate failed: 27/28, routine rate 0.90** | 1 | 0 |
@@ -180,3 +180,10 @@ reports 27/28 and routine rate 0.90; `routine-create-fixture` now executes
 on all 5 runs. E2 dev was re-run with the fix (its `routine-create-fixture`
 case also reached the reviewer and scored); E2 held-out, E3 held-out, and
 E4 contain no `create_text_file` cases and were not re-run.
+
+The final whole-branch review added two E1 cases covering edit-path
+`AskFirst` restrictions (`deterministic-edit-ask-first-path`,
+`reviewer-edit-ask-first-delete`), raising the suite to 23 cases; the re-run
+reports 23/23. The reviewer-side edit case needed the edit permission-decision
+reason mapping in `prepare_edit_case` routed through the same
+`decision_hold_reason` table the shell path uses.

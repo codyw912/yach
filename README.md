@@ -97,7 +97,13 @@ session switch. Direct `/approval full-access` opens the same warning rather
 (e.g. Jev) that assesses each request's hazards and scope against your recent
 messages; user restrictions are enforced by Yach, not the reviewer. The
 reviewer sees your recent user messages plus the action being requested; it is
-not a sandbox — the extension host runs with the agent's privileges.
+not a sandbox — the extension host runs with the agent's privileges. In this
+build automatic execution is compiled off (`AUTO_REVIEW_EXECUTION_ENABLED =
+false`): actions the reviewer would have allowed are shown to you for
+approval, while reviewer holds (risk, clarification, restrictions) still apply
+and human-performs restrictions are handed off, not run — until the
+evaluation gates in `docs/project/records/2026-09-25-auto-review-signals-evaluation.md`
+pass.
 `auto-review` is session-only like `full-access`, never persisted,
 and resets on restart. The picker works during active turns; a change affects
 future tool requests without changing a pending review. The active mode stays

@@ -2,8 +2,9 @@
 //! reviewer, validate freshness, and route.
 //!
 //! Model-derived execution stays off until Task 8 flips
-//! [`AUTO_REVIEW_EXECUTION_ENABLED`]. Fixture reviewers and `cfg(test)` bypass
-//! that gate so routing can be proven before live enablement.
+//! [`AUTO_REVIEW_EXECUTION_ENABLED`]; while off, only the `Execute` route is
+//! disabled — reviewer holds still apply. Fixture reviewers and `cfg(test)`
+//! bypass the gate so routing can be proven before live enablement.
 
 #[cfg(test)]
 use std::future::Future;
@@ -36,7 +37,7 @@ pub fn bump_authorization_revision(revision: &Mutex<u64>) {
 }
 
 /// Compile-time enablement. Task 8 flips this after the held-out evaluation.
-/// While false, a model-derived route is [`ReviewFailure::Disabled`].
+/// While false, a model-derived `Execute` route is [`ReviewFailure::Disabled`].
 pub(crate) const AUTO_REVIEW_EXECUTION_ENABLED: bool = false;
 
 /// Why a reviewed action is held for a person.
@@ -404,21 +405,32 @@ impl<'a> ReviewCoordinator<'a> {
         })
     }
     fn gate_execution(&self, route: ReviewRoute) -> ReviewRoute {
-        if AUTO_REVIEW_EXECUTION_ENABLED || cfg!(test) || self.fixture_reviewer {
-            return route;
-        }
-        match route {
-            ReviewRoute::Execute | ReviewRoute::Hold { .. } => ReviewRoute::ReviewFailed {
-                reason: ReviewFailure::Disabled,
-            },
-            failed @ ReviewRoute::ReviewFailed { .. } => failed,
-        }
+        gate_route(
+            AUTO_REVIEW_EXECUTION_ENABLED || cfg!(test) || self.fixture_reviewer,
+            route,
+        )
     }
 
     /// Shared revision so the runner can invalidate in-flight reviews when a
     /// trusted user message or user review decision lands.
     pub(crate) fn authorization_revision_handle(&self) -> &Arc<Mutex<u64>> {
         &self.authorization_revision
+    }
+}
+
+/// Execution gate: when disabled, only `Execute` is blocked — holds pass
+/// through because they already require a person (a `HumanPerforms`
+/// restriction hold must survive to reach the handoff, not collapse into an
+/// approvable `ReviewFailed` row).
+fn gate_route(execution_enabled: bool, route: ReviewRoute) -> ReviewRoute {
+    if execution_enabled {
+        return route;
+    }
+    match route {
+        ReviewRoute::Execute => ReviewRoute::ReviewFailed {
+            reason: ReviewFailure::Disabled,
+        },
+        held @ (ReviewRoute::Hold { .. } | ReviewRoute::ReviewFailed { .. }) => held,
     }
 }
 
@@ -1084,6 +1096,50 @@ mod tests {
                 }
             ),
             "a user message between send and response is stale, got {route:?}"
+        );
+    }
+
+    #[test]
+    fn gate_route_disabled_blocks_only_execute() {
+        assert_eq!(
+            super::gate_route(false, ReviewRoute::Execute),
+            ReviewRoute::ReviewFailed {
+                reason: ReviewFailure::Disabled
+            }
+        );
+        for reason in [
+            HoldReason::RestrictionApplies {
+                restriction: crate::ReviewRestriction::HumanPerforms {
+                    matcher: crate::RestrictionMatcher::ActionClass {
+                        class: crate::ActionClass::PersistentInstall,
+                    },
+                    note: String::from("human installs"),
+                },
+            },
+            HoldReason::SignificantRisk,
+            HoldReason::NeedsClarification,
+        ] {
+            let hold = ReviewRoute::Hold {
+                reason,
+                evidence_refs: vec![String::from("user:e0")],
+            };
+            assert_eq!(
+                super::gate_route(false, hold.clone()),
+                hold,
+                "disabled gate must not erase reviewer holds"
+            );
+        }
+        let failed = ReviewRoute::ReviewFailed {
+            reason: ReviewFailure::TimedOut,
+        };
+        assert_eq!(super::gate_route(false, failed.clone()), failed);
+    }
+
+    #[test]
+    fn gate_route_enabled_passes_execute() {
+        assert_eq!(
+            super::gate_route(true, ReviewRoute::Execute),
+            ReviewRoute::Execute
         );
     }
 }

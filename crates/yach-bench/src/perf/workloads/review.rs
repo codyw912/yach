@@ -114,7 +114,7 @@ fn run_review_route(ctx: &RunCtx, with_reviewer: bool) -> Result<Measured, Strin
         let trusted = vec![
             EvidenceItem {
                 id: String::from("user:perf"),
-                source: String::from("user"),
+                source: String::from(yach_backend::USER_EVIDENCE_SOURCE),
                 kind: String::from("message"),
                 excerpt: String::from("run true"),
                 truncated: false,

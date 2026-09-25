@@ -387,7 +387,7 @@ pub enum ExtensionHostServerMessage {
     },
     ReviewResult {
         request_id: String,
-        /// Serialized review assessment (schema yach.review-assessment.v1),
+        /// Serialized review assessment (schema yach.review-assessment.v2),
         /// bounded to 16 KiB.
         assessment: serde_json::Value,
     },
@@ -4557,7 +4557,7 @@ done
 
     #[test]
     fn review_returns_matching_assessment() {
-        let assessment = serde_json::json!({"schema": "yach.review-assessment.v1", "allow": true});
+        let assessment = serde_json::json!({"schema": "yach.review-assessment.v2", "allow": true});
         let transport =
             FakeExtensionHostTransport::new([Ok(ExtensionHostServerMessage::ReviewResult {
                 request_id: String::from("review-1"),

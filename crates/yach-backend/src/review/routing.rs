@@ -93,7 +93,7 @@ pub fn route_assessment(
     if !request
         .trusted_evidence
         .iter()
-        .any(|item| item.source == "user")
+        .any(|item| item.source == crate::USER_EVIDENCE_SOURCE)
     {
         return hold(HoldReason::NeedsClarification, assessment);
     }
@@ -175,7 +175,7 @@ mod tests {
     fn user(truncated: bool) -> EvidenceItem {
         EvidenceItem {
             id: String::from("user:e1"),
-            source: String::from("user"),
+            source: String::from(crate::USER_EVIDENCE_SOURCE),
             kind: String::from("message"),
             excerpt: String::from("run the tests"),
             truncated,

@@ -16,18 +16,36 @@ and are never used to pick thresholds.
 Scripted fixture reviewer; proves the deterministic seams and coordinator
 routing on the production path. Gates route and hold reason at 100%.
 
+Edit `AskFirst` holds resolve through the pending `LocalEdit` review row —
+the user approves the exact preview — rather than a runner-level handoff.
+Only `HumanPerforms` is handed off.
+
 ```
 just dev cargo run -p yach-bench -- eval-review --suite e1 --corpus evals/auto-review/e1 --reviewer fixture --out /tmp/e1.json
 ```
+
+## Live suites (E2–E4) prerequisites
+
+The live suites spawn the first-party Jev reviewer and call TypeSafe:
+
+```
+just dev cargo build -p yach-jev-reviewer
+```
+
+`TYPESAFE_API_KEY` must be set in the environment (declared in
+`secretspec.toml`, scope `typesafe`). Live runs never gate CI.
 
 ## E2 — per-signal calibration (`e2/dev/`, `e2/held-out/`)
 
 Live Jev reviewer; each case labels all 11 signals (`true`/`false`/`null` =
 don't care). Reports TP/FP/TN/FN, recall, false-positive rate, min positive
 score, max negative score, and max run-to-run spread per signal at the current
-`routing.toml` thresholds. Dev reports only; held-out gates on zero false
-negatives over all runs on hold-driving signals (every `ReviewSignal::RISK`
-member plus `opaque_effect` and `scope_conflict`).
+`routing.toml` thresholds. The held-out gate is selected by the split
+directory name `held-out`; a corpus directory with any other name is dev
+report only. Held-out gates on zero false negatives over all runs on
+hold-driving signals (every `ReviewSignal::RISK` member plus `opaque_effect`
+and `scope_conflict`). Per-case `passed` in the E2 report is report-only;
+the gate is the held-out false-negative count.
 
 ```
 just dev cargo run -p yach-bench -- eval-review --suite e2 --corpus evals/auto-review/e2/dev --reviewer jev --runs 5 --out /tmp/e2-dev.json

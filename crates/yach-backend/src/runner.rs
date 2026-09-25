@@ -2117,7 +2117,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         cancellation,
                     });
                 } else if let Some(setup_error) = provider_setup_error.as_deref() {
-                    handle_native_prompt_unconfigured_provider(
+                    if handle_native_prompt_unconfigured_provider(
                         &tx,
                         &store,
                         &mut session_log,
@@ -2131,10 +2131,12 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             prompt_started: Instant::now(),
                             setup_error,
                         },
-                    );
+                    ) {
+                        crate::bump_authorization_revision(&authorization_revision);
+                    }
                 } else {
                     let prompt_started = Instant::now();
-                    handle_native_prompt(
+                    if handle_native_prompt(
                         &tx,
                         &store,
                         &mut session_log,
@@ -2145,8 +2147,9 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         &prompt,
                         prompt_turn_index,
                         prompt_started,
-                    );
-                    crate::bump_authorization_revision(&authorization_revision);
+                    ) {
+                        crate::bump_authorization_revision(&authorization_revision);
+                    }
                 }
             }
             ClientEvent::ModelActivationRequested {
@@ -3315,7 +3318,6 @@ fn backend_status_message(
         )
     }
 }
-
 fn handle_native_prompt(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &JsonlSessionStore,
@@ -3324,7 +3326,7 @@ fn handle_native_prompt(
     prompt: &str,
     turn_index: u64,
     prompt_started: Instant,
-) {
+) -> bool {
     let session_id =
         if session.requested_session_id.is_empty() || session.requested_session_id == "default" {
             session.current_session_id.to_owned()
@@ -3335,7 +3337,7 @@ fn handle_native_prompt(
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: format!("unknown session {session_id}"),
         }));
-        return;
+        return false;
     }
     let typed_session_id = SessionId(session_id.clone());
 
@@ -3398,7 +3400,7 @@ fn handle_native_prompt(
                     );
                     let _ = append_pending_native_session_events(store, &mut pending_events)
                         .and_then(|()| store.flush_durable());
-                    return;
+                    return true;
                 }
             }
             push_native_prompt_total_metric(
@@ -3504,6 +3506,7 @@ fn handle_native_prompt(
         message: Some(status),
     }));
     send_native_session_stats_from_log(tx, log, None);
+    true
 }
 
 /// Prompt details for a native session whose provider could not be configured.
@@ -3522,7 +3525,7 @@ fn handle_native_prompt_unconfigured_provider(
     log: &mut SessionLog,
     session: PromptSessionInput<'_>,
     prompt: &UnconfiguredProviderPrompt<'_>,
-) {
+) -> bool {
     let session_id =
         if session.requested_session_id.is_empty() || session.requested_session_id == "default" {
             session.current_session_id.to_owned()
@@ -3533,7 +3536,7 @@ fn handle_native_prompt_unconfigured_provider(
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: format!("unknown session {session_id}"),
         }));
-        return;
+        return false;
     }
     let typed_session_id = SessionId(session_id);
 
@@ -3587,6 +3590,7 @@ fn handle_native_prompt_unconfigured_provider(
             trace: None,
         },
     );
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -10322,12 +10326,13 @@ mod tests {
         ProviderConnectionFlow, ProviderFirstRound, ProviderRequester, ProviderRetryContext,
         ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
         ProviderToolRoundContext, RunnerConfig, SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState,
-        ThinkingLevel, active_model, apply_active_connection_rename, apply_connection_flow_effects,
-        apply_native_model_selection, backend_status_message, cancel_active_provider_turn,
-        clear_connection_catalog, collect_native_provider_first_round, edit_permission_mode,
-        execute_native_provider_agent_tool_batch, finish_native_prompt, fixture_outcome,
-        handle_native_extension_diagnostic_snapshot_request,
-        handle_native_extension_lifecycle_request, handle_native_prompt, launch_project_context,
+        ThinkingLevel, UnconfiguredProviderPrompt, active_model, apply_active_connection_rename,
+        apply_connection_flow_effects, apply_native_model_selection, backend_status_message,
+        cancel_active_provider_turn, clear_connection_catalog, collect_native_provider_first_round,
+        edit_permission_mode, execute_native_provider_agent_tool_batch, finish_native_prompt,
+        fixture_outcome, handle_native_extension_diagnostic_snapshot_request,
+        handle_native_extension_lifecycle_request, handle_native_prompt,
+        handle_native_prompt_unconfigured_provider, launch_project_context,
         launch_project_context_from_root, load_native_session_log_for_runner,
         load_native_session_log_for_runner_with_loader, local_edit_error_message,
         log_has_finished_turn, model_change_target, native_models_from_catalog,
@@ -11912,6 +11917,90 @@ mod tests {
             "a completed fixture turn must issue exactly one durable sync"
         );
     }
+
+    #[test]
+    fn native_prompt_bumps_authorization_revision_once_per_appended_user_entry() {
+        // Every branch that appends a trusted Role::User entry must bump the
+        // authorization revision exactly once; a rejected prompt (unknown
+        // session) appends nothing and must not bump.
+        let root = TempProject::new("native-prompt-authorization-bump");
+        let store = JsonlSessionStore::new(root.root().join("session.jsonl"));
+        let mut log = SessionLog::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let revision = Mutex::new(0_u64);
+
+        let bump_on_appended = |appended: bool| {
+            if appended {
+                crate::bump_authorization_revision(&revision);
+            }
+        };
+
+        bump_on_appended(handle_native_prompt(
+            &tx,
+            &store,
+            &mut log,
+            PromptSessionInput {
+                current_session_id: "default",
+                requested_session_id: String::from("default"),
+            },
+            "hello",
+            0,
+            Instant::now(),
+        ));
+        assert_eq!(revision.lock().map_or(0, |value| *value), 1);
+
+        // Unknown session: nothing appended, no bump.
+        bump_on_appended(handle_native_prompt(
+            &tx,
+            &store,
+            &mut log,
+            PromptSessionInput {
+                current_session_id: "default",
+                requested_session_id: String::from("other"),
+            },
+            "hello",
+            1,
+            Instant::now(),
+        ));
+        assert_eq!(revision.lock().map_or(0, |value| *value), 1);
+
+        // Unconfigured-provider branch also appends a user entry and bumps.
+        bump_on_appended(handle_native_prompt_unconfigured_provider(
+            &tx,
+            &store,
+            &mut log,
+            PromptSessionInput {
+                current_session_id: "default",
+                requested_session_id: String::from("default"),
+            },
+            &UnconfiguredProviderPrompt {
+                prompt: "hello",
+                turn_index: 2,
+                prompt_started: Instant::now(),
+                setup_error: "missing key",
+            },
+        ));
+        assert_eq!(revision.lock().map_or(0, |value| *value), 2);
+
+        // Unconfigured-provider rejection on an unknown session: no bump.
+        bump_on_appended(handle_native_prompt_unconfigured_provider(
+            &tx,
+            &store,
+            &mut log,
+            PromptSessionInput {
+                current_session_id: "default",
+                requested_session_id: String::from("other"),
+            },
+            &UnconfiguredProviderPrompt {
+                prompt: "hello",
+                turn_index: 3,
+                prompt_started: Instant::now(),
+                setup_error: "missing key",
+            },
+        ));
+        assert_eq!(revision.lock().map_or(0, |value| *value), 2);
+    }
+
     #[test]
     fn provider_agent_edit_validation_failure_persists_replayable_terminal_evidence() {
         let root = TempProject::new("native-provider-agent-edit-validation");
