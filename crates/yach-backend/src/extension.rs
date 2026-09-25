@@ -348,7 +348,7 @@ pub enum ExtensionHostClientMessage {
     #[serde(rename = "review.assess")]
     ReviewAssess {
         request_id: String,
-        /// Serialized review request (schema yach.review-request.v1),
+        /// Serialized review request (schema yach.review-request.v2),
         /// already bounded to 64 KiB by core.
         request: serde_json::Value,
     },
@@ -4566,7 +4566,7 @@ done
         let mut session = ExtensionHostSession::new("acme.review", transport, 16 * 1024);
         let result = session.review(
             "review-1",
-            serde_json::json!({"schema": "yach.review-request.v1"}),
+            serde_json::json!({"schema": "yach.review-request.v2"}),
             Duration::from_secs(1),
             &DenyExtensionResources,
         );
@@ -4588,7 +4588,7 @@ done
         let mut session = ExtensionHostSession::new("acme.review", transport, 16 * 1024);
         let result = session.review(
             "review-1",
-            serde_json::json!({"schema": "yach.review-request.v1"}),
+            serde_json::json!({"schema": "yach.review-request.v2"}),
             Duration::from_secs(1),
             &DenyExtensionResources,
         );

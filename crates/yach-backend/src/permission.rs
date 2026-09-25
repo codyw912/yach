@@ -615,10 +615,10 @@ fn selected_restriction<'a>(
     )
 }
 
-fn strongest_by<'a>(
-    restrictions: &'a [ReviewRestriction],
+fn strongest_by(
+    restrictions: &[ReviewRestriction],
     matches: impl Fn(&ReviewRestriction) -> bool,
-) -> Option<&'a ReviewRestriction> {
+) -> Option<&ReviewRestriction> {
     let mut selected: Option<&ReviewRestriction> = None;
     for restriction in restrictions {
         if !matches(restriction) {

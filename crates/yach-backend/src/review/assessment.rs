@@ -118,6 +118,7 @@ impl ReviewAssessment {
     pub fn signal(&self, signal: super::signals::ReviewSignal) -> f64 {
         self.signals.get(signal.id()).copied().unwrap_or(1.0)
     }
+
     pub fn authorization_answer(&self) -> Result<AuthorizationAnswer, AssessmentValidationError> {
         match self.authorization.as_str() {
             "exact_authorized" => Ok(AuthorizationAnswer::ExactAuthorized),

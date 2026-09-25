@@ -93,10 +93,12 @@ host-access warning because commands are not sandboxed and may access files,
 credentials, networks, and processes outside the project. `full-access` lasts
 only for the current session, is never persisted, and resets on restart or
 session switch. Direct `/approval full-access` opens the same warning rather
-than bypassing it. `auto-review` delegates approval to a reviewer extension
-(e.g. Jev) that assesses each request against durable user restrictions and
-evidence; it is not a sandbox — the extension host runs with the agent's
-privileges. `auto-review` is session-only like `full-access`, never persisted,
+`auto-review` delegates approval to a reviewer extension
+(e.g. Jev) that assesses each request's hazards and scope against your recent
+messages; user restrictions are enforced by Yach, not the reviewer. The
+reviewer sees your recent user messages plus the action being requested; it is
+not a sandbox — the extension host runs with the agent's privileges.
+`auto-review` is session-only like `full-access`, never persisted,
 and resets on restart. The picker works during active turns; a change affects
 future tool requests without changing a pending review. The active mode stays
 visible in the status bar and `/status`. `/help` lists commands; useful

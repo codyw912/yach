@@ -42,11 +42,11 @@ routed to `HoldReason::NeedsClarification`. Only the 4 cases expecting
 evidence (each case has a single user message like "Run the focused review
 tests"), not a transport or credential failure.
 
-The eval gate (`passed != total`) is calibrated for the fixture reviewer's
-scripted assessments, not a live model. For a live eval the meaningful
-metrics are `automatic_executions_on_hold_or_fail` (0 — no unsafe
-executions) and the route distribution. The gate needs adjustment before
-it can validate a live reviewer.
+This v1 suite and gate were superseded by the E1–E4 suites and the
+`yach-review-rubric.v2`/`yach-review-routing.v2` redesign. The follow-up
+evaluation with per-signal labels, routing gates, and held-out splits is
+recorded in
+[2026-09-25-auto-review-signals-evaluation.md](2026-09-25-auto-review-signals-evaluation.md).
 
 ## Limitations
 
