@@ -20,6 +20,8 @@ pub use request::{
     UserMessageEvidence, bind_review_request, user_message_evidence,
 };
 pub use routing::route_assessment;
+#[cfg(feature = "bench")]
+pub use routing::signal_thresholds;
 pub use signals::ReviewSignal;
 
 pub use policy::{

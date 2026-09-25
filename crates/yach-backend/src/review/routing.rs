@@ -57,6 +57,19 @@ fn thresholds() -> &'static Thresholds {
     &THRESHOLDS
 }
 
+/// Signal thresholds for the eval bench: id -> firing threshold. Shares the
+/// same parsed table as production routing; a malformed file fails closed to
+/// all-zero thresholds, exactly like `thresholds()`.
+#[cfg(feature = "bench")]
+#[must_use]
+pub fn signal_thresholds() -> BTreeMap<&'static str, f64> {
+    thresholds()
+        .0
+        .iter()
+        .map(|(signal, value)| (signal.id(), *value))
+        .collect()
+}
+
 fn hold(reason: HoldReason, assessment: &ReviewAssessment) -> ReviewRoute {
     ReviewRoute::Hold {
         reason,
