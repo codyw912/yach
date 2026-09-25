@@ -2,9 +2,11 @@
 
 Date: 2026-09-25
 Reviewer: fixture (E1), live TypeSafe Jev (E2–E4)
-Reports: [`2026-09-25-auto-review-signals-evaluation/`](2026-09-25-auto-review-signals-evaluation/)
-(e1.json, e2-dev.json 703 KB, e2-held-out.json 363 KB, e3.json 233 KB,
-e3-held-out.json 93 KB, e4.json 111 KB)
+Reports: `codyw912/yach-evals` at commit
+`21135bf501f97f2de470a26eb5079b500da04378`, directory
+`auto-review/2026-09-25-signals-v2/`. Files: e1.json, e2-dev.json (703 KB),
+e2-held-out.json (363 KB), e3.json (233 KB), e3-held-out.json (93 KB),
+e4.json (111 KB). The directory's `SHA256SUMS` lists their checksums.
 Follows: [Jev category rubric probe](2026-09-24-jev-category-rubric-probe.md),
 supersedes the v1 gate in
 [2026-09-22-auto-review-evaluation.md](2026-09-22-auto-review-evaluation.md).
@@ -19,9 +21,13 @@ supersedes the v1 gate in
   (`crates/yach-backend/src/review/routing.toml`) — every signal threshold is
   0.5 (install, activation, publish, disclosure, delete, irreversible_loss,
   privilege, remote_code, opaque_effect, origin_confusion, scope_conflict).
-- Corpus revision: commit `e434db35a69ddcd06f070260c01f0081dd733c2e`
-  ("Task 9: E2 signal suite and E4 adversarial seeds"), the last change under
-  `evals/` before this record (`jj log -r 'latest(::@ & files("evals"))'`).
+- Corpus revision for the live suites (E2–E4): jj change `nxqwpqrn`,
+  published commit `5f8c3fd6075779d9135dd6bed4b55952ec8a36ca`. That is Task 10,
+  whose only corpus edit was the `e3/truncated-build-log.json` expected
+  reason; the other E2–E4 cases are as authored in Task 9 (`utnxvwwz`,
+  `31bc50c5`). The E2–E4 corpora are unchanged at PR head `a4e248af`.
+- E1 (23 cases) ran on the final-fixes change `ktnkumyp`, published commit
+  `a4e248af3a40f0c72529f4912a7ea0c41169d859`.
 
 ## Method
 
@@ -164,7 +170,8 @@ met:
   `opaque_effect` firing (0.50–0.53 vs threshold 0.5). It is recorded as a
   result — thresholds, labels, and routing are unchanged.
 - Single model version (`jev-1.13.0`); run-to-run spread is small (≤ 0.10).
-- Reports embed full assessments per run; `e2-dev.json` is ~703 KB.
+- Reports embed the full assessment for every run (`e2-dev.json` is ~703 KB),
+  so they live in `yach-evals` rather than this repository.
 
 ## Corrections
 
