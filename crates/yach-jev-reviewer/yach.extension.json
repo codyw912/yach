@@ -1,0 +1,19 @@
+{
+  "schema": "yach.extension.v1",
+  "id": "yach.jev-reviewer",
+  "version": "0.1.0",
+  "main": {
+    "command": "yach",
+    "args": ["__extension-host", "jev"]
+  },
+  "activation": {
+    "events": ["postFirstPaint"]
+  },
+  "contributes": {
+    "reviewer": {
+      "reviewer_id": "jev-typesafe",
+      "disclosure_summary": "Recent user messages and the proposed action are sent to the configured TypeSafe endpoint for assessment.",
+      "remote": true
+    }
+  }
+}

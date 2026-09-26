@@ -1191,6 +1191,9 @@ pub enum ToolExecutionError {
     PermissionDenied,
     UnsupportedTool,
     MalformedResult,
+    /// Policy, authorization, or reviewer generation changed between preview
+    /// and apply. The provider should request a fresh preview.
+    StaleAuthorization,
     ExtensionHost {
         error: crate::ExtensionHostProtocolError,
     },
@@ -2723,6 +2726,7 @@ fn tool_execution_error_label(error: &ToolExecutionError) -> &'static str {
         ToolExecutionError::PermissionDenied => "permission_denied",
         ToolExecutionError::UnsupportedTool => "unsupported_tool",
         ToolExecutionError::MalformedResult => "malformed_result",
+        ToolExecutionError::StaleAuthorization => "stale_authorization",
         ToolExecutionError::ExtensionHost { error } => extension_host_error_label(error),
         ToolExecutionError::ResourceReadTooLarge => "resource_read_too_large",
         ToolExecutionError::ResourceReadNotUtf8 => "resource_read_not_utf8",
@@ -2759,6 +2763,12 @@ fn extension_host_error_label(error: &crate::ExtensionHostProtocolError) -> &'st
         }
         crate::ExtensionHostProtocolError::ToolRiskMismatch { .. } => {
             "extension_host_tool_risk_mismatch"
+        }
+        crate::ExtensionHostProtocolError::ReviewerContractMismatch => {
+            "extension_host_reviewer_contract_mismatch"
+        }
+        crate::ExtensionHostProtocolError::MissingReviewReady => {
+            "extension_host_missing_review_ready"
         }
     }
 }

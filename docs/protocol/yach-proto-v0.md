@@ -32,6 +32,20 @@ Important characteristics:
 - transport messages include explicit direction
 - transport metadata carries request/stream correlation fields
 
+
+The `auto_review` capability gates automatic-review mode and reviewer status events. Both peers
+must advertise it before a client selects `ApprovalMode::AutoReview` (wire value `auto-review`).
+The capability list is forward-tolerant when decoded by current binaries: recognized entries are
+kept in their original order (including duplicates), while unknown entries are dropped.
+
+Compatibility within protocol version `0.3.0` is asymmetric:
+
+| Client | Backend | Result |
+| --- | --- | --- |
+| Legacy (no `auto_review`) | Current | Supported; negotiation omits `auto_review` and review remains manual |
+| Current | Legacy strict decoder | Unsupported; the old backend rejects the new client's unknown `auto_review` capability |
+| Current | Current | Supported; automatic review is available only when negotiation includes `auto_review` |
+
 This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without exposing Pi RPC details directly to the UI.
 
 ## Currently modeled client events
@@ -78,6 +92,7 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - title changed
 - extension lifecycle finished (`extension_lifecycle_finished`)
 - extension diagnostic snapshot updated (`extension_diagnostic_snapshot_updated`)
+- reviewer status changed (`reviewer_status_changed`)
 
 
 ## Structured tool review
@@ -90,6 +105,21 @@ that payload. After durably recording the decision or interruption, the backend 
 than issuing an actionable review when the capability was not negotiated. `ToolCallFinished`
 replaces the same transcript row with its terminal output and may include a structured
 `HarnessOutcomeKind` plus `ToolResultMetadata` (`byte_count`, `truncated`, and optional reason).
+
+`CommandReviewSummary` and `LocalEditPreviewSummary` optionally carry `review_origin`. An omitted
+field (or `null` when decoding) means the ordinary user-ask path. `risk` means the automatic
+reviewer flagged risk or a standing `ask_first` restriction applies, `reviewer_error` means review
+was unavailable and fell back to a person, and `human_performs` is reserved for actions only the
+user may perform — backends hand those off without emitting a review row, so clients should not
+expect to render it. Serializers omit the field for the ordinary user-ask path so older clients
+continue to decode review payloads.
+
+When `auto_review` is negotiated, `ReviewerStatusChanged` reports `reviewer_id`, monotonically
+ordered `generation`, `state` (`selected`, `unavailable`, or `reloaded`), and
+`disclosure_summary` (bounded text from the reviewer manifest describing what the reviewer sees).
+The backend does not yet emit this event; clients that receive it must use generation order rather
+than arrival text to reject stale status. No reviewer status event is emitted unless `auto_review`
+was negotiated.
 
 ## Extension lifecycle and diagnostics
 

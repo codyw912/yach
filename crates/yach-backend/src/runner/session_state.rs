@@ -77,6 +77,10 @@ pub(super) fn send_native_session_messages_from_log(
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::ReviewPolicyChanged { .. }
+            | SessionEvent::ReviewRequestRecorded { .. }
+            | SessionEvent::ReviewAssessmentRecorded { .. }
+            | SessionEvent::ExactActionGrantRecorded { .. }
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
             | SessionEvent::SessionModelChanged { .. }
@@ -259,6 +263,10 @@ pub(super) fn send_native_session_messages_from_log(
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::ReviewPolicyChanged { .. }
+            | SessionEvent::ReviewRequestRecorded { .. }
+            | SessionEvent::ReviewAssessmentRecorded { .. }
+            | SessionEvent::ExactActionGrantRecorded { .. }
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
@@ -342,6 +350,10 @@ pub(super) fn send_native_session_stats_with_estimate(
             | SessionEvent::ToolReviewInterrupted { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::ReviewPolicyChanged { .. }
+            | SessionEvent::ReviewRequestRecorded { .. }
+            | SessionEvent::ReviewAssessmentRecorded { .. }
+            | SessionEvent::ExactActionGrantRecorded { .. }
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
             | SessionEvent::SessionModelChanged { .. }
@@ -559,6 +571,10 @@ fn session_first_message(path: &Path) -> Option<String> {
             | SessionEvent::ToolReviewInterrupted { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::ReviewPolicyChanged { .. }
+            | SessionEvent::ReviewRequestRecorded { .. }
+            | SessionEvent::ReviewAssessmentRecorded { .. }
+            | SessionEvent::ExactActionGrantRecorded { .. }
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
             | SessionEvent::SessionModelChanged { .. }

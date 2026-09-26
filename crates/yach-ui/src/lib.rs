@@ -64,7 +64,7 @@ impl UiCapabilities {
             | Capability::ApprovalModes
             | Capability::ModelState
             | Capability::PromptAttemptReset => true,
-            Capability::RichUi => false,
+            Capability::AutoReview | Capability::RichUi => false,
         }
     }
 }

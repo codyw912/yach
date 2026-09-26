@@ -1,0 +1,16 @@
+schema = "yach-review-routing.v2"
+
+# One threshold per reviewer signal; a signal at or above its threshold fires.
+# Values are provisional and frozen with model + rubric + corpus revisions.
+[signals]
+install = 0.5
+activation = 0.5
+publish = 0.5
+disclosure = 0.5
+delete = 0.5
+irreversible_loss = 0.5
+privilege = 0.5
+remote_code = 0.5
+opaque_effect = 0.5
+origin_confusion = 0.5
+scope_conflict = 0.5

@@ -26,6 +26,10 @@ pub struct EditAccessContext {
     pub permission_policy: PermissionPolicy,
     pub edit_policy: EditPolicy,
     pub tool_request_id: Option<ToolRequestId>,
+    /// Live user review restrictions applied to the permission decision.
+    pub review_policy: crate::ReviewPolicy,
+    /// Authorization revision captured at prepare time for staleness checks.
+    pub authorization_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +38,9 @@ pub enum EditAccessReviewState {
     Allowed,
     NeedsUserApproval,
     AutoReviewUnavailable,
+    /// A `human_performs` restriction matched: never an approvable row; the
+    /// action is handed off to the user outside the agent.
+    HumanPerforms,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,12 +57,17 @@ pub struct EditPreview {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditAccessError {
-    PermissionDenied { reason: String },
+    PermissionDenied {
+        reason: String,
+    },
     Preview(EditError),
     Apply(EditError),
     PreviewNotFound,
     DecisionMismatch,
     EvidencePersistFailed,
+    /// Policy, authorization, or reviewer generation changed between preview
+    /// and apply. The pending preview is retained; a fresh preview is needed.
+    StaleAuthorization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,11 +103,75 @@ struct PendingEditPreview {
     prepared: PreparedEditTransaction,
     permission_decision_id: PermissionDecisionId,
     permission_summary: PermissionDecisionSummary,
+    /// Stable fingerprint of the exact action (operations + preconditions)
+    /// for exact-action grant matching.
+    #[expect(dead_code)]
+    action_fingerprint: String,
+    /// Policy revision at prepare time; apply revalidates against current.
+    policy_revision: crate::PolicyRevision,
+    /// Authorization revision at prepare time.
+    authorization_revision: u64,
+    /// Reviewer generation at prepare time.
+    reviewer_generation: u64,
+    /// Exact-action grant id when the preview was approved through one.
+    /// Populated when the grant store lands; apply revalidates it then.
+    #[expect(dead_code)]
+    grant_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
 pub struct EditAccess {
     pending: BTreeMap<String, PendingEditPreview>,
+}
+
+impl EditAccess {
+    /// Bounded review action for a pending preview. Returns `None` when the
+    /// preview id is unknown — the coordinator treats that as unavailable.
+    #[must_use]
+    pub fn review_action_for_preview(
+        &self,
+        preview_id: &EditPreviewId,
+    ) -> Option<crate::ReviewAction> {
+        let pending = self.pending.get(&preview_id.0)?;
+        let operations = pending
+            .prepared
+            .operations
+            .iter()
+            .map(|operation| match operation {
+                crate::PreparedEditOperation::ModifyTextFile {
+                    relative_path,
+                    before_sha256,
+                    ..
+                } => crate::ReviewEditOperation::ModifyTextFile {
+                    path: relative_path.clone(),
+                    expected_sha256: before_sha256.clone(),
+                },
+                crate::PreparedEditOperation::CreateTextFile { relative_path, .. } => {
+                    crate::ReviewEditOperation::CreateTextFile {
+                        path: relative_path.clone(),
+                    }
+                }
+            })
+            .collect();
+        Some(crate::ReviewAction::EditTransaction {
+            operations,
+            preconditions: Vec::new(),
+        })
+    }
+
+    /// Bind the reviewer generation that will judge this preview. Called by the
+    /// coordinator path immediately before review; manual review leaves it 0.
+    pub fn rebind_reviewer_generation(
+        &mut self,
+        preview_id: &EditPreviewId,
+        generation: u64,
+    ) -> bool {
+        let Some(pending) = self.pending.get_mut(&preview_id.0) else {
+            return false;
+        };
+        pending.reviewer_generation = generation;
+        true
+    }
 }
 
 impl EditAccess {
@@ -124,9 +200,13 @@ impl EditAccess {
         log: &mut SessionLog,
     ) -> Result<EditAccessPrepareOutcome, Box<EditAccessPrepareError>> {
         let permission_request = permission_request_from_edit(&request);
-        let decision =
-            PermissionDecisionEngine::decide(&permission_request, &context.permission_policy);
-        let permission_summary = decision.summary(&permission_request, false);
+        let decision = PermissionDecisionEngine::decide(
+            &permission_request,
+            &context.permission_policy,
+            &context.review_policy,
+        );
+        let mut permission_summary = decision.summary(&permission_request, false);
+        permission_summary.authorization_revision = context.authorization_revision;
         log.record_permission_decision(
             context.session_id.clone(),
             context.turn_id.clone(),
@@ -137,7 +217,13 @@ impl EditAccess {
         let review_state = match &decision {
             PermissionDecision::Allowed { .. } => EditAccessReviewState::Allowed,
             PermissionDecision::NeedsUserReview { reason, .. }
-                if reason == "auto_review_unavailable_fallback_ask" =>
+                if reason == crate::RESTRICTION_HUMAN_PERFORMS_REASON =>
+            {
+                EditAccessReviewState::HumanPerforms
+            }
+            PermissionDecision::NeedsUserReview { reason, .. }
+                if reason == "route_to_reviewer"
+                    || reason == "auto_review_unavailable_fallback_ask" =>
             {
                 EditAccessReviewState::AutoReviewUnavailable
             }
@@ -200,6 +286,7 @@ impl EditAccess {
             diff_summary_truncated: prepared.diff_summary_truncated,
             diff_summary_bytes: prepared.diff_summary_bytes,
         };
+        let action_fingerprint = edit_action_fingerprint(&prepared);
         self.pending.insert(
             preview_id.0.clone(),
             PendingEditPreview {
@@ -207,7 +294,12 @@ impl EditAccess {
                 root: root.clone(),
                 prepared,
                 permission_decision_id: preview.permission_decision_id.clone(),
-                permission_summary,
+                permission_summary: permission_summary.clone(),
+                action_fingerprint,
+                policy_revision: permission_summary.policy_revision,
+                authorization_revision: permission_summary.authorization_revision,
+                reviewer_generation: 0,
+                grant_id: None,
             },
         );
         Ok(EditAccessPrepareOutcome {
@@ -236,12 +328,13 @@ impl EditAccess {
             return Err(EditAccessError::DecisionMismatch);
         }
 
-        record_user_permission_override(
+        record_permission_override(
             log,
             &pending.context,
             &pending.permission_summary,
             PermissionDecisionOutcome::Allowed,
             "user_approved",
+            true,
         );
         let transaction_id = pending.prepared.transaction_id.clone();
         match EditEngine::apply(
@@ -282,6 +375,20 @@ impl EditAccess {
         decision_id: &PermissionDecisionId,
         sink: &impl SessionEventSink,
     ) -> Result<(EditApplyResult, bool), EditAccessError> {
+        self.apply_with_evidence_sink_and_freshness(preview_id, decision_id, sink, None)
+    }
+
+    /// Apply with freshness revalidation. `current` carries the live policy
+    /// revision, authorization revision, and reviewer generation; a mismatch
+    /// against the values captured at prepare time means the authorization
+    /// context changed and the preview is stale.
+    pub fn apply_with_evidence_sink_and_freshness(
+        &mut self,
+        preview_id: &EditPreviewId,
+        decision_id: &PermissionDecisionId,
+        sink: &impl SessionEventSink,
+        current: Option<crate::ReviewFreshness>,
+    ) -> Result<(EditApplyResult, bool), EditAccessError> {
         let pending = self
             .pending
             .remove(&preview_id.0)
@@ -290,15 +397,25 @@ impl EditAccess {
             self.pending.insert(preview_id.0.clone(), pending);
             return Err(EditAccessError::DecisionMismatch);
         }
+        if let Some(current) = current {
+            let stale = pending.policy_revision != current.policy_revision
+                || pending.authorization_revision != current.authorization_revision
+                || pending.reviewer_generation != current.reviewer_generation;
+            if stale {
+                self.pending.insert(preview_id.0.clone(), pending);
+                return Err(EditAccessError::StaleAuthorization);
+            }
+        }
 
         let transaction_id = pending.prepared.transaction_id.clone();
         let mut write_ahead_log = SessionLog::default();
-        record_user_permission_override(
+        record_permission_override(
             &mut write_ahead_log,
             &pending.context,
             &pending.permission_summary,
             PermissionDecisionOutcome::Allowed,
             "user_approved",
+            true,
         );
         write_ahead_log.push(SessionEvent::EditTransactionFinished {
             session_id: pending.context.session_id.clone(),
@@ -354,6 +471,20 @@ impl EditAccess {
         decision_id: &PermissionDecisionId,
         log: &mut SessionLog,
     ) -> Result<(), EditAccessError> {
+        self.reject_with_reason(preview_id, decision_id, "user_rejected", true, log)
+    }
+
+    /// Reject a pending preview recording `reason` instead of a user
+    /// rejection. `user_override` is false when no user decision happened
+    /// (e.g. a `human_performs` restriction handoff).
+    pub fn reject_with_reason(
+        &mut self,
+        preview_id: &EditPreviewId,
+        decision_id: &PermissionDecisionId,
+        reason: &str,
+        user_override: bool,
+        log: &mut SessionLog,
+    ) -> Result<(), EditAccessError> {
         let pending = self
             .pending
             .remove(&preview_id.0)
@@ -363,12 +494,13 @@ impl EditAccess {
             return Err(EditAccessError::DecisionMismatch);
         }
 
-        record_user_permission_override(
+        record_permission_override(
             log,
             &pending.context,
             &pending.permission_summary,
             PermissionDecisionOutcome::Denied,
-            "user_rejected",
+            reason,
+            user_override,
         );
         log.push(SessionEvent::EditTransactionFinished {
             session_id: pending.context.session_id.clone(),
@@ -376,7 +508,7 @@ impl EditAccess {
             tool_request_id: pending.context.tool_request_id.clone(),
             transaction_id: Some(pending.prepared.transaction_id.clone()),
             outcome: EditEvidenceOutcome::Failed,
-            reason: Some(String::from("user_rejected")),
+            reason: Some(String::from(reason)),
             summary: Some(edit_prepared_evidence_summary(&pending.prepared)),
         });
         Ok(())
@@ -388,12 +520,13 @@ impl EditAccess {
     }
 }
 
-fn record_user_permission_override(
+fn record_permission_override(
     log: &mut SessionLog,
     context: &EditAccessContext,
     summary: &PermissionDecisionSummary,
     outcome: PermissionDecisionOutcome,
     reason: &str,
+    user_override: bool,
 ) {
     if summary.outcome != PermissionDecisionOutcome::NeedsUserReview {
         return;
@@ -401,7 +534,7 @@ fn record_user_permission_override(
     let mut summary = summary.clone();
     summary.outcome = outcome;
     reason.clone_into(&mut summary.reason);
-    summary.user_override = true;
+    summary.user_override = user_override;
     summary.rationale = None;
     log.record_permission_decision(context.session_id.clone(), context.turn_id.clone(), summary);
 }
@@ -437,6 +570,7 @@ fn permission_request_from_edit(request: &EditTransactionRequest) -> PermissionR
         },
         risk: PermissionRisk::WorkspaceWrite,
         requested_reviewer: None,
+        command: None,
     }
 }
 
@@ -482,6 +616,39 @@ fn next_edit_preview_id() -> String {
 fn next_edit_permission_request_id() -> String {
     let next = EDIT_PERMISSION_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("edit-permission-request-{next}")
+}
+
+/// Stable fingerprint of the exact action for grant matching. Hashes the
+/// operation kind, path, and content hashes — not the transaction id, which
+/// is fresh per preview.
+fn edit_action_fingerprint(prepared: &crate::PreparedEditTransaction) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for operation in &prepared.operations {
+        match operation {
+            crate::PreparedEditOperation::ModifyTextFile {
+                relative_path,
+                before_sha256,
+                after_sha256,
+                ..
+            } => {
+                "modify".hash(&mut hasher);
+                relative_path.hash(&mut hasher);
+                before_sha256.hash(&mut hasher);
+                after_sha256.hash(&mut hasher);
+            }
+            crate::PreparedEditOperation::CreateTextFile {
+                relative_path,
+                after_sha256,
+                ..
+            } => {
+                "create".hash(&mut hasher);
+                relative_path.hash(&mut hasher);
+                after_sha256.hash(&mut hasher);
+            }
+        }
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 #[cfg(test)]
@@ -530,6 +697,8 @@ mod tests {
             permission_policy: PermissionPolicy::for_edit_mode(mode),
             edit_policy: EditPolicy::test(),
             tool_request_id: None,
+            review_policy: crate::ReviewPolicy::empty(),
+            authorization_revision: 0,
         }
     }
 
@@ -848,6 +1017,7 @@ mod tests {
         let decision = crate::PermissionDecisionEngine::decide(
             &permission_request,
             &PermissionPolicy::for_edit_mode(PermissionMode::Ask),
+            &crate::ReviewPolicy::empty(),
         );
 
         let crate::PermissionDecision::NeedsUserReview { prompt, .. } = decision else {
@@ -884,6 +1054,7 @@ mod tests {
             let decision = crate::PermissionDecisionEngine::decide(
                 &permission_request,
                 &PermissionPolicy::for_edit_mode(PermissionMode::Ask),
+                &crate::ReviewPolicy::empty(),
             );
 
             let crate::PermissionDecision::NeedsUserReview { prompt, .. } = decision else {
@@ -990,5 +1161,165 @@ mod tests {
                 .as_deref(),
             Some("hello\n")
         );
+    }
+
+    #[test]
+    fn prepare_applies_user_restrictions_to_agent_edits() {
+        let project = TempProject::new("restriction-edit");
+        write_file(&project, "file.txt", "hello\n");
+        let Some(root) = resource_root(&project) else {
+            return;
+        };
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
+        let mut context = context(PermissionMode::Allow);
+        context.review_policy = crate::ReviewPolicy {
+            revision: crate::PolicyRevision(3),
+            global: vec![crate::ReviewRestriction::AskFirst {
+                matcher: crate::RestrictionMatcher::PathPrefix {
+                    prefix: String::from("file.txt"),
+                },
+                note: String::from("ask before touching file.txt"),
+            }],
+            project: Vec::new(),
+        };
+        let outcome = access.prepare_with_diagnostics(&root, modify_request(), context, &mut log);
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else { return };
+        assert_eq!(
+            outcome.preview.review_state,
+            EditAccessReviewState::NeedsUserApproval
+        );
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::PermissionDecisionRecorded { summary, .. }
+                if summary.reason == "restriction_ask_first"
+                    && summary.policy_revision == crate::PolicyRevision(3)
+        )));
+    }
+
+    #[test]
+    fn prepare_maps_human_performs_restriction_to_handoff_state() {
+        let project = TempProject::new("human-performs-edit");
+        write_file(&project, "file.txt", "hello\n");
+        let Some(root) = resource_root(&project) else {
+            return;
+        };
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
+        let mut context = context(PermissionMode::Allow);
+        context.review_policy = crate::ReviewPolicy {
+            revision: crate::PolicyRevision(5),
+            global: vec![crate::ReviewRestriction::HumanPerforms {
+                matcher: crate::RestrictionMatcher::PathPrefix {
+                    prefix: String::from("file.txt"),
+                },
+                note: String::from("the user edits file.txt"),
+            }],
+            project: Vec::new(),
+        };
+        let outcome = access.prepare_with_diagnostics(&root, modify_request(), context, &mut log);
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else { return };
+        assert_eq!(
+            outcome.preview.review_state,
+            EditAccessReviewState::HumanPerforms
+        );
+        assert!(log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::PermissionDecisionRecorded { summary, .. }
+                if summary.reason == crate::RESTRICTION_HUMAN_PERFORMS_REASON
+        )));
+
+        // The handoff rejection records the restriction reason, not a user
+        // rejection, and is not a user override.
+        let mut reject_log = SessionLog::default();
+        assert!(
+            access
+                .reject_with_reason(
+                    &outcome.preview.preview_id,
+                    &outcome.preview.permission_decision_id,
+                    crate::RESTRICTION_HUMAN_PERFORMS_REASON,
+                    false,
+                    &mut reject_log,
+                )
+                .is_ok()
+        );
+        assert!(reject_log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::PermissionDecisionRecorded { summary, .. }
+                if summary.reason == crate::RESTRICTION_HUMAN_PERFORMS_REASON
+                    && summary.outcome == PermissionDecisionOutcome::Denied
+                    && !summary.user_override
+        )));
+        assert!(reject_log.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::EditTransactionFinished { reason, .. }
+                if reason.as_deref() == Some(crate::RESTRICTION_HUMAN_PERFORMS_REASON)
+        )));
+    }
+
+    #[test]
+    fn pending_preview_binds_live_revisions_and_rebinds_generation() {
+        let project = TempProject::new("freshness-binding");
+        write_file(&project, "file.txt", "hello\n");
+        let Some(root) = resource_root(&project) else {
+            return;
+        };
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
+        let mut context = context(PermissionMode::Ask);
+        context.authorization_revision = 4;
+        let preview = access.prepare(&root, modify_request(), context, &mut log);
+        assert!(preview.is_ok());
+        let Ok(preview) = preview else { return };
+        assert!(access.rebind_reviewer_generation(&preview.preview_id, 2));
+        let fresh = crate::ReviewFreshness {
+            policy_revision: crate::PolicyRevision(0),
+            authorization_revision: 4,
+            reviewer_generation: 2,
+        };
+        let store = crate::JsonlSessionStore::new(project.root().join("session.jsonl"));
+        let applied = access.apply_with_evidence_sink_and_freshness(
+            &preview.preview_id,
+            &preview.permission_decision_id,
+            &store,
+            Some(fresh),
+        );
+        assert!(
+            applied.is_ok(),
+            "matching live revisions apply: {applied:?}"
+        );
+    }
+
+    #[test]
+    fn pending_preview_is_stale_after_a_new_user_message() {
+        let project = TempProject::new("freshness-stale");
+        write_file(&project, "file.txt", "hello\n");
+        let Some(root) = resource_root(&project) else {
+            return;
+        };
+        let mut access = EditAccess::default();
+        let mut log = SessionLog::default();
+        let mut context = context(PermissionMode::Ask);
+        context.authorization_revision = 4;
+        let preview = access.prepare(&root, modify_request(), context, &mut log);
+        let Ok(preview) = preview else {
+            unreachable!("prepare succeeds")
+        };
+        let _ = access.rebind_reviewer_generation(&preview.preview_id, 2);
+        let moved = crate::ReviewFreshness {
+            policy_revision: crate::PolicyRevision(0),
+            authorization_revision: 5,
+            reviewer_generation: 2,
+        };
+        let store = crate::JsonlSessionStore::new(project.root().join("session.jsonl"));
+        let applied = access.apply_with_evidence_sink_and_freshness(
+            &preview.preview_id,
+            &preview.permission_decision_id,
+            &store,
+            Some(moved),
+        );
+        assert!(matches!(applied, Err(EditAccessError::StaleAuthorization)));
     }
 }

@@ -1467,6 +1467,7 @@ mod tests {
                     review_state: LocalEditReviewState::NeedsUserApproval,
                     diff_summary: String::from("-old\n+new"),
                     diff_summary_truncated: false,
+                    review_origin: None,
                 },
             },
         );
@@ -1523,6 +1524,7 @@ mod tests {
                     command: String::from("cargo test"),
                     workdir: Some(String::from("/workspace")),
                     timeout_ms: 30_000,
+                    review_origin: None,
                 },
             },
         );
@@ -1557,6 +1559,7 @@ mod tests {
                     command: String::from("cargo test"),
                     workdir: None,
                     timeout_ms: 30_000,
+                    review_origin: None,
                 },
             },
         );
@@ -1588,6 +1591,7 @@ mod tests {
                     review_state: LocalEditReviewState::NeedsUserApproval,
                     diff_summary: String::from("+ added"),
                     diff_summary_truncated: false,
+                    review_origin: None,
                 },
             },
         );
@@ -1615,6 +1619,7 @@ mod tests {
                     command: String::from("cargo test"),
                     workdir: None,
                     timeout_ms: 30_000,
+                    review_origin: None,
                 },
             },
             resolution: ToolReviewResolution::Approved,

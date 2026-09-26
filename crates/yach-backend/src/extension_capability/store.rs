@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     ExtensionCapability, ExtensionCapabilityGrant, requested_capabilities, utc_timestamp_now,
 };
-use crate::extension::ExtensionToolContribution;
+use crate::extension::{ExtensionReviewerContribution, ExtensionToolContribution};
 
 const SCHEMA: &str = "yach.extension-authority.v1";
 const GRANT_REASON: &str = "extension_capability_grant";
@@ -139,9 +139,10 @@ impl ExtensionAuthorityStore {
         id: &str,
         version: &str,
         tools: &[ExtensionToolContribution],
+        reviewer: Option<&ExtensionReviewerContribution>,
         surface: ExtensionDecisionSurface,
     ) -> Result<Option<ExtensionCapabilityGrant>, ExtensionAuthorityError> {
-        let approved = requested_capabilities(tools);
+        let approved = requested_capabilities(tools, reviewer);
         if approved.is_empty() {
             let _ = self.document_path(id)?;
             return Ok(None);
@@ -812,8 +813,13 @@ mod tests {
         let home = TestHome::new();
         let store = home.store();
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
-        let granted =
-            store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli);
+        let granted = store.grant_requested(
+            "example.net",
+            "1.0",
+            &tools,
+            None,
+            ExtensionDecisionSurface::Cli,
+        );
         assert!(matches!(granted, Ok(Some(_))));
         assert_eq!(
             store.revoke_grant("example.net", ExtensionDecisionSurface::Cli),
@@ -836,8 +842,13 @@ mod tests {
         let home = TestHome::new();
         let store = home.store();
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
-        let granted =
-            store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli);
+        let granted = store.grant_requested(
+            "example.net",
+            "1.0",
+            &tools,
+            None,
+            ExtensionDecisionSurface::Cli,
+        );
         assert!(matches!(granted, Ok(Some(_))));
         assert_eq!(
             store.revoke_grant("example.net", ExtensionDecisionSurface::Cli),
@@ -860,11 +871,21 @@ mod tests {
         let home = TestHome::new();
         let store = home.store();
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
-        let first =
-            store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli);
+        let first = store.grant_requested(
+            "example.net",
+            "1.0",
+            &tools,
+            None,
+            ExtensionDecisionSurface::Cli,
+        );
         assert!(matches!(first, Ok(Some(_))));
-        let second =
-            store.grant_requested("example.net", "2.0", &tools, ExtensionDecisionSurface::Cli);
+        let second = store.grant_requested(
+            "example.net",
+            "2.0",
+            &tools,
+            None,
+            ExtensionDecisionSurface::Cli,
+        );
         assert!(matches!(second, Ok(Some(_))));
         let doc = home.document("example.net");
         assert_eq!(doc["history"][0]["action"], "grant");
@@ -879,8 +900,13 @@ mod tests {
         let home = TestHome::new();
         let store = home.store();
         let tools = vec![tool("read", ExtensionToolRisk::ReadsLocalContent)];
-        let granted =
-            store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli);
+        let granted = store.grant_requested(
+            "example.net",
+            "1.0",
+            &tools,
+            None,
+            ExtensionDecisionSurface::Cli,
+        );
         assert_eq!(granted, Ok(None));
         assert!(!home.document_path("example.net").exists());
     }
@@ -890,8 +916,13 @@ mod tests {
         let home = TestHome::new();
         let store = home.store();
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
-        let granted =
-            store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli);
+        let granted = store.grant_requested(
+            "example.net",
+            "1.0",
+            &tools,
+            None,
+            ExtensionDecisionSurface::Cli,
+        );
         assert!(matches!(granted, Ok(Some(_))));
         assert_eq!(
             store.revoke_grant("example.net", ExtensionDecisionSurface::Cli),
@@ -917,7 +948,13 @@ mod tests {
         let store = home.store();
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
         assert_eq!(
-            store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli,),
+            store.grant_requested(
+                "example.net",
+                "1.0",
+                &tools,
+                None,
+                ExtensionDecisionSurface::Cli,
+            ),
             Err(ExtensionAuthorityError::InvalidDocument)
         );
         assert_eq!(
@@ -952,7 +989,13 @@ mod tests {
         );
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
         assert_eq!(
-            store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli,),
+            store.grant_requested(
+                "example.net",
+                "1.0",
+                &tools,
+                None,
+                ExtensionDecisionSurface::Cli,
+            ),
             Err(ExtensionAuthorityError::UnsupportedSchema)
         );
         let after = fs::read(home.document_path("example.net"));
@@ -970,7 +1013,13 @@ mod tests {
         let store = home.store();
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
         assert_eq!(
-            store.grant_requested("../keep", "1.0", &tools, ExtensionDecisionSurface::Cli,),
+            store.grant_requested(
+                "../keep",
+                "1.0",
+                &tools,
+                None,
+                ExtensionDecisionSurface::Cli,
+            ),
             Err(ExtensionAuthorityError::InvalidId)
         );
         assert_eq!(
@@ -1010,7 +1059,13 @@ mod tests {
         );
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
         assert_eq!(
-            store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli,),
+            store.grant_requested(
+                "example.net",
+                "1.0",
+                &tools,
+                None,
+                ExtensionDecisionSurface::Cli,
+            ),
             Err(ExtensionAuthorityError::InvalidDocument)
         );
         let after = fs::read(home.document_path("example.net"));
@@ -1102,7 +1157,13 @@ mod tests {
         );
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
         assert_eq!(
-            store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli),
+            store.grant_requested(
+                "example.net",
+                "1.0",
+                &tools,
+                None,
+                ExtensionDecisionSurface::Cli
+            ),
             Err(ExtensionAuthorityError::InvalidDocument)
         );
         let after = fs::read(home.document_path("example.net"));
@@ -1149,7 +1210,13 @@ mod tests {
         );
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
         assert_eq!(
-            store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli),
+            store.grant_requested(
+                "example.net",
+                "1.0",
+                &tools,
+                None,
+                ExtensionDecisionSurface::Cli
+            ),
             Err(ExtensionAuthorityError::InvalidDocument)
         );
         let after = fs::read(home.document_path("example.net"));
@@ -1288,8 +1355,13 @@ mod tests {
         );
         let store = home.store();
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
-        let granted =
-            store.grant_requested("example.net", "2.0", &tools, ExtensionDecisionSurface::Cli);
+        let granted = store.grant_requested(
+            "example.net",
+            "2.0",
+            &tools,
+            None,
+            ExtensionDecisionSurface::Cli,
+        );
         assert!(matches!(granted, Ok(Some(_))));
         let doc = home.document("example.net");
         assert_eq!(doc["schema"], "yach.extension-authority.v1");
@@ -1531,8 +1603,13 @@ mod tests {
         let store = ExtensionAuthorityStore::in_home(Path::new(&home));
         let tools = vec![tool("fetch", ExtensionToolRisk::UsesNetwork)];
         for _ in 0..iters {
-            let granted =
-                store.grant_requested("example.net", "1.0", &tools, ExtensionDecisionSurface::Cli);
+            let granted = store.grant_requested(
+                "example.net",
+                "1.0",
+                &tools,
+                None,
+                ExtensionDecisionSurface::Cli,
+            );
             assert!(granted.is_ok(), "helper grant should commit: {granted:?}");
             let revoked = store.revoke_grant("example.net", ExtensionDecisionSurface::Cli);
             assert!(revoked.is_ok(), "helper revoke should commit: {revoked:?}");

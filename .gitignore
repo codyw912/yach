@@ -41,3 +41,9 @@ result-*
 
 # env files
 .env*
+
+# scratch files
+SCRATCHPAD.md
+
+# ad-hoc eval-review output (reports belong in codyw912/yach-evals)
+/eval-report.json

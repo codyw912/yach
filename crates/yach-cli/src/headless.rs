@@ -53,6 +53,8 @@ pub(crate) struct RunOptions {
     /// Overrides the env-derived model (yacht substitutes `{model}` here).
     pub model: Option<String>,
     pub full_auto: bool,
+    /// Reviewer id for `--auto-review`; mutually exclusive with `--full-auto`.
+    pub auto_review: Option<String>,
     pub turn_timeout: Duration,
     /// `None` writes the outcome document to stdout.
     pub outcome_path: Option<PathBuf>,
@@ -67,6 +69,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
     let mut session_id = None;
     let mut model = None;
     let mut full_auto = false;
+    let mut auto_review = None;
     let mut turn_timeout_secs = DEFAULT_TURN_TIMEOUT_SECS;
     let mut outcome_path = None;
     let mut quiet = false;
@@ -111,6 +114,10 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
                 full_auto = true;
                 index += 1;
             }
+            "--auto-review" => {
+                auto_review = Some(value_of("--auto-review", args, index)?);
+                index += 2;
+            }
             "--turn-timeout-secs" => {
                 let raw = value_of("--turn-timeout-secs", args, index)?;
                 turn_timeout_secs = raw
@@ -140,6 +147,11 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
             "--session and --session-path are mutually exclusive",
         ));
     }
+    if full_auto && auto_review.is_some() {
+        return Err(String::from(
+            "--full-auto and --auto-review are mutually exclusive",
+        ));
+    }
     let prompts = match (prompt, script) {
         (Some(_), Some(_)) => {
             return Err(String::from("--prompt and --script are mutually exclusive"));
@@ -158,6 +170,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
         session_id,
         model,
         full_auto,
+        auto_review,
         turn_timeout: Duration::from_secs(turn_timeout_secs),
         outcome_path,
         quiet,
@@ -623,6 +636,26 @@ async fn drive_turns(
             })
             .collect();
     }
+    if let Some(reviewer_id) = &options.auto_review
+        && let Err(message) = select_auto_review(client_tx, backend_rx, reviewer_id).await
+    {
+        return options
+            .prompts
+            .iter()
+            .enumerate()
+            .map(|(index, prompt)| TurnRun {
+                prompt: prompt.clone(),
+                outcome: if index == 0 {
+                    TurnRunOutcome::Failed
+                } else {
+                    TurnRunOutcome::Skipped
+                },
+                failure_reason: (index == 0).then(|| message.clone()),
+                response: String::new(),
+                duration_ms: 0,
+            })
+            .collect();
+    }
     let mut turns = Vec::new();
     let mut stopped = false;
     for prompt in &options.prompts {
@@ -677,6 +710,53 @@ async fn select_full_access(
                 message,
                 ..
             } => return Err(format!("full-access selection failed: {message}")),
+            _ => {}
+        }
+    }
+}
+
+async fn select_auto_review(
+    client_tx: &mpsc::UnboundedSender<ClientEvent>,
+    backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    reviewer_id: &str,
+) -> Result<(), String> {
+    const REQUEST_ID: u64 = 1;
+    client_tx
+        .send(ClientEvent::ApprovalModeSelected {
+            request_id: REQUEST_ID,
+            mode: ApprovalMode::AutoReview,
+        })
+        .map_err(|_| String::from("backend channel closed before auto-review selection"))?;
+    let deadline = Instant::now() + FULL_ACCESS_SELECTION_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(String::from("timed out selecting auto-review"));
+        }
+        let event = tokio::time::timeout(remaining, backend_rx.recv())
+            .await
+            .map_err(|_| String::from("timed out selecting auto-review"))?
+            .ok_or_else(|| String::from("backend channel closed during auto-review selection"))?;
+        let BackendEvent::Server(event) = event else {
+            continue;
+        };
+        match event {
+            ServerEvent::ApprovalModeChanged {
+                request_id: REQUEST_ID,
+                mode: ApprovalMode::AutoReview,
+            } => return Ok(()),
+            ServerEvent::ApprovalModeChangeFailed {
+                request_id: REQUEST_ID,
+                message,
+                ..
+            } => return Err(format!("auto-review selection failed: {message}")),
+            ServerEvent::ReviewerStatusChanged {
+                reviewer_id: reported,
+                state: yach_proto::ReviewerState::Unavailable,
+                ..
+            } if reported == reviewer_id => {
+                return Err(format!("reviewer '{reviewer_id}' is unavailable"));
+            }
             _ => {}
         }
     }
@@ -796,6 +876,10 @@ async fn drive_one_turn(
                     turn.failure_reason = Some(if options.full_auto {
                         format!(
                             "approval required for tool '{tool_name}' despite backend full-access"
+                        )
+                    } else if options.auto_review.is_some() {
+                        format!(
+                            "approval required for tool '{tool_name}' (reviewer held or unavailable)"
                         )
                     } else {
                         format!("approval required for tool '{tool_name}' (run with --full-auto)")
@@ -1369,6 +1453,7 @@ mod tests {
                 session_id: None,
                 model: None,
                 full_auto: true,
+                auto_review: None,
                 turn_timeout: Duration::from_secs(30),
                 outcome_path: None,
                 quiet: true,
@@ -1442,6 +1527,7 @@ mod tests {
             session_id: None,
             model: None,
             full_auto,
+            auto_review: None,
             turn_timeout: Duration::from_secs(5),
             outcome_path: None,
             quiet: true,
@@ -1564,6 +1650,7 @@ mod tests {
                         command: String::from("rm -rf ."),
                         workdir: None,
                         timeout_ms: 1_000,
+                        review_origin: None,
                     },
                 },
             };
@@ -1615,6 +1702,7 @@ mod tests {
                         command: String::from("cargo test"),
                         workdir: None,
                         timeout_ms: 1_000,
+                        review_origin: None,
                     },
                 },
             };
