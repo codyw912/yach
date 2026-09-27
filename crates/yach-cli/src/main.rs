@@ -43,6 +43,7 @@ use yach_ui::{
     RunTuiOptions, Theme, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
     run_tui_with_trace_and_options,
 };
+mod bundled;
 mod model_discovery_cache;
 mod provider_connections;
 
@@ -4165,141 +4166,6 @@ fn installed_extension_package_roots() -> Vec<ExtensionPackageRoot> {
     extension_package_roots_from_install_records(&installed_extension_records())
 }
 
-#[cfg(not(test))]
-fn bundled_hashline_package_root() -> io::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    let root = home
-        .join(".yach/bundled/yach-hashline")
-        .join(env!("CARGO_PKG_VERSION"));
-    std::fs::create_dir_all(&root)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-
-    let executable = std::env::current_exe()?;
-    let executable = executable.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "yach executable path is not UTF-8",
-        )
-    })?;
-    let mut manifest =
-        serde_json::from_str::<serde_json::Value>(yach_hashline_extension::MANIFEST_JSON)
-            .map_err(io::Error::other)?;
-    manifest["main"]["command"] = serde_json::Value::String(executable.to_owned());
-    manifest["main"]["args"] = serde_json::json!(["__extension-host", "hashline"]);
-    let mut bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
-    bytes.push(b'\n');
-
-    let manifest_path = root.join("yach.extension.json");
-    if std::fs::read(&manifest_path).ok().as_deref() != Some(bytes.as_slice()) {
-        let temp_path = root.join(format!(".yach.extension.json.{}.tmp", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&temp_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temp_path, &manifest_path)?;
-    }
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        &manifest_path,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )?;
-
-    Ok(root)
-}
-
-#[cfg(not(test))]
-fn ensure_bundled_hashline_install_record() -> io::Result<()> {
-    let package_root = bundled_hashline_package_root()?;
-    let path = extension_store_path(ExtensionInstallScope::User)?;
-    let mut store = ExtensionInstallStore::load_from_path(&path)
-        .map_err(|error| extension_install_io_error(&error))?;
-    let before = store.clone();
-    store
-        .install_bundled("yach.hashline", &package_root, ExtensionInstallScope::User)
-        .map_err(|error| extension_install_io_error(&error))?;
-    if store != before {
-        store
-            .save_to_path(&path)
-            .map_err(|error| extension_install_io_error(&error))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(test))]
-fn bundled_jev_package_root() -> io::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    let root = home
-        .join(".yach/bundled/yach-jev-reviewer")
-        .join(env!("CARGO_PKG_VERSION"));
-    std::fs::create_dir_all(&root)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-
-    let executable = std::env::current_exe()?;
-    let executable = executable.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "yach executable path is not UTF-8",
-        )
-    })?;
-    let mut manifest = serde_json::from_str::<serde_json::Value>(yach_jev_reviewer::MANIFEST_JSON)
-        .map_err(io::Error::other)?;
-    manifest["main"]["command"] = serde_json::Value::String(executable.to_owned());
-    manifest["main"]["args"] = serde_json::json!(["__extension-host", "jev"]);
-    let mut bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
-    bytes.push(b'\n');
-
-    let manifest_path = root.join("yach.extension.json");
-    if std::fs::read(&manifest_path).ok().as_deref() != Some(bytes.as_slice()) {
-        let temp_path = root.join(format!(".yach.extension.json.{}.tmp", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&temp_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temp_path, &manifest_path)?;
-    }
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        &manifest_path,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )?;
-
-    Ok(root)
-}
-
-#[cfg(not(test))]
-fn ensure_bundled_jev_install_record() -> io::Result<()> {
-    let package_root = bundled_jev_package_root()?;
-    let path = extension_store_path(ExtensionInstallScope::User)?;
-    let mut store = ExtensionInstallStore::load_from_path(&path)
-        .map_err(|error| extension_install_io_error(&error))?;
-    let before = store.clone();
-    store
-        .install_bundled(
-            "yach.jev-reviewer",
-            &package_root,
-            ExtensionInstallScope::User,
-        )
-        .map_err(|error| extension_install_io_error(&error))?;
-    if store != before {
-        store
-            .save_to_path(&path)
-            .map_err(|error| extension_install_io_error(&error))?;
-    }
-    Ok(())
-}
-
 fn extension_package_roots_from_install_records(
     records: &[ExtensionInstallRecord],
 ) -> Vec<ExtensionPackageRoot> {
@@ -4367,20 +4233,32 @@ fn run_extension_install_command(
 
 fn run_extension_remove_command(selector: &str, scope: ExtensionInstallScope) -> CommandResult {
     let result = (|| {
-        #[cfg(not(test))]
-        ensure_bundled_hashline_install_record()?;
-        #[cfg(not(test))]
-        ensure_bundled_jev_install_record()?;
         let path = extension_store_path(scope)?;
         let mut store = ExtensionInstallStore::load_from_path(&path)
             .map_err(|error| extension_install_io_error(&error))?;
         let resolved_selector = resolve_extension_install_selector(&store, selector);
+        let removed_bundled_source = store
+            .records
+            .iter()
+            .find(|record| {
+                record.kind == ExtensionInstallRefKind::Bundled
+                    && (record.source == resolved_selector
+                        || record.package_root == Path::new(&resolved_selector))
+            })
+            .map(|record| record.source.clone());
         store
             .remove(&resolved_selector)
             .map_err(|error| extension_install_io_error(&error))?;
         store
             .save_to_path(&path)
             .map_err(|error| extension_install_io_error(&error))?;
+        if let Some(source) = removed_bundled_source {
+            let config = yach_backend::UserConfigStore::for_current_user()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            config
+                .persist_bundled_removed(&source, true)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
         Ok(format!("removed {selector}"))
     })();
     extension_management_result(ExtensionManagementAction::Remove, scope, result)
@@ -4398,10 +4276,6 @@ fn run_extension_set_enabled_command(
     };
     let result = (|| {
         let path = extension_store_path(scope)?;
-        #[cfg(not(test))]
-        ensure_bundled_hashline_install_record()?;
-        #[cfg(not(test))]
-        ensure_bundled_jev_install_record()?;
         let mut store = ExtensionInstallStore::load_from_path(&path)
             .map_err(|error| extension_install_io_error(&error))?;
         let resolved_selector = resolve_extension_install_selector(&store, selector);
@@ -4485,7 +4359,6 @@ fn extension_install_error_label(error: &ExtensionInstallError) -> &'static str 
         ExtensionInstallError::StoreIo => "store_io",
         ExtensionInstallError::StoreMalformed => "store_malformed",
         ExtensionInstallError::RecordNotFound { .. } => "record_not_found",
-        ExtensionInstallError::BundledCannotRemove { .. } => "bundled_cannot_remove",
     }
 }
 
@@ -4612,18 +4485,6 @@ fn run_extension_revoke_command(selector: &str) -> CommandResult {
 fn loaded_extension_package_record(
     selector: &str,
 ) -> Result<Option<ExtensionPackageRecord>, String> {
-    #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_hashline_install_record() {
-        return Err(format!(
-            "failed to prepare bundled hashline extension: {error}"
-        ));
-    }
-    #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_jev_install_record() {
-        return Err(format!(
-            "failed to prepare bundled jev reviewer extension: {error}"
-        ));
-    }
     let install_records = loaded_extension_install_records()?;
     let index = ExtensionManifestIndex::from_package_roots(
         extension_package_roots_from_env_and_install_records(&install_records),
@@ -4672,26 +4533,6 @@ fn extension_diagnostics_result(
     command: ExtensionDiagnosticsCommand,
     extension_id: Option<&str>,
 ) -> CommandResult {
-    #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_hashline_install_record() {
-        return CommandResult::ExtensionDiagnostics {
-            command,
-            outcome: ExtensionDiagnosticsOutcome::Failed,
-            records: Vec::new(),
-            message: Some(format!("extension diagnostics failed: {error}")),
-            host_start_count: 0,
-        };
-    }
-    #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_jev_install_record() {
-        return CommandResult::ExtensionDiagnostics {
-            command,
-            outcome: ExtensionDiagnosticsOutcome::Failed,
-            records: Vec::new(),
-            message: Some(format!("extension diagnostics failed: {error}")),
-            host_start_count: 0,
-        };
-    }
     let install_records = match loaded_extension_install_records() {
         Ok(records) => records,
         Err(message) => {
@@ -4746,20 +4587,53 @@ fn extension_diagnostics_result(
 
 fn installed_extension_records() -> Vec<ExtensionInstallRecord> {
     #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_hashline_install_record() {
-        let _ = writeln!(
-            io::stderr(),
-            "warning: failed to prepare bundled hashline extension: {error}"
-        );
-    }
-    #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_jev_install_record() {
-        let _ = writeln!(
-            io::stderr(),
-            "warning: failed to prepare bundled jev reviewer extension: {error}"
-        );
-    }
+    refresh_bundled_install_records();
     loaded_extension_install_records().unwrap_or_default()
+}
+
+#[cfg(not(test))]
+fn refresh_bundled_install_records() {
+    if let Err(error) = refresh_bundled_install_records_inner() {
+        let _ = writeln!(
+            io::stderr(),
+            "warning: failed to refresh bundled extensions: {error}"
+        );
+    }
+}
+
+#[cfg(not(test))]
+fn refresh_bundled_install_records_inner() -> io::Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let path = extension_store_path(ExtensionInstallScope::User)?;
+    let mut store = ExtensionInstallStore::load_from_path(&path)
+        .map_err(|error| extension_install_io_error(&error))?;
+    let bundled_removed = match yach_backend::UserConfigStore::for_current_user() {
+        Ok(config) => match config.load() {
+            Ok(snapshot) => snapshot.bundled_removed,
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "warning: failed to load user config for bundled extensions: {error}"
+                );
+                BTreeSet::new()
+            }
+        },
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "warning: failed to load user config for bundled extensions: {error}"
+            );
+            BTreeSet::new()
+        }
+    };
+    if bundled::refresh_on_upgrade(&home, &mut store, &bundled_removed)? {
+        store
+            .save_to_path(&path)
+            .map_err(|error| extension_install_io_error(&error))?;
+    }
+    Ok(())
 }
 
 fn loaded_extension_install_records() -> Result<Vec<ExtensionInstallRecord>, String> {

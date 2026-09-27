@@ -31,7 +31,6 @@ pub enum ExtensionInstallError {
     StoreIo,
     StoreMalformed,
     RecordNotFound { selector: String },
-    BundledCannotRemove { selector: String },
 }
 
 pub fn parse_extension_install_ref(
@@ -209,14 +208,6 @@ impl ExtensionInstallStore {
 
     pub fn remove(&mut self, selector: &str) -> Result<(), ExtensionInstallError> {
         let selector_path = PathBuf::from(selector);
-        if self.records.iter().any(|record| {
-            record.kind == ExtensionInstallRefKind::Bundled
-                && (record.source == selector || record.package_root == selector_path)
-        }) {
-            return Err(ExtensionInstallError::BundledCannotRemove {
-                selector: selector.to_owned(),
-            });
-        }
         let before = self.records.len();
         self.records
             .retain(|record| record.source != selector && record.package_root != selector_path);
@@ -226,6 +217,25 @@ impl ExtensionInstallStore {
             });
         }
         Ok(())
+    }
+
+    pub fn refresh_bundled(
+        &mut self,
+        source: &str,
+        package_root: &Path,
+    ) -> Result<bool, ExtensionInstallError> {
+        let Some(record) = self.records.iter_mut().find(|record| {
+            record.source == source && record.kind == ExtensionInstallRefKind::Bundled
+        }) else {
+            return Ok(false);
+        };
+        let package_root =
+            fs::canonicalize(package_root).map_err(|_| ExtensionInstallError::StoreIo)?;
+        if record.package_root == package_root {
+            return Ok(false);
+        }
+        record.package_root = package_root;
+        Ok(true)
     }
 
     pub fn set_enabled(
@@ -481,12 +491,34 @@ mod tests {
             store.enabled_package_roots().is_empty(),
             "disabled bundle should not load",
         )?;
-        expect_equal(
-            &store.remove("yach.hashline"),
-            &Err(ExtensionInstallError::BundledCannotRemove {
-                selector: String::from("yach.hashline"),
-            }),
-        )
+        expect_ok(store.remove("yach.hashline"))?;
+        expect_true(store.records.is_empty(), "bundled record should be removed")
+    }
+
+    #[test]
+    fn bundled_records_are_removable_and_refresh_never_creates() -> Result<(), String> {
+        let root = TempDir::new("bundled-refresh")?;
+        let old = root.path().join("yach-hashline/0.1.0");
+        let new = root.path().join("yach-hashline/0.2.0");
+        for dir in [&old, &new] {
+            expect_ok(fs::create_dir_all(dir))?;
+        }
+        let mut store = ExtensionInstallStore::default();
+        expect_equal(&store.refresh_bundled("yach.hashline", &new), &Ok(false))?;
+        expect_true(store.records.is_empty(), "refresh must not create a record")?;
+
+        expect_ok(store.install_bundled("yach.hashline", &old, ExtensionInstallScope::User))?;
+        expect_ok(store.set_enabled("yach.hashline", false))?;
+        expect_equal(&store.refresh_bundled("yach.hashline", &new), &Ok(true))?;
+        let record = &store.records[0];
+        expect_true(
+            record.package_root.ends_with("0.2.0"),
+            "record should point at the refreshed package root",
+        )?;
+        expect_true(!record.enabled, "refresh keeps the user's choice")?;
+
+        expect_ok(store.remove("yach.hashline"))?;
+        expect_true(store.records.is_empty(), "bundled record should be removed")
     }
 
     fn expect_ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> Result<T, String> {
