@@ -160,12 +160,25 @@ impl UserConfigStore {
         })
     }
 
-    pub fn persist_preset(&self, preset: Preset, reset: bool) -> Result<(), UserConfigError> {
+    /// Writes the preset marker and the kernel component set. When
+    /// `preserve_existing` is true (the implicit first-run apply only), a
+    /// `[components]` key that already exists keeps its value — spec rule 3:
+    /// only components with no prior record take the preset's default.
+    /// `--reset` is always explicit and never preserves.
+    pub fn persist_preset(
+        &self,
+        preset: Preset,
+        reset: bool,
+        preserve_existing: bool,
+    ) -> Result<(), UserConfigError> {
         let selected = ComponentSet::from_preset(preset);
         self.update(|document| {
             table_mut(document.as_table_mut(), "preset")?["applied"] = value(preset.name());
             let components = table_mut(document.as_table_mut(), "components")?;
             for component in Component::ALL.into_iter().filter(|c| c.is_kernel()) {
+                if preserve_existing && components.get(component.name()).is_some() {
+                    continue;
+                }
                 components[component.name()] = value(selected.contains(component));
             }
             if reset {
@@ -666,7 +679,7 @@ mod tests {
             .is_ok()
         );
         set_private(store.path());
-        assert!(store.persist_preset(Preset::Minimal, false).is_ok());
+        assert!(store.persist_preset(Preset::Minimal, false, false).is_ok());
         let raw = fs::read_to_string(store.path()).unwrap_or_default();
         assert!(raw.contains("# keep me"));
         assert!(raw.contains("default = \"low\""));
@@ -677,7 +690,7 @@ mod tests {
         assert!(!snapshot.kernel_components().project_tools());
         assert!(snapshot.bundled_removed.contains("yach.jev-reviewer"));
 
-        assert!(store.persist_preset(Preset::Full, true).is_ok());
+        assert!(store.persist_preset(Preset::Full, true, false).is_ok());
         let Ok(snapshot) = store.load() else {
             unreachable!("valid config")
         };
@@ -685,6 +698,26 @@ mod tests {
         assert!(
             snapshot.bundled_removed.is_empty(),
             "--reset clears removals"
+        );
+    }
+
+    #[test]
+    fn persist_preset_first_run_preserves_existing_component_toggles() {
+        let (_directory, store) = temp_store("preset-preserve");
+        assert!(fs::write(store.path(), "[components]\nproject-tools = false\n").is_ok());
+        set_private(store.path());
+        assert!(store.persist_preset(Preset::Full, false, true).is_ok());
+        let Ok(snapshot) = store.load() else {
+            unreachable!("valid config")
+        };
+        assert_eq!(snapshot.preset_applied, Some(Preset::Full));
+        assert!(
+            !snapshot.kernel_components().project_tools(),
+            "existing project-tools = false record must survive the first-run apply"
+        );
+        assert!(
+            snapshot.kernel_components().baseline_guidance(),
+            "components with no prior record take the preset default"
         );
     }
 

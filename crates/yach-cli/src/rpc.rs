@@ -40,6 +40,9 @@ pub(crate) struct RpcOptions {
     /// deterministic clients (CI, the invariant matrix) never touch the
     /// network.
     pub catalog_refresh: bool,
+    /// `yach rpc --preset <name>` applies a preset to this session only;
+    /// user state is never read for components nor written.
+    pub preset: Option<yach_backend::Preset>,
 }
 
 pub(crate) fn parse_rpc_args(args: &[String]) -> Result<RpcOptions, String> {
@@ -48,6 +51,7 @@ pub(crate) fn parse_rpc_args(args: &[String]) -> Result<RpcOptions, String> {
     let mut session_id = None;
     let mut backend = RpcBackend::System;
     let mut catalog_refresh = true;
+    let mut preset = None;
     let mut index = 0;
     while index < args.len() {
         let value_of = |flag: &str| {
@@ -85,6 +89,14 @@ pub(crate) fn parse_rpc_args(args: &[String]) -> Result<RpcOptions, String> {
                 catalog_refresh = false;
                 index += 1;
             }
+            "--preset" => {
+                let raw = value_of("--preset")?;
+                preset = Some(
+                    yach_backend::Preset::parse(&raw)
+                        .ok_or_else(|| format!("unknown preset '{raw}'"))?,
+                );
+                index += 2;
+            }
             other => return Err(format!("unknown 'rpc' flag '{other}'")),
         }
     }
@@ -99,6 +111,7 @@ pub(crate) fn parse_rpc_args(args: &[String]) -> Result<RpcOptions, String> {
         session_id,
         backend,
         catalog_refresh,
+        preset,
     })
 }
 
@@ -380,6 +393,16 @@ async fn run_rpc(options: RpcOptions) -> io::Result<()> {
             None::<ModelDiscoveryFuture>,
         ),
     };
+    // `--preset` makes the session ephemeral: no first-run apply, no user
+    // state writes; the config is still loaded once for unknown-component
+    // warnings.
+    let components = match options.preset {
+        Some(preset) => {
+            super::warn_unknown_config_components();
+            yach_backend::ComponentSet::from_preset(preset)
+        }
+        None => super::first_run_session_components(),
+    };
     let backend_config = runner_config(RunnerConfigInput {
         session_path,
         project_root,
@@ -389,6 +412,8 @@ async fn run_rpc(options: RpcOptions) -> io::Result<()> {
         catalog_refresh,
         model_discovery,
         provider_connections,
+        components,
+        ephemeral_preset: options.preset,
     });
     let backend_handle = tokio::spawn(run_native_loop_with_negotiated_capabilities(
         backend_session.endpoints.client_rx,
@@ -495,6 +520,13 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn rpc_accepts_preset() {
+        let options = parse_rpc_args(&["--preset".into(), "full".into()]);
+        assert!(matches!(options, Ok(o) if o.preset == Some(yach_backend::Preset::Full)));
+        assert!(parse_rpc_args(&["--preset".into(), "tiny".into()]).is_err());
     }
 
     #[test]

@@ -373,6 +373,20 @@ fn bundled_hashline_package_lists_disables_and_reenables_through_cli() {
     let user_store = stores.root.join("user-extensions.json");
     let project_store = stores.root.join("project-extensions.json");
     let home = stores.root.join("home");
+    fs::create_dir_all(&home).test_unwrap();
+
+    // `preset use full` is the seeding path now: it writes the preset and
+    // installs both bundled records into the user store.
+    let preset = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["preset", "use", "full"])
+        .env("HOME", &home)
+        .env("YACH_EXTENSION_USER_STORE", &user_store)
+        .env("YACH_EXTENSION_PROJECT_STORE", &project_store)
+        .output()
+        .test_unwrap();
+    assert!(preset.status.success());
+    let preset_stdout = String::from_utf8(preset.stdout).test_unwrap();
+    assert!(preset_stdout.contains("installed=yach.hashline"));
 
     let list = Command::new(env!("CARGO_BIN_EXE_yach"))
         .args(["extension", "list"])
@@ -383,7 +397,53 @@ fn bundled_hashline_package_lists_disables_and_reenables_through_cli() {
         .test_unwrap();
     assert!(list.status.success());
     let list_stdout = String::from_utf8(list.stdout).test_unwrap();
-    assert!(list_stdout.contains("extension_count=0"));
-    assert!(!list_stdout.contains("yach.hashline"));
-    // Task 7 restores the full flow.
+    assert!(list_stdout.contains("extension_count=2"));
+    assert!(list_stdout.contains("extension id=yach.hashline"));
+    assert!(list_stdout.contains("activation_state=discovered"));
+
+    let disable = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["extension", "disable", "yach.hashline"])
+        .env("HOME", &home)
+        .env("YACH_EXTENSION_USER_STORE", &user_store)
+        .env("YACH_EXTENSION_PROJECT_STORE", &project_store)
+        .output()
+        .test_unwrap();
+    assert!(disable.status.success());
+    let disable_stdout = String::from_utf8(disable.stdout).test_unwrap();
+    assert!(disable_stdout.contains("extension_outcome=Completed"));
+
+    let disabled = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["extension", "doctor", "yach.hashline"])
+        .env("HOME", &home)
+        .env("YACH_EXTENSION_USER_STORE", &user_store)
+        .env("YACH_EXTENSION_PROJECT_STORE", &project_store)
+        .output()
+        .test_unwrap();
+    assert!(disabled.status.success());
+    let disabled_stdout = String::from_utf8(disabled.stdout).test_unwrap();
+    assert!(disabled_stdout.contains("install_source=yach.hashline"));
+    assert!(disabled_stdout.contains("extension id=yach.hashline"));
+    assert!(disabled_stdout.contains("activation_state=blocked"));
+    assert!(disabled_stdout.contains("last_error_kind=disabled"));
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["extension", "enable", "yach.hashline"])
+        .env("HOME", &home)
+        .env("YACH_EXTENSION_USER_STORE", &user_store)
+        .env("YACH_EXTENSION_PROJECT_STORE", &project_store)
+        .output()
+        .test_unwrap();
+    assert!(enable.status.success());
+
+    let reenabled = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["extension", "doctor", "yach.hashline"])
+        .env("HOME", &home)
+        .env("YACH_EXTENSION_USER_STORE", &user_store)
+        .env("YACH_EXTENSION_PROJECT_STORE", &project_store)
+        .output()
+        .test_unwrap();
+    assert!(reenabled.status.success());
+    let reenabled_stdout = String::from_utf8(reenabled.stdout).test_unwrap();
+    assert!(reenabled_stdout.contains("extension id=yach.hashline"));
+    assert!(reenabled_stdout.contains("activation_state=discovered"));
 }

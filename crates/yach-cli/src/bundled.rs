@@ -4,10 +4,11 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use yach_backend::{Component, ExtensionInstallStore};
+use yach_backend::{
+    Component, ComponentSet, ExtensionInstallStore, ExtensionPackageRoot, Preset, UserConfigStore,
+};
 
 pub(crate) struct BundledPackage {
-    #[expect(dead_code, reason = "consumed by Task 7/8 component routing")]
     pub component: Component,
     pub source: &'static str,
     pub dir_name: &'static str,
@@ -83,13 +84,19 @@ pub(crate) fn materialize(home: &Path, package: &BundledPackage) -> io::Result<O
 }
 
 /// The version segment of a materialized package root: its last path component.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "kept for Task 8 bundle diagnostics")
+)]
 pub(crate) fn materialized_version(package_root: &Path) -> Option<&str> {
     package_root.file_name()?.to_str()
 }
 
-/// Re-materializes and repoints bundled records whose stored version differs
-/// from the running binary's version. Packages whose source is in `removed` are
-/// left untouched. Returns whether the store changed.
+/// Re-materializes and repoints bundled records so the manifest's
+/// `main.command` always names the running binary. Packages whose source is
+/// in `removed` are left untouched. `materialize` skips an unchanged write
+/// and `refresh_bundled` is a no-op when the root is unchanged, so the
+/// steady state stays write-free. Returns whether the store changed.
 pub(crate) fn refresh_on_upgrade(
     home: &Path,
     store: &mut ExtensionInstallStore,
@@ -107,15 +114,6 @@ pub(crate) fn refresh_on_upgrade(
         if !has_record {
             continue;
         }
-        let stale = store
-            .records
-            .iter()
-            .find(|record| record.source == package.source)
-            .and_then(|record| materialized_version(&record.package_root))
-            != Some(env!("CARGO_PKG_VERSION"));
-        if !stale {
-            continue;
-        }
         let Some(package_root) = materialize(home, package)? else {
             continue;
         };
@@ -131,7 +129,6 @@ pub(crate) fn refresh_on_upgrade(
 
 /// Materializes a bundled package and installs its record into `store`.
 /// Returns whether a record was installed.
-#[expect(dead_code, reason = "consumed by Task 7 preset apply")]
 pub(crate) fn install(
     home: &Path,
     store: &mut ExtensionInstallStore,
@@ -150,13 +147,187 @@ pub(crate) fn install(
     Ok(true)
 }
 
+/// The outcome of applying a preset to user state: which bundled ids were
+/// installed, re-enabled, disabled, preserved as-is, or unavailable in this
+/// build.
+pub(crate) struct PresetApplyReport {
+    pub preset: Preset,
+    pub installed: Vec<&'static str>,
+    pub enabled: Vec<&'static str>,
+    pub disabled: Vec<&'static str>,
+    pub not_compiled_in: Vec<&'static str>,
+    pub preserved: Vec<&'static str>,
+}
+
+/// Reconciles the bundled install store with `preset`, then persists the
+/// preset marker. A record is never deleted here — exclusion only disables,
+/// and `[bundled] removed` ids are skipped unless `reset` ignores them.
+/// `preserve_existing` is true only for the implicit first run: an existing
+/// record keeps its `enabled` value then; an explicit apply always enables
+/// the preset's components. The marker is written last so a store failure
+/// leaves `ensure_first_run` free to retry on the next start.
+pub(crate) fn apply_preset(
+    home: &Path,
+    config: &UserConfigStore,
+    store_path: &Path,
+    preset: Preset,
+    reset: bool,
+    preserve_existing: bool,
+) -> io::Result<PresetApplyReport> {
+    // Validate the whole config up front: a malformed known field must fail
+    // the apply before any bundled record changes. `reset` ignores the
+    // removed set but never the validation.
+    let snapshot = config.load().map_err(io::Error::other)?;
+    let bundled_removed = if reset {
+        BTreeSet::new()
+    } else {
+        snapshot.bundled_removed
+    };
+    let included = ComponentSet::from_preset(preset);
+    let mut store = ExtensionInstallStore::load_from_path(store_path)
+        .map_err(|error| crate::extension_install_io_error(&error))?;
+    let mut report = PresetApplyReport {
+        preset,
+        installed: Vec::new(),
+        enabled: Vec::new(),
+        disabled: Vec::new(),
+        not_compiled_in: Vec::new(),
+        preserved: Vec::new(),
+    };
+    for package in &BUNDLED {
+        let has_record = store
+            .records
+            .iter()
+            .any(|record| record.source == package.source);
+        if included.contains(package.component) {
+            if bundled_removed.contains(package.source) {
+                continue;
+            }
+            if has_record {
+                if preserve_existing {
+                    report.preserved.push(package.source);
+                } else {
+                    store
+                        .set_enabled(package.source, true)
+                        .map_err(|error| crate::extension_install_io_error(&error))?;
+                    report.enabled.push(package.source);
+                }
+            } else if install(home, &mut store, package)? {
+                report.installed.push(package.source);
+            } else {
+                report.not_compiled_in.push(package.source);
+            }
+        } else if has_record {
+            store
+                .set_enabled(package.source, false)
+                .map_err(|error| crate::extension_install_io_error(&error))?;
+            report.disabled.push(package.source);
+        }
+    }
+    store
+        .save_to_path(store_path)
+        .map_err(|error| crate::extension_install_io_error(&error))?;
+    config
+        .persist_preset(preset, reset, preserve_existing)
+        .map_err(io::Error::other)?;
+    Ok(report)
+}
+
+/// First run only: a config without `[preset] applied` gets `full` applied
+/// once, preserving existing records' `enabled` values. Returns `None` on
+/// any later run or when the config cannot load.
+pub(crate) fn ensure_first_run(
+    home: &Path,
+    config: &UserConfigStore,
+    store_path: &Path,
+) -> io::Result<Option<PresetApplyReport>> {
+    let snapshot = match config.load() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "warning: failed to load user config for preset apply: {error}"
+            );
+            return Ok(None);
+        }
+    };
+    if snapshot.preset_applied.is_some() {
+        return Ok(None);
+    }
+    apply_preset(home, config, store_path, Preset::Full, false, true).map(Some)
+}
+
+/// The component set for one session: the ephemeral preset when given, else
+/// the persisted kernel components. Never writes user state.
+pub(crate) fn session_components(
+    config: &UserConfigStore,
+    ephemeral: Option<Preset>,
+) -> ComponentSet {
+    if let Some(preset) = ephemeral {
+        return ComponentSet::from_preset(preset);
+    }
+    match config.load() {
+        Ok(snapshot) => {
+            warn_unknown_components(&snapshot.unknown_components);
+            snapshot.kernel_components()
+        }
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "warning: failed to load user config for components: {error}"
+            );
+            ComponentSet::full()
+        }
+    }
+}
+
+/// Resolves an ephemeral `--preset` session's package roots in memory:
+/// `persisted` non-bundled roots (read without refresh, without save) pass
+/// through, and every bundled package the preset includes and this build
+/// compiles is materialized under `~/.yach/bundled` — a cache, not user
+/// state. Persisted bundled records and `[bundled] removed` are ignored.
+pub(crate) fn ephemeral_package_roots(
+    home: &Path,
+    preset: Preset,
+    persisted: Vec<ExtensionPackageRoot>,
+) -> io::Result<Vec<ExtensionPackageRoot>> {
+    let included = ComponentSet::from_preset(preset);
+    let mut roots = persisted;
+    for package in &BUNDLED {
+        if !included.contains(package.component) {
+            continue;
+        }
+        if let Some(root) = materialize(home, package)? {
+            roots.push(ExtensionPackageRoot {
+                root,
+                scope: yach_backend::ExtensionInstallScope::User,
+                source_ref: Some(String::from(package.source)),
+            });
+        }
+    }
+    Ok(roots)
+}
+
+/// One stderr warning per unknown component name in the user config.
+pub(crate) fn warn_unknown_components(unknown: &[String]) {
+    for name in unknown {
+        let _ = writeln!(
+            io::stderr(),
+            "warning: unknown component '{name}' in ~/.yach/config.toml ignored"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use yach_backend::{ExtensionInstallScope, ExtensionInstallStore};
+    use yach_backend::{ExtensionInstallScope, ExtensionInstallStore, Preset, UserConfigStore};
 
-    use super::{materialized_version, refresh_on_upgrade};
+    use super::{
+        BUNDLED, apply_preset, ensure_first_run, ephemeral_package_roots, install,
+        materialized_version, refresh_on_upgrade,
+    };
 
     fn temp_home(name: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -210,5 +381,287 @@ mod tests {
 
         let unchanged = refresh_on_upgrade(&home, &mut store, &removed);
         assert!(matches!(unchanged, Ok(false)), "second pass is a no-op");
+    }
+
+    #[test]
+    fn upgrade_refresh_repaints_manifest_command_at_the_same_version() {
+        let home = temp_home("bundled-same-version");
+        let mut store = ExtensionInstallStore::default();
+        let package = &BUNDLED[0]; // hashline
+        assert!(matches!(install(&home, &mut store, package), Ok(true)));
+        // Simulate a manifest installed by an older build at the same
+        // version: its `main.command` points at a binary that is gone.
+        let manifest_path = home
+            .join(".yach/bundled/yach-hashline")
+            .join(env!("CARGO_PKG_VERSION"))
+            .join("yach.extension.json");
+        let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+            unreachable!("materialized manifest exists")
+        };
+        let Ok(mut manifest) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            unreachable!("materialized manifest is JSON")
+        };
+        manifest["main"]["command"] =
+            serde_json::Value::String(String::from("/nonexistent/old-yach"));
+        let Ok(bytes) = serde_json::to_vec(&manifest) else {
+            unreachable!("manifest serializes")
+        };
+        assert!(std::fs::write(&manifest_path, bytes).is_ok());
+
+        let changed = refresh_on_upgrade(&home, &mut store, &BTreeSet::new());
+        assert!(matches!(changed, Ok(false)), "record root is unchanged");
+        let Ok(written_raw) = std::fs::read_to_string(&manifest_path) else {
+            unreachable!("manifest still readable")
+        };
+        let Ok(written) = serde_json::from_str::<serde_json::Value>(&written_raw) else {
+            unreachable!("manifest still JSON")
+        };
+        let command = written["main"]["command"].as_str();
+        assert_eq!(
+            command,
+            std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(|p| p.to_str()),
+            "same-version refresh repaints main.command onto the running binary"
+        );
+    }
+
+    #[test]
+    fn first_apply_preserves_existing_disabled_record() {
+        let home = temp_home("first-apply");
+        let config = UserConfigStore::in_home(&home);
+        let store_path = home.join(".yach/extensions.json");
+        let mut store = ExtensionInstallStore::default();
+        let package = &BUNDLED[0]; // hashline
+        assert!(matches!(install(&home, &mut store, package), Ok(true)));
+        assert!(store.set_enabled("yach.hashline", false).is_ok());
+        assert!(store.save_to_path(&store_path).is_ok());
+
+        let report = ensure_first_run(&home, &config, &store_path);
+        assert!(
+            matches!(&report, Ok(Some(r)) if r.preset == Preset::Full && r.preserved.contains(&"yach.hashline"))
+        );
+        let Ok(store) = ExtensionInstallStore::load_from_path(&store_path) else {
+            unreachable!()
+        };
+        let hashline = store.records.iter().find(|r| r.source == "yach.hashline");
+        assert!(
+            hashline.is_some_and(|r| !r.enabled),
+            "existing choice preserved"
+        );
+        assert!(
+            store
+                .records
+                .iter()
+                .any(|r| r.source == "yach.jev-reviewer" && r.enabled)
+        );
+        assert!(
+            matches!(ensure_first_run(&home, &config, &store_path), Ok(None)),
+            "runs once"
+        );
+    }
+
+    #[test]
+    fn preset_use_never_readds_removed_until_reset() {
+        let home = temp_home("preset-removed");
+        let config = UserConfigStore::in_home(&home);
+        let store_path = home.join(".yach/extensions.json");
+        assert!(
+            config
+                .persist_bundled_removed("yach.hashline", true)
+                .is_ok()
+        );
+
+        let report = apply_preset(&home, &config, &store_path, Preset::Full, false, false);
+        assert!(matches!(&report, Ok(r) if !r.installed.contains(&"yach.hashline")));
+        let Ok(store) = ExtensionInstallStore::load_from_path(&store_path) else {
+            unreachable!()
+        };
+        assert!(store.records.iter().all(|r| r.source != "yach.hashline"));
+
+        let reset = apply_preset(&home, &config, &store_path, Preset::Full, true, false);
+        assert!(matches!(&reset, Ok(r) if r.installed.contains(&"yach.hashline")));
+    }
+
+    #[test]
+    fn ephemeral_roots_materialize_included_without_touching_the_store() {
+        let home = temp_home("ephemeral-full");
+        let store_path = home.join(".yach/extensions.json");
+        let mut store = ExtensionInstallStore::default();
+        let stale = home.join(".yach/bundled/yach-hashline/0.0.1");
+        assert!(std::fs::create_dir_all(&stale).is_ok());
+        let local = home.join("third-party");
+        assert!(std::fs::create_dir_all(&local).is_ok());
+        assert!(
+            store
+                .install_bundled("yach.hashline", &stale, ExtensionInstallScope::User)
+                .is_ok()
+        );
+        assert!(
+            store
+                .install_local_path(
+                    "/opt/example.third-party",
+                    &local,
+                    ExtensionInstallScope::User,
+                    true,
+                )
+                .is_ok()
+        );
+        assert!(store.save_to_path(&store_path).is_ok());
+        let before = std::fs::read(&store_path).unwrap_or_default();
+
+        let persisted: Vec<yach_backend::ExtensionPackageRoot> = store
+            .records
+            .iter()
+            .filter(|r| r.enabled)
+            .filter(|r| r.kind == yach_backend::ExtensionInstallRefKind::LocalPath)
+            .map(|r| yach_backend::ExtensionPackageRoot {
+                root: r.package_root.clone(),
+                scope: r.scope,
+                source_ref: Some(r.source.clone()),
+            })
+            .collect();
+        let roots = ephemeral_package_roots(&home, Preset::Full, persisted);
+        let Ok(roots) = roots else { unreachable!() };
+        let sources: Vec<_> = roots
+            .iter()
+            .filter_map(|r| r.source_ref.as_deref())
+            .collect();
+        assert!(
+            sources.contains(&"/opt/example.third-party"),
+            "non-bundled persisted roots pass through"
+        );
+        for id in ["yach.hashline", "yach.jev-reviewer"] {
+            let root = roots.iter().find(|r| r.source_ref.as_deref() == Some(id));
+            assert!(
+                root.is_some_and(|r| {
+                    materialized_version(&r.root) == Some(env!("CARGO_PKG_VERSION"))
+                        && r.root.join("yach.extension.json").is_file()
+                }),
+                "{id} is materialized at the current version in memory"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&store_path).unwrap_or_default(),
+            before,
+            "ephemeral resolution writes no user state"
+        );
+
+        let minimal = ephemeral_package_roots(&home, Preset::Minimal, Vec::new());
+        let Ok(minimal) = minimal else { unreachable!() };
+        assert!(
+            minimal.iter().all(|r| {
+                !matches!(
+                    r.source_ref.as_deref(),
+                    Some("yach.hashline" | "yach.jev-reviewer")
+                )
+            }),
+            "minimal contributes no bundled roots"
+        );
+    }
+
+    #[test]
+    fn first_run_store_load_failure_leaves_preset_unapplied() {
+        let home = temp_home("first-run-unwritable");
+        let config = UserConfigStore::in_home(&home);
+        // A directory at the store path fails the load (read on a dir).
+        let store_path = home.join(".yach/extensions.json");
+        assert!(std::fs::create_dir_all(&store_path).is_ok());
+
+        let report = ensure_first_run(&home, &config, &store_path);
+        assert!(report.is_err(), "store load failure propagates");
+        let Ok(snapshot) = config.load() else {
+            unreachable!()
+        };
+        assert_eq!(
+            snapshot.preset_applied, None,
+            "the preset marker is written only after the store save"
+        );
+    }
+
+    #[test]
+    fn first_run_save_failure_leaves_preset_unapplied() {
+        let home = temp_home("first-run-readonly");
+        let config = UserConfigStore::in_home(&home);
+        // A regular file where the store's parent should be: the store load
+        // sees no file and returns the default, materialization writes under
+        // ~/.yach/bundled fine, and the save fails in create_dir_all — a
+        // deterministic, privilege-independent save failure.
+        assert!(std::fs::write(home.join("not-a-dir"), b"").is_ok());
+        let store_path = home.join("not-a-dir/extensions.json");
+
+        let report = ensure_first_run(&home, &config, &store_path);
+        assert!(report.is_err(), "store save failure propagates");
+        assert!(
+            home.join(".yach/bundled").is_dir(),
+            "reconciliation ran; only the store save failed"
+        );
+        let Ok(snapshot) = config.load() else {
+            unreachable!()
+        };
+        assert_eq!(
+            snapshot.preset_applied, None,
+            "a failed save leaves the preset unapplied for next start"
+        );
+    }
+
+    #[test]
+    fn apply_preset_validates_config_before_touching_the_store() {
+        let home = temp_home("preset-malformed-config");
+        let config = UserConfigStore::in_home(&home);
+        let store_path = home.join(".yach/extensions.json");
+        let config_path = config.path().to_path_buf();
+        assert!(std::fs::create_dir_all(config_path.parent().unwrap_or(&home)).is_ok());
+        // A removed bundled id plus a malformed known field: the load fails,
+        // so neither the removal is ignored nor the store is written.
+        assert!(
+            std::fs::write(
+                &config_path,
+                "[bundled]\nremoved = [\"yach.hashline\"]\n\n[components]\nproject-tools = \"yes\"\n",
+            )
+            .is_ok()
+        );
+
+        let report = apply_preset(&home, &config, &store_path, Preset::Full, false, false);
+        assert!(
+            report.is_err(),
+            "malformed config fails before the store save"
+        );
+        assert!(
+            !store_path.exists(),
+            "extensions.json is untouched on a config load failure"
+        );
+    }
+
+    #[test]
+    fn explicit_preset_use_reenables_existing_records() {
+        let home = temp_home("preset-round-trip");
+        let config = UserConfigStore::in_home(&home);
+        let store_path = home.join(".yach/extensions.json");
+
+        let minimal = apply_preset(&home, &config, &store_path, Preset::Minimal, false, false);
+        assert!(matches!(&minimal, Ok(r) if r.preset == Preset::Minimal));
+        // Minimal installs nothing; now seed both as the full preset would.
+        let full = apply_preset(&home, &config, &store_path, Preset::Full, false, false);
+        assert!(matches!(&full, Ok(r) if r.installed.len() == 2));
+        let minimal_again =
+            apply_preset(&home, &config, &store_path, Preset::Minimal, false, false);
+        assert!(matches!(&minimal_again, Ok(r) if r.disabled.len() == 2));
+        let Ok(store) = ExtensionInstallStore::load_from_path(&store_path) else {
+            unreachable!()
+        };
+        assert!(store.records.iter().all(|r| !r.enabled));
+
+        // The spec round-trip: an explicit `preset use full` after `minimal`
+        // re-enables the existing records instead of preserving their
+        // disabled state.
+        let full_again = apply_preset(&home, &config, &store_path, Preset::Full, false, false);
+        assert!(matches!(&full_again, Ok(r) if r.enabled.len() == 2 && r.preserved.is_empty()));
+        let Ok(store) = ExtensionInstallStore::load_from_path(&store_path) else {
+            unreachable!()
+        };
+        assert_eq!(store.records.len(), 2);
+        assert!(store.records.iter().all(|r| r.enabled));
     }
 }
