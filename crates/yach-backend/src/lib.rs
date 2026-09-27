@@ -11,6 +11,7 @@ mod backend;
 pub mod bench_loop;
 mod chatgpt_auth;
 mod compaction;
+mod components;
 mod edit;
 mod edit_access;
 #[cfg_attr(
@@ -57,6 +58,7 @@ pub use chatgpt_auth::{
     reauth_chatgpt_subscription, relogin_chatgpt_subscription, start_chatgpt_device_login,
 };
 pub use compaction::*;
+pub use components::{Component, ComponentSet, Preset};
 pub use edit::*;
 pub use edit_access::*;
 pub use error_dialect::{
