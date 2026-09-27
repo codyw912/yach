@@ -69,7 +69,25 @@ pub struct ExtensionContributions {
     pub tools: Vec<ExtensionToolContribution>,
     pub static_context: Vec<ExtensionStaticContextContribution>,
     pub tool_replacement_bundles: Vec<ExtensionToolReplacementBundleContribution>,
+    pub reviewer: Option<ExtensionReviewerContribution>,
 }
+/// Manifest contribution: `contributes.reviewer` — at most one per extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionReviewerContribution {
+    /// Stable reviewer identity shown in status/evidence, e.g. "jev-typesafe".
+    pub reviewer_id: String,
+    /// Human-readable disclosure summary shown at selection time.
+    pub disclosure_summary: String,
+    /// Whether the reviewer calls a remote endpoint (forces UsesNetwork grant).
+    pub remote: bool,
+}
+
+pub const REVIEW_CONTRACT: &str = "yach.review.v1";
+/// Serialized review assessment bound. Core rejects larger `review.result` bodies.
+pub const MAX_REVIEW_ASSESSMENT_BYTES: usize = 16 * 1024;
+const MAX_REVIEWER_ID_LEN: usize = 64;
+const MAX_DISCLOSURE_SUMMARY_LEN: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionToolContribution {
@@ -147,6 +165,9 @@ pub enum ExtensionManifestError {
     DuplicateReplacementBundleId { id: String },
     InvalidReplacementBundle { id: String },
     InvalidReplacementContract { contract: String },
+    InvalidReviewerId { id: String },
+    DisclosureSummaryTooLong,
+    ReviewerCannotDeclareTools,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +245,8 @@ pub enum ExtensionHostProtocolError {
         declared: ExtensionToolRisk,
         registered: ExtensionToolRisk,
     },
+    ReviewerContractMismatch,
+    MissingReviewReady,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,7 +310,7 @@ pub enum ExtensionHostInvocation {
     EditProposal(ExtensionEditProposal),
 }
 
-pub trait ExtensionResourceBroker {
+pub trait ExtensionResourceBroker: Send + Sync {
     fn execute(&self, request: &ExtensionResourceRequest) -> ExtensionResourceResult;
 }
 
@@ -322,6 +345,13 @@ pub enum ExtensionHostClientMessage {
         request_id: String,
         result: ExtensionResourceResult,
     },
+    #[serde(rename = "review.assess")]
+    ReviewAssess {
+        request_id: String,
+        /// Serialized review request (schema yach.review-request.v2),
+        /// already bounded to 64 KiB by core.
+        request: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +381,16 @@ pub enum ExtensionHostServerMessage {
         status: ExtensionToolResultStatus,
         reason: Option<String>,
     },
+    ReviewReady {
+        reviewer_id: String,
+        contract: String,
+    },
+    ReviewResult {
+        request_id: String,
+        /// Serialized review assessment (schema yach.review-assessment.v2),
+        /// bounded to 16 KiB.
+        assessment: serde_json::Value,
+    },
 }
 
 pub trait ExtensionHostTransport {
@@ -374,6 +414,21 @@ pub trait ExtensionHostInvoker: Send {
         timeout: Duration,
         resources: &dyn ExtensionResourceBroker,
     ) -> Result<ExtensionHostInvocation, ExtensionHostProtocolError>;
+
+    /// Send `review.assess` and return the matching `review.result` assessment.
+    ///
+    /// The default rejects the call: only a host that completed the
+    /// `review.ready` handshake implements it. Tool-only hosts and test
+    /// doubles that do not override this method fail closed.
+    fn review(
+        &mut self,
+        _request_id: &str,
+        _request: serde_json::Value,
+        _timeout: Duration,
+        _resources: &dyn ExtensionResourceBroker,
+    ) -> Result<serde_json::Value, ExtensionHostProtocolError> {
+        Err(ExtensionHostProtocolError::UnsupportedProtocol)
+    }
 }
 
 #[derive(Debug)]
@@ -418,6 +473,7 @@ impl ExtensionProcessHostTransport {
         main: &ExtensionMain,
         package_root: &Path,
         max_stdout_line_bytes: usize,
+        remote_reviewer: bool,
     ) -> Result<Self, ExtensionHostProtocolError> {
         let mut process = Command::new(&main.command);
         process
@@ -426,7 +482,7 @@ impl ExtensionProcessHostTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        configure_extension_host_process(&mut process);
+        configure_extension_host_process(&mut process, remote_reviewer);
 
         let mut child = process
             .spawn()
@@ -647,6 +703,30 @@ pub struct ExtensionActivationDiagnostic {
     pub capability_grant: ExtensionCapabilityGrantStatus,
 }
 
+/// A live reviewer host session bound to its manifest identity.
+///
+/// The runner clones the `Arc` into a review coordinator when the user
+/// selects automatic review; the generation increments on reload so a
+/// response from a previous process is stale.
+#[derive(Clone)]
+pub struct ActiveReviewer {
+    pub reviewer_id: String,
+    pub extension_id: String,
+    pub generation: u64,
+    pub disclosure_summary: String,
+    pub invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>>,
+}
+
+impl std::fmt::Debug for ActiveReviewer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveReviewer")
+            .field("reviewer_id", &self.reviewer_id)
+            .field("extension_id", &self.extension_id)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtensionActivationSnapshot {
     pub registry: ToolRegistry,
@@ -654,6 +734,12 @@ pub struct ExtensionActivationSnapshot {
     pub diagnostics: Vec<ExtensionActivationDiagnostic>,
     pub replacement_bundles: Vec<ActivatedToolReplacementBundle>,
     pub host_start_count: usize,
+    /// At most one reviewer per snapshot; a second activation replaces the
+    /// first so the coordinator never sees a split-brain reviewer set.
+    pub reviewer: Option<ActiveReviewer>,
+    /// Live reviewer generation counter, bumped on every activation, reload,
+    /// or stop. The coordinator reads this to detect staleness.
+    pub reviewer_generation: Arc<Mutex<u64>>,
 }
 
 impl Default for ExtensionActivationSnapshot {
@@ -664,6 +750,8 @@ impl Default for ExtensionActivationSnapshot {
             diagnostics: Vec::new(),
             replacement_bundles: Vec::new(),
             host_start_count: 0,
+            reviewer: None,
+            reviewer_generation: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -822,6 +910,16 @@ impl ExtensionActivationSnapshot {
         );
         self.replacement_bundles
             .retain(|bundle| bundle.extension_id != extension_id);
+        if self
+            .reviewer
+            .as_ref()
+            .is_some_and(|reviewer| reviewer.extension_id == extension_id)
+        {
+            self.reviewer = None;
+            if let Ok(mut generation) = self.reviewer_generation.lock() {
+                *generation = generation.saturating_add(1);
+            }
+        }
         diagnostic.mark_stopped();
         Ok(diagnostic.clone())
     }
@@ -879,7 +977,9 @@ impl ExtensionActivationSnapshot {
             self.diagnostics.push(diagnostic.clone());
             return diagnostic;
         }
-        if record.manifest.contributes.tools.is_empty() {
+        if record.manifest.contributes.tools.is_empty()
+            && record.manifest.contributes.reviewer.is_none()
+        {
             self.diagnostics.push(diagnostic.clone());
             return diagnostic;
         }
@@ -895,6 +995,18 @@ impl ExtensionActivationSnapshot {
             Ok((session, registered_tools)) => {
                 let shared_invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>> =
                     Arc::new(Mutex::new(Box::new(session)));
+                if let Some(reviewer) = &record.manifest.contributes.reviewer {
+                    self.reviewer = Some(ActiveReviewer {
+                        reviewer_id: reviewer.reviewer_id.clone(),
+                        extension_id: extension_id.clone(),
+                        generation: next_generation,
+                        disclosure_summary: reviewer.disclosure_summary.clone(),
+                        invoker: shared_invoker.clone(),
+                    });
+                    if let Ok(mut generation) = self.reviewer_generation.lock() {
+                        *generation = next_generation;
+                    }
+                }
                 for tool_name in &registered_tools {
                     self.executor.insert_tool(
                         tool_name.clone(),
@@ -997,7 +1109,7 @@ impl ExtensionBackgroundActivationConfig {
     #[must_use]
     pub const fn conservative() -> Self {
         Self {
-            registration_timeout: Duration::from_millis(750),
+            registration_timeout: Duration::from_secs(2),
             invocation_timeout: Duration::from_secs(5),
             max_stdout_line_bytes: 64 * 1024,
             max_result_bytes: 64 * 1024,
@@ -1037,6 +1149,7 @@ impl ExtensionActivationDiagnostic {
             provider_visible_tools: Vec::new(),
             requested_capabilities: Some(requested_capabilities(
                 &record.manifest.contributes.tools,
+                record.manifest.contributes.reviewer.as_ref(),
             )),
             capability_grant: ExtensionCapabilityGrantStatus::from_loaded(load_grant(
                 &record.manifest.id.0,
@@ -1171,8 +1284,10 @@ fn capability_block_reason_with_grant(
     manifest: &ExtensionManifest,
     grant: Option<&crate::extension_capability::ExtensionCapabilityGrant>,
 ) -> Option<String> {
-    let requested =
-        crate::extension_capability::requested_capabilities(&manifest.contributes.tools);
+    let requested = crate::extension_capability::requested_capabilities(
+        &manifest.contributes.tools,
+        manifest.contributes.reviewer.as_ref(),
+    );
     if requested.is_empty() {
         return None;
     }
@@ -1218,7 +1333,9 @@ pub fn activate_background_metadata_extensions(
             snapshot.diagnostics.push(diagnostic);
             continue;
         }
-        if record.manifest.contributes.tools.is_empty() {
+        if record.manifest.contributes.tools.is_empty()
+            && record.manifest.contributes.reviewer.is_none()
+        {
             snapshot.diagnostics.push(diagnostic);
             continue;
         }
@@ -1235,6 +1352,18 @@ pub fn activate_background_metadata_extensions(
             Ok((session, registered_tools)) => {
                 let shared_invoker: Arc<Mutex<Box<dyn ExtensionHostInvoker>>> =
                     Arc::new(Mutex::new(Box::new(session)));
+                if let Some(reviewer) = &record.manifest.contributes.reviewer {
+                    snapshot.reviewer = Some(ActiveReviewer {
+                        reviewer_id: reviewer.reviewer_id.clone(),
+                        extension_id: record.manifest.id.0.clone(),
+                        generation: diagnostic.generation,
+                        disclosure_summary: reviewer.disclosure_summary.clone(),
+                        invoker: shared_invoker.clone(),
+                    });
+                    if let Ok(mut generation) = snapshot.reviewer_generation.lock() {
+                        *generation = diagnostic.generation;
+                    }
+                }
                 for tool_name in &registered_tools {
                     handlers.insert(
                         tool_name.clone(),
@@ -1297,6 +1426,12 @@ fn activate_extension_host_record(
         &record.manifest.main,
         &record.package_root,
         config.max_stdout_line_bytes,
+        record
+            .manifest
+            .contributes
+            .reviewer
+            .as_ref()
+            .is_some_and(|r| r.remote),
     )?;
     mark_extension_host(trace, "extension_host_spawned", extension_id);
     let mut session = ExtensionHostSession::new(
@@ -1308,6 +1443,7 @@ fn activate_extension_host_record(
         registry,
         Some(&record.manifest.version),
         &record.manifest.contributes.tools,
+        record.manifest.contributes.reviewer.as_ref(),
         config.registration_timeout,
     )?;
     mark_extension_host(trace, "extension_host_ready", extension_id);
@@ -1343,7 +1479,9 @@ fn extension_host_activation_error(
         | ExtensionHostProtocolError::UnsupportedRisk
         | ExtensionHostProtocolError::UnsupportedSchema
         | ExtensionHostProtocolError::UndeclaredTool { .. }
-        | ExtensionHostProtocolError::ToolRiskMismatch { .. } => {
+        | ExtensionHostProtocolError::ToolRiskMismatch { .. }
+        | ExtensionHostProtocolError::ReviewerContractMismatch
+        | ExtensionHostProtocolError::MissingReviewReady => {
             ExtensionActivationErrorKind::ProtocolError
         }
     };
@@ -1366,6 +1504,8 @@ fn extension_host_protocol_error_label(error: &ExtensionHostProtocolError) -> &'
         ExtensionHostProtocolError::ToolRegistration(_) => "tool_registration",
         ExtensionHostProtocolError::UndeclaredTool { .. } => "undeclared_tool",
         ExtensionHostProtocolError::ToolRiskMismatch { .. } => "tool_risk_mismatch",
+        ExtensionHostProtocolError::ReviewerContractMismatch => "reviewer_contract_mismatch",
+        ExtensionHostProtocolError::MissingReviewReady => "missing_review_ready",
     }
 }
 
@@ -1469,6 +1609,16 @@ struct RawExtensionContributions {
     static_context: Vec<RawExtensionStaticContextContribution>,
     #[serde(default)]
     tool_replacement_bundles: Vec<RawExtensionToolReplacementBundle>,
+    #[serde(default)]
+    reviewer: Option<RawExtensionReviewerContribution>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExtensionReviewerContribution {
+    reviewer_id: String,
+    disclosure_summary: String,
+    remote: bool,
 }
 
 #[derive(Deserialize)]
@@ -1546,6 +1696,16 @@ enum RawExtensionHostMessage {
         status: Option<String>,
         #[serde(default)]
         reason: Option<String>,
+    },
+    #[serde(rename = "review.ready")]
+    ReviewReady {
+        reviewer_id: String,
+        contract: String,
+    },
+    #[serde(rename = "review.result")]
+    ReviewResult {
+        request_id: String,
+        assessment: serde_json::Value,
     },
 }
 
@@ -1673,6 +1833,15 @@ pub fn parse_extension_manifest(
         .map(parse_static_context_contribution)
         .collect::<Result<Vec<_>, _>>()?;
 
+    let reviewer = raw
+        .contributes
+        .reviewer
+        .map(parse_reviewer_contribution)
+        .transpose()?;
+    if reviewer.is_some() && !tools.is_empty() {
+        return Err(ExtensionManifestError::ReviewerCannotDeclareTools);
+    }
+
     Ok(ExtensionManifest {
         schema: ExtensionManifestSchema::V1,
         id: ExtensionId(raw.id),
@@ -1688,6 +1857,7 @@ pub fn parse_extension_manifest(
             tools,
             static_context,
             tool_replacement_bundles,
+            reviewer,
         },
     })
 }
@@ -1759,6 +1929,20 @@ pub fn parse_extension_host_server_message(
                 summary,
                 operations,
             },
+        }),
+        RawExtensionHostMessage::ReviewReady {
+            reviewer_id,
+            contract,
+        } => Ok(ExtensionHostServerMessage::ReviewReady {
+            reviewer_id,
+            contract,
+        }),
+        RawExtensionHostMessage::ReviewResult {
+            request_id,
+            assessment,
+        } => Ok(ExtensionHostServerMessage::ReviewResult {
+            request_id,
+            assessment,
         }),
     }
 }
@@ -1835,7 +2019,9 @@ pub fn process_extension_registration_messages(
             }
             ExtensionHostServerMessage::ToolResult { .. }
             | ExtensionHostServerMessage::ResourceRequest { .. }
-            | ExtensionHostServerMessage::EditProposal { .. } => {
+            | ExtensionHostServerMessage::EditProposal { .. }
+            | ExtensionHostServerMessage::ReviewReady { .. }
+            | ExtensionHostServerMessage::ReviewResult { .. } => {
                 return Err(ExtensionHostProtocolError::Malformed);
             }
         }
@@ -1877,6 +2063,7 @@ where
         registry: &mut ToolRegistry,
         extension_version: Option<&str>,
         declared_tools: &[ExtensionToolContribution],
+        reviewer: Option<&ExtensionReviewerContribution>,
         timeout: Duration,
     ) -> Result<Vec<String>, ExtensionHostProtocolError> {
         self.transport
@@ -1900,7 +2087,9 @@ where
             ExtensionHostServerMessage::ToolRegister { .. }
             | ExtensionHostServerMessage::ToolResult { .. }
             | ExtensionHostServerMessage::ResourceRequest { .. }
-            | ExtensionHostServerMessage::EditProposal { .. } => {
+            | ExtensionHostServerMessage::EditProposal { .. }
+            | ExtensionHostServerMessage::ReviewReady { .. }
+            | ExtensionHostServerMessage::ReviewResult { .. } => {
                 return Err(ExtensionHostProtocolError::MissingReady);
             }
         }
@@ -1954,6 +2143,19 @@ where
             registry
                 .register_extension_tool(definition)
                 .map_err(ExtensionHostProtocolError::ToolRegistration)?;
+        }
+
+        if let Some(reviewer) = reviewer {
+            match self.transport.recv(timeout)? {
+                ExtensionHostServerMessage::ReviewReady {
+                    reviewer_id,
+                    contract,
+                } if reviewer_id == reviewer.reviewer_id && contract == REVIEW_CONTRACT => {}
+                ExtensionHostServerMessage::ReviewReady { .. } => {
+                    return Err(ExtensionHostProtocolError::ReviewerContractMismatch);
+                }
+                _ => return Err(ExtensionHostProtocolError::MissingReviewReady),
+            }
         }
 
         Ok(registered_tools)
@@ -2035,7 +2237,80 @@ where
                         })?;
                 }
                 ExtensionHostServerMessage::Ready { .. }
-                | ExtensionHostServerMessage::ToolRegister { .. } => {
+                | ExtensionHostServerMessage::ToolRegister { .. }
+                | ExtensionHostServerMessage::ReviewReady { .. }
+                | ExtensionHostServerMessage::ReviewResult { .. } => {
+                    return Err(ExtensionHostProtocolError::Malformed);
+                }
+            }
+        }
+        Err(ExtensionHostProtocolError::Malformed)
+    }
+
+    /// Send `review.assess` and return the matching `review.result` assessment.
+    ///
+    /// Resource requests are brokered read-only. The caller owns the 15-second
+    /// end-to-end budget; this method recomputes remaining time per message.
+    pub fn review(
+        &mut self,
+        request_id: &str,
+        request: serde_json::Value,
+        timeout: Duration,
+        resources: &dyn ExtensionResourceBroker,
+    ) -> Result<serde_json::Value, ExtensionHostProtocolError> {
+        self.transport
+            .send(ExtensionHostClientMessage::ReviewAssess {
+                request_id: request_id.to_owned(),
+                request,
+            })?;
+
+        let started = Instant::now();
+        let mut resource_request_ids = BTreeSet::new();
+        for _ in 0..64 {
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .ok_or(ExtensionHostProtocolError::TimedOut)?;
+            match self.transport.recv(remaining)? {
+                ExtensionHostServerMessage::ReviewResult {
+                    request_id: result_request_id,
+                    assessment,
+                } => {
+                    if result_request_id != request_id {
+                        return Err(ExtensionHostProtocolError::RequestIdMismatch);
+                    }
+                    let assessment_bytes = serde_json::to_vec(&assessment)
+                        .map_err(|_| ExtensionHostProtocolError::Malformed)?
+                        .len();
+                    if assessment_bytes > MAX_REVIEW_ASSESSMENT_BYTES
+                        || assessment_bytes > self.max_result_bytes
+                    {
+                        return Err(ExtensionHostProtocolError::OutputTooLarge {
+                            max_bytes: self.max_result_bytes.min(MAX_REVIEW_ASSESSMENT_BYTES),
+                        });
+                    }
+                    return Ok(assessment);
+                }
+                ExtensionHostServerMessage::ResourceRequest {
+                    request_id: resource_request_id,
+                    operation,
+                } => {
+                    if resource_request_id.is_empty()
+                        || !resource_request_ids.insert(resource_request_id.clone())
+                    {
+                        return Err(ExtensionHostProtocolError::RequestIdMismatch);
+                    }
+                    let result = resources.execute(&operation);
+                    self.transport
+                        .send(ExtensionHostClientMessage::ResourceResult {
+                            request_id: resource_request_id,
+                            result,
+                        })?;
+                }
+                ExtensionHostServerMessage::Ready { .. }
+                | ExtensionHostServerMessage::ToolRegister { .. }
+                | ExtensionHostServerMessage::ToolResult { .. }
+                | ExtensionHostServerMessage::EditProposal { .. }
+                | ExtensionHostServerMessage::ReviewReady { .. } => {
                     return Err(ExtensionHostProtocolError::Malformed);
                 }
             }
@@ -2058,6 +2333,16 @@ where
     ) -> Result<ExtensionHostInvocation, ExtensionHostProtocolError> {
         self.invoke_tool(request_id, tool_name, arguments, timeout, resources)
     }
+
+    fn review(
+        &mut self,
+        request_id: &str,
+        request: serde_json::Value,
+        timeout: Duration,
+        resources: &dyn ExtensionResourceBroker,
+    ) -> Result<serde_json::Value, ExtensionHostProtocolError> {
+        Self::review(self, request_id, request, timeout, resources)
+    }
 }
 
 pub fn run_extension_host_registration_command(
@@ -2073,7 +2358,7 @@ pub fn run_extension_host_registration_command(
         .args(&command.args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    configure_extension_host_process(&mut process);
+    configure_extension_host_process(&mut process, false);
 
     let mut child = process
         .spawn()
@@ -2151,23 +2436,42 @@ pub fn run_extension_host_registration_command(
 }
 
 #[cfg(unix)]
-fn configure_extension_host_process(command: &mut Command) {
-    configure_extension_host_environment(command);
+fn configure_extension_host_process(command: &mut Command, remote_reviewer: bool) {
+    configure_extension_host_environment(command, remote_reviewer);
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn configure_extension_host_process(command: &mut Command) {
-    configure_extension_host_environment(command);
+fn configure_extension_host_process(command: &mut Command, remote_reviewer: bool) {
+    configure_extension_host_environment(command, remote_reviewer);
 }
 
-fn configure_extension_host_environment(command: &mut Command) {
+fn configure_extension_host_environment(command: &mut Command, remote_reviewer: bool) {
     command.env_clear();
     copy_parent_env_if_present(command, "PATH");
     copy_parent_env_if_present(command, "HOME");
     copy_parent_env_if_present(command, "LANG");
     copy_parent_env_if_present(command, "LC_ALL");
     copy_parent_env_if_present(command, "LC_CTYPE");
+
+    if remote_reviewer {
+        // A remote reviewer calls its provider endpoint through the managed
+        // egress proxy; without these vars the subprocess bypasses policy
+        // enforcement and cannot verify the proxy's TLS interception.
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "NODE_EXTRA_CA_CERTS",
+            "TYPESAFE_API_KEY",
+        ] {
+            copy_parent_env_if_present(command, key);
+        }
+    }
 
     #[cfg(windows)]
     {
@@ -2717,6 +3021,31 @@ fn validate_tool_name(name: &str) -> Result<(), ExtensionManifestError> {
 
     Ok(())
 }
+fn parse_reviewer_contribution(
+    raw: RawExtensionReviewerContribution,
+) -> Result<ExtensionReviewerContribution, ExtensionManifestError> {
+    if !is_valid_reviewer_id(&raw.reviewer_id) {
+        return Err(ExtensionManifestError::InvalidReviewerId {
+            id: raw.reviewer_id,
+        });
+    }
+    if raw.disclosure_summary.chars().count() > MAX_DISCLOSURE_SUMMARY_LEN {
+        return Err(ExtensionManifestError::DisclosureSummaryTooLong);
+    }
+    Ok(ExtensionReviewerContribution {
+        reviewer_id: raw.reviewer_id,
+        disclosure_summary: raw.disclosure_summary,
+        remote: raw.remote,
+    })
+}
+
+fn is_valid_reviewer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_REVIEWER_ID_LEN
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '.' || ch == '-')
+}
 
 fn is_reserved_tool_name(name: &str) -> bool {
     matches!(name, "project_path_info" | "fixture_echo_metadata")
@@ -3236,6 +3565,7 @@ done
                     }],
                     static_context: Vec::new(),
                     tool_replacement_bundles: Vec::new(),
+                    reviewer: None,
                 },
             })
         );
@@ -3586,6 +3916,7 @@ done
                     tools: Vec::new(),
                     static_context: Vec::new(),
                     tool_replacement_bundles: Vec::new(),
+                    reviewer: None,
                 },
             },
         )?;
@@ -4042,6 +4373,249 @@ done
 
         expect_equal(&cache.host_start_count(), &0)
     }
+    fn reviewer_contribution(remote: bool) -> ExtensionReviewerContribution {
+        ExtensionReviewerContribution {
+            reviewer_id: String::from("acme-review"),
+            disclosure_summary: String::from("sends bounded action context to api.example"),
+            remote,
+        }
+    }
+
+    fn review_ready(reviewer_id: &str, contract: &str) -> ExtensionHostServerMessage {
+        ExtensionHostServerMessage::ReviewReady {
+            reviewer_id: reviewer_id.to_owned(),
+            contract: contract.to_owned(),
+        }
+    }
+
+    #[test]
+    fn reviewer_manifest_parses_and_requires_network_grant_when_remote() {
+        let manifest = parse_extension_manifest(serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "acme.review",
+            "version": "0.1.0",
+            "main": {"command": "review-host", "args": []},
+            "contributes": {
+                "reviewer": {
+                    "reviewer_id": "acme-review",
+                    "disclosure_summary": "sends bounded action context to api.example",
+                    "remote": true
+                }
+            }
+        }));
+        assert!(manifest.is_ok());
+        let Ok(manifest) = manifest else {
+            return;
+        };
+        let caps = requested_capabilities(
+            &manifest.contributes.tools,
+            manifest.contributes.reviewer.as_ref(),
+        );
+        assert!(caps.contains(&ExtensionCapability::UsesNetwork));
+        assert_eq!(
+            manifest.contributes.reviewer,
+            Some(reviewer_contribution(true))
+        );
+    }
+
+    #[test]
+    fn local_reviewer_does_not_request_network() {
+        let manifest = parse_extension_manifest(serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "acme.review",
+            "version": "0.1.0",
+            "main": {"command": "review-host"},
+            "contributes": {
+                "reviewer": {
+                    "reviewer_id": "acme-review",
+                    "disclosure_summary": "local only",
+                    "remote": false
+                }
+            }
+        }));
+        assert!(manifest.is_ok());
+        let Ok(manifest) = manifest else {
+            return;
+        };
+        assert!(
+            requested_capabilities(
+                &manifest.contributes.tools,
+                manifest.contributes.reviewer.as_ref(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn reviewer_manifest_with_tools_is_rejected() {
+        let error = parse_extension_manifest(serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "acme.review",
+            "version": "0.1.0",
+            "main": {"command": "review-host"},
+            "contributes": {
+                "tools": [{
+                    "name": "toy_tool",
+                    "description": "not allowed",
+                    "risk": "reads_local_metadata",
+                    "provider_visible": false
+                }],
+                "reviewer": {
+                    "reviewer_id": "acme-review",
+                    "disclosure_summary": "local only",
+                    "remote": false
+                }
+            }
+        }));
+        assert_eq!(
+            error,
+            Err(ExtensionManifestError::ReviewerCannotDeclareTools)
+        );
+    }
+
+    #[test]
+    fn reviewer_id_must_be_bounded_identifier() {
+        let empty = parse_extension_manifest(serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "acme.review",
+            "version": "0.1.0",
+            "main": {"command": "review-host"},
+            "contributes": {
+                "reviewer": {
+                    "reviewer_id": "",
+                    "disclosure_summary": "local only",
+                    "remote": false
+                }
+            }
+        }));
+        assert_eq!(
+            empty,
+            Err(ExtensionManifestError::InvalidReviewerId { id: String::new() })
+        );
+        let uppercase = parse_extension_manifest(serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "acme.review",
+            "version": "0.1.0",
+            "main": {"command": "review-host"},
+            "contributes": {
+                "reviewer": {
+                    "reviewer_id": "Acme",
+                    "disclosure_summary": "local only",
+                    "remote": false
+                }
+            }
+        }));
+        assert!(matches!(
+            uppercase,
+            Err(ExtensionManifestError::InvalidReviewerId { .. })
+        ));
+    }
+
+    #[test]
+    fn reviewer_host_must_send_review_ready_with_matching_id() {
+        let reviewer = reviewer_contribution(true);
+        let transport = FakeExtensionHostTransport::new([
+            Ok(ready_message("acme.review")),
+            Ok(review_ready("other", REVIEW_CONTRACT)),
+        ]);
+        let mut session = ExtensionHostSession::new("acme.review", transport, 16 * 1024);
+        let mut registry = ToolRegistry::with_project_read_only_tools();
+        let result = session.initialize_and_register(
+            &mut registry,
+            Some("0.1.0"),
+            &[],
+            Some(&reviewer),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            result,
+            Err(ExtensionHostProtocolError::ReviewerContractMismatch)
+        );
+    }
+
+    #[test]
+    fn reviewer_host_must_send_the_review_contract() {
+        let reviewer = reviewer_contribution(false);
+        let transport = FakeExtensionHostTransport::new([
+            Ok(ready_message("acme.review")),
+            Ok(review_ready("acme-review", "yach.review.v0")),
+        ]);
+        let mut session = ExtensionHostSession::new("acme.review", transport, 16 * 1024);
+        let mut registry = ToolRegistry::with_project_read_only_tools();
+        let result = session.initialize_and_register(
+            &mut registry,
+            Some("0.1.0"),
+            &[],
+            Some(&reviewer),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            result,
+            Err(ExtensionHostProtocolError::ReviewerContractMismatch)
+        );
+    }
+
+    #[test]
+    fn review_returns_matching_assessment() {
+        let assessment = serde_json::json!({"schema": "yach.review-assessment.v2", "allow": true});
+        let transport =
+            FakeExtensionHostTransport::new([Ok(ExtensionHostServerMessage::ReviewResult {
+                request_id: String::from("review-1"),
+                assessment: assessment.clone(),
+            })]);
+        let mut session = ExtensionHostSession::new("acme.review", transport, 16 * 1024);
+        let result = session.review(
+            "review-1",
+            serde_json::json!({"schema": "yach.review-request.v2"}),
+            Duration::from_secs(1),
+            &DenyExtensionResources,
+        );
+        assert_eq!(result, Ok(assessment));
+        assert!(matches!(
+            session.transport().sent().first(),
+            Some(ExtensionHostClientMessage::ReviewAssess { request_id, .. })
+                if request_id == "review-1"
+        ));
+    }
+
+    #[test]
+    fn reviewer_result_with_wrong_request_id_is_rejected() {
+        let transport =
+            FakeExtensionHostTransport::new([Ok(ExtensionHostServerMessage::ReviewResult {
+                request_id: String::from("nope"),
+                assessment: serde_json::json!({"allow": true}),
+            })]);
+        let mut session = ExtensionHostSession::new("acme.review", transport, 16 * 1024);
+        let result = session.review(
+            "review-1",
+            serde_json::json!({"schema": "yach.review-request.v2"}),
+            Duration::from_secs(1),
+            &DenyExtensionResources,
+        );
+        assert_eq!(result, Err(ExtensionHostProtocolError::RequestIdMismatch));
+    }
+
+    #[test]
+    fn oversized_review_assessment_is_rejected() {
+        let assessment = serde_json::json!({"blob": "x".repeat(MAX_REVIEW_ASSESSMENT_BYTES)});
+        let transport =
+            FakeExtensionHostTransport::new([Ok(ExtensionHostServerMessage::ReviewResult {
+                request_id: String::from("review-1"),
+                assessment,
+            })]);
+        let mut session = ExtensionHostSession::new("acme.review", transport, 64 * 1024);
+        let result = session.review(
+            "review-1",
+            serde_json::json!({}),
+            Duration::from_secs(1),
+            &DenyExtensionResources,
+        );
+        assert!(matches!(
+            result,
+            Err(ExtensionHostProtocolError::OutputTooLarge { .. })
+        ));
+    }
+
     #[test]
     fn extension_host_tool_result_requires_a_reason_for_failures() -> Result<(), String> {
         let failed = parse_extension_host_server_message(serde_json::json!({
@@ -4090,6 +4664,7 @@ done
                 &mut registry,
                 Some("0.1.0"),
                 &[toy_tool_declared()],
+                None,
                 Duration::from_secs(1),
             )
             .map_err(|error| format!("{error:?}"))?;
@@ -4162,6 +4737,7 @@ done
             &mut registry,
             Some("1.0.0"),
             &declared,
+            None,
             Duration::from_secs(1),
         );
 
@@ -4196,6 +4772,7 @@ done
             &mut registry,
             Some("1.0.0"),
             &declared,
+            None,
             Duration::from_secs(1),
         );
 
@@ -4240,6 +4817,7 @@ done
             &mut registry,
             Some("1.0.0"),
             &declared,
+            None,
             Duration::from_secs(1),
         );
 
@@ -4381,6 +4959,7 @@ done
             },
             &package.path,
             4096,
+            false,
         )
         .map_err(|error| format!("{error:?}"))?;
         let mut session = ExtensionHostSession::new("example.toy-tools", transport, 4096);
@@ -4391,6 +4970,7 @@ done
                 &mut registry,
                 None,
                 &[toy_tool_declared()],
+                None,
                 Duration::from_secs(1),
             )
             .map_err(|error| format!("{error:?}"))?;
@@ -4709,6 +5289,7 @@ done
                 &record.manifest.id.0,
                 &record.manifest.version,
                 &record.manifest.contributes.tools,
+                record.manifest.contributes.reviewer.as_ref(),
                 crate::ExtensionDecisionSurface::Cli,
             )
             .map_err(|error| format!("{error:?}"))?;
@@ -4820,6 +5401,7 @@ done
                 &mut registry,
                 None,
                 &[toy_tool_declared()],
+                None,
                 Duration::from_millis(1),
             ),
             &Err(ExtensionHostProtocolError::TimedOut),
@@ -4829,6 +5411,7 @@ done
                 &mut registry,
                 None,
                 &[toy_tool_declared()],
+                None,
                 Duration::from_millis(1),
             ),
             &Err(ExtensionHostProtocolError::HostExited { status: Some(7) }),

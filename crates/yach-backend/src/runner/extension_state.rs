@@ -177,13 +177,43 @@ fn schedule_extension_background_activation(
             let host_start_count = snapshot.host_start_count;
             {
                 let mut active_snapshot = activation_state.lock().await;
+                let previous_reviewer = active_snapshot.reviewer.take();
                 *active_snapshot = snapshot;
+                match (
+                    previous_reviewer.as_ref(),
+                    active_snapshot.reviewer.as_ref(),
+                ) {
+                    (Some(previous), None) => {
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::ReviewerStatusChanged {
+                            reviewer_id: previous.reviewer_id.clone(),
+                            generation: previous.generation,
+                            state: yach_proto::ReviewerState::Unavailable,
+                            disclosure_summary: String::new(),
+                        }));
+                    }
+                    (_, Some(reviewer)) => {
+                        let changed = previous_reviewer.as_ref().is_none_or(|previous| {
+                            previous.reviewer_id != reviewer.reviewer_id
+                                || previous.generation != reviewer.generation
+                        });
+                        if changed {
+                            let _ =
+                                tx.send(BackendEvent::Server(ServerEvent::ReviewerStatusChanged {
+                                    reviewer_id: reviewer.reviewer_id.clone(),
+                                    generation: reviewer.generation,
+                                    state: yach_proto::ReviewerState::Selected,
+                                    disclosure_summary: reviewer.disclosure_summary.clone(),
+                                }));
+                        }
+                    }
+                    (None, None) => {}
+                }
             }
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                    message: format!(
-                        "extension_background_activation_finished active_extension_count={active_extension_count} registered_tool_count={registered_tool_count} host_start_count={host_start_count}"
-                    ),
-                }));
+                message: format!(
+                    "extension_background_activation_finished active_extension_count={active_extension_count} registered_tool_count={registered_tool_count} host_start_count={host_start_count}"
+                ),
+            }));
         } else {
             mark_extension_scan(trace.as_ref(), "extension_background_activation_failed");
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -331,6 +361,10 @@ pub(super) async fn handle_native_extension_lifecycle_request(
         return;
     }
 
+    let previous_reviewer = {
+        let snapshot = activation_state.lock().await;
+        snapshot.reviewer.clone()
+    };
     let (outcome, message) = {
         let mut snapshot = activation_state.lock().await;
         match action {
@@ -361,6 +395,18 @@ pub(super) async fn handle_native_extension_lifecycle_request(
             }
         }
     };
+
+    if action == ExtensionLifecycleAction::Stop
+        && outcome == ExtensionLifecycleOutcome::Completed
+        && let Some(reviewer) = previous_reviewer
+    {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::ReviewerStatusChanged {
+            reviewer_id: reviewer.reviewer_id,
+            generation: reviewer.generation,
+            state: yach_proto::ReviewerState::Unavailable,
+            disclosure_summary: String::new(),
+        }));
+    }
 
     let _ = tx.send(BackendEvent::Server(
         ServerEvent::ExtensionLifecycleFinished {
@@ -476,6 +522,7 @@ fn schedule_native_extension_reload(
             ),
             &selector,
         );
+        let reviewer_snapshot = snapshot.reviewer.clone();
         let _ = tx.send(BackendEvent::Server(
             ServerEvent::ExtensionLifecycleFinished {
                 request_id,
@@ -485,6 +532,16 @@ fn schedule_native_extension_reload(
                 message,
             },
         ));
+        if outcome == ExtensionLifecycleOutcome::Completed
+            && let Some(reviewer) = reviewer_snapshot
+        {
+            let _ = tx.send(BackendEvent::Server(ServerEvent::ReviewerStatusChanged {
+                reviewer_id: reviewer.reviewer_id,
+                generation: reviewer.generation,
+                state: yach_proto::ReviewerState::Reloaded,
+                disclosure_summary: reviewer.disclosure_summary,
+            }));
+        }
     });
 }
 
@@ -544,6 +601,7 @@ fn schedule_native_extension_trust(
             extension_id,
             &record.manifest.version,
             &record.manifest.contributes.tools,
+            record.manifest.contributes.reviewer.as_ref(),
             crate::ExtensionDecisionSurface::Lifecycle,
         ) {
             Ok(None) => (

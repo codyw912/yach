@@ -105,7 +105,7 @@ static ALL: LazyLock<Vec<Workload>> = LazyLock::new(|| {
     workloads.extend_from_slice(&crate::perf::workloads::extension::EXTENSION);
     workloads.extend_from_slice(&crate::perf::workloads::binary::BINARY);
     workloads.extend_from_slice(&crate::perf::workloads::core_loop::CORE_LOOP);
-
+    workloads.extend_from_slice(&crate::perf::workloads::review::REVIEW);
     workloads
 });
 
@@ -223,6 +223,8 @@ mod tests {
                 "extension/activation/hashline_ext/total",
                 "extension/execute/hashline_ext/one_call",
                 "extension/execute/hashline_ext/tools_4_total",
+                "review/route/deterministic",
+                "review/route/fixture_assess",
             ])
         );
     }

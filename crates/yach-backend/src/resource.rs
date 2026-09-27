@@ -9,6 +9,18 @@ use crate::sensitive_paths::SensitivePathPolicy;
 pub enum ResourceRootKind {
     /// Project-local resources rooted at the current workspace/project.
     Project,
+    /// A single file outside the project, granted by exact-target review.
+    /// The root is the granted file's parent; the sensitive policy is an
+    /// exact-allowlist containing only that file.
+    ExactTarget,
+}
+
+/// A recorded exact-target grant. Evidence that the user approved one
+/// specific file outside the project root; not a standing permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactTargetGrant {
+    /// Canonical path of the granted file.
+    pub canonical_target: PathBuf,
 }
 
 /// Errors produced while resolving native resource paths.
@@ -221,6 +233,9 @@ pub struct ResourceRoot {
     pub kind: ResourceRootKind,
     canonical_path: PathBuf,
     sensitive_policy: SensitivePathPolicy,
+    /// The single file an `ExactTarget` root may resolve. `None` for project
+    /// roots, which resolve any path beneath the root.
+    granted_target: Option<PathBuf>,
 }
 
 impl ResourceRoot {
@@ -242,6 +257,44 @@ impl ResourceRoot {
             kind: ResourceRootKind::Project,
             canonical_path,
             sensitive_policy: SensitivePathPolicy::default(),
+            granted_target: None,
+        })
+    }
+
+    /// Root scoped to one granted file outside the project. The canonical
+    /// path is the target's parent; resolution rejects every path except the
+    /// granted file itself. Authority and control-plane ancestors (`.git`,
+    /// `.jj`, `.yach`, `target`) are rejected unconditionally — the grant
+    /// never covers them.
+    pub fn for_review_target(
+        canonical_target: &Path,
+        grant: &ExactTargetGrant,
+    ) -> Result<Self, ResourcePathError> {
+        if canonical_target != grant.canonical_target {
+            return Err(ResourcePathError::EscapesRoot);
+        }
+        // Reject any control-plane ancestor, not just the leaf: a grant for
+        // `/home/u/.git/config` must not produce a root at `/home/u/.git`.
+        let control_plane = canonical_target.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some(".git" | ".jj" | ".yach" | "target" | ".hg" | ".svn")
+            )
+        });
+        if control_plane {
+            return Err(ResourcePathError::SensitiveDenied);
+        }
+        let parent = canonical_target
+            .parent()
+            .ok_or(ResourcePathError::RootUnavailable)?;
+        if !parent.is_dir() {
+            return Err(ResourcePathError::RootUnavailable);
+        }
+        Ok(Self {
+            kind: ResourceRootKind::ExactTarget,
+            canonical_path: parent.to_path_buf(),
+            sensitive_policy: SensitivePathPolicy::deny_nothing(),
+            granted_target: Some(canonical_target.to_path_buf()),
         })
     }
 
@@ -596,6 +649,14 @@ impl ResourceRoot {
             };
             return Err(error);
         }
+        // An exact-target root resolves only the granted file. A sibling in
+        // the same directory, a subdirectory, or a symlink that happens to
+        // land inside the parent is still outside the grant.
+        if self.kind == ResourceRootKind::ExactTarget
+            && self.granted_target.as_ref() != Some(&canonical)
+        {
+            return Err(ResourcePathError::EscapesRoot);
+        }
         Ok(canonical)
     }
 
@@ -630,4 +691,88 @@ fn generated_or_heavy_resource_entry(file_name: &str) -> bool {
             | "venv"
             | "__pycache__"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tempdir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "yach-resource-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        assert!(fs::create_dir_all(&dir).is_ok());
+        dir
+    }
+
+    #[test]
+    fn exact_target_rejects_sibling_file() {
+        let dir = tempdir();
+        let granted = dir.join("granted.txt");
+        let sibling = dir.join("sibling.txt");
+        assert!(fs::write(&granted, "granted").is_ok());
+        assert!(fs::write(&sibling, "sibling").is_ok());
+        let Ok(canonical_target) = granted.canonicalize() else {
+            return;
+        };
+        let grant = ExactTargetGrant { canonical_target };
+        let Ok(root) = ResourceRoot::for_review_target(&grant.canonical_target, &grant) else {
+            return;
+        };
+        // The granted file resolves.
+        assert!(root.resolve_file("granted.txt").is_ok());
+        // A sibling in the same directory does not.
+        assert_eq!(
+            root.resolve_file("sibling.txt"),
+            Err(ResourcePathError::EscapesRoot)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_target_rejects_control_plane_ancestor() {
+        let dir = tempdir();
+        let git_dir = dir.join(".git");
+        assert!(fs::create_dir_all(&git_dir).is_ok());
+        let target = git_dir.join("config");
+        assert!(fs::write(&target, "[core]").is_ok());
+        let Ok(canonical_target) = target.canonicalize() else {
+            return;
+        };
+        let grant = ExactTargetGrant { canonical_target };
+        assert_eq!(
+            ResourceRoot::for_review_target(&grant.canonical_target, &grant),
+            Err(ResourcePathError::SensitiveDenied)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_target_rejects_symlink_in_parent() {
+        let dir = tempdir();
+        let granted = dir.join("granted.txt");
+        let outside = dir.join("outside.txt");
+        let link = dir.join("link.txt");
+        assert!(fs::write(&granted, "granted").is_ok());
+        assert!(fs::write(&outside, "outside").is_ok());
+        assert!(std::os::unix::fs::symlink(&outside, &link).is_ok());
+        let Ok(canonical_target) = granted.canonicalize() else {
+            return;
+        };
+        let grant = ExactTargetGrant { canonical_target };
+        let Ok(root) = ResourceRoot::for_review_target(&grant.canonical_target, &grant) else {
+            return;
+        };
+        // A symlink that resolves inside the parent is still not the granted file.
+        assert_eq!(
+            root.resolve_file("link.txt"),
+            Err(ResourcePathError::EscapesRoot)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

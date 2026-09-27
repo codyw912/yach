@@ -321,6 +321,7 @@ fn local_edit_review_status_message(review_state: LocalEditReviewState) -> &'sta
         LocalEditReviewState::AutoReviewUnavailable => {
             "auto-review unavailable; user approval required"
         }
+        LocalEditReviewState::HumanPerforms => "reserved for the user to perform",
     }
 }
 
@@ -361,6 +362,11 @@ enum AppMode {
     FullAccessConfirm {
         selected: FullAccessConfirmationAction,
     },
+    AutoReviewConfirm {
+        selected: FullAccessConfirmationAction,
+        reviewer_id: String,
+        disclosure_summary: String,
+    },
     HelpOverlay,
     DialogConfirm,
     DialogInput,
@@ -377,6 +383,13 @@ enum AppMode {
     },
 }
 
+/// Last known reviewer status from the backend.
+#[derive(Debug, Clone)]
+struct ReviewerStatus {
+    reviewer_id: String,
+    generation: u64,
+    disclosure_summary: String,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FullAccessConfirmationAction {
     Enable,
@@ -736,6 +749,9 @@ pub struct App {
     session_tree: Option<SessionTree>,
     thinking_level: ThinkingLevel,
     approval_mode: ApprovalMode,
+    /// Last reviewer status from `ReviewerStatusChanged`; `None` until the
+    /// backend reports a selected reviewer.
+    reviewer_status: Option<ReviewerStatus>,
     pending_model: Option<String>,
     pending_model_id: Option<String>,
     pending_model_connection_id: PendingModelConnectionId,
@@ -804,6 +820,7 @@ impl App {
             session_tree: None,
             thinking_level: ThinkingLevel::Off,
             approval_mode: ApprovalMode::Review,
+            reviewer_status: None,
             pending_model: None,
             pending_model_id: None,
             pending_model_connection_id: PendingModelConnectionId::NotPending,
@@ -1161,6 +1178,21 @@ impl App {
     fn handle_server_event(&mut self, event: ServerEvent) {
         match event {
             ServerEvent::Ready { .. } => {}
+            ServerEvent::ReviewerStatusChanged {
+                reviewer_id,
+                generation,
+                state,
+                disclosure_summary,
+            } => {
+                self.reviewer_status = match state {
+                    yach_proto::ReviewerState::Unavailable => None,
+                    _ => Some(ReviewerStatus {
+                        reviewer_id,
+                        generation,
+                        disclosure_summary,
+                    }),
+                };
+            }
             ServerEvent::StateUpdated(state) => self.apply_backend_state(*state),
             ServerEvent::ApprovalModeChanged { mode, .. } => {
                 self.approval_mode = mode;
@@ -1857,6 +1889,9 @@ impl App {
             AppMode::ApprovalSelect { .. } => self.handle_approval_select_key(key, modifiers),
             AppMode::FullAccessConfirm { .. } => {
                 self.handle_full_access_confirm_key(key, modifiers);
+            }
+            AppMode::AutoReviewConfirm { .. } => {
+                self.handle_auto_review_confirm_key(key, modifiers);
             }
             AppMode::HelpOverlay => self.handle_help_overlay_key(key, modifiers),
             AppMode::DialogConfirm => self.handle_dialog_confirm_key(key, modifiers),
@@ -2732,6 +2767,8 @@ impl App {
                 if let Some(mode) = ApprovalMode::ALL.get(selected).copied() {
                     if mode == ApprovalMode::FullAccess {
                         self.open_full_access_confirmation();
+                    } else if mode == ApprovalMode::AutoReview {
+                        self.open_auto_review_confirmation();
                     } else {
                         self.request_approval_mode(mode);
                         self.mode = AppMode::Normal;
@@ -2748,6 +2785,58 @@ impl App {
             selected: FullAccessConfirmationAction::Cancel,
         };
         self.status_message = String::from("full-access confirmation required");
+    }
+
+    fn open_auto_review_confirmation(&mut self) {
+        let Some(status) = self.reviewer_status.as_ref() else {
+            self.status_message = String::from("auto-review unavailable: no reviewer selected");
+            self.mode = AppMode::Normal;
+            return;
+        };
+        self.mode = AppMode::AutoReviewConfirm {
+            selected: FullAccessConfirmationAction::Cancel,
+            reviewer_id: status.reviewer_id.clone(),
+            disclosure_summary: status.disclosure_summary.clone(),
+        };
+        self.status_message = String::from("auto-review confirmation required");
+    }
+
+    fn handle_auto_review_confirm_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        let AppMode::AutoReviewConfirm {
+            selected,
+            reviewer_id,
+            disclosure_summary,
+        } = &self.mode
+        else {
+            return;
+        };
+        let reviewer_id = reviewer_id.clone();
+        let disclosure_summary = disclosure_summary.clone();
+        match (key, modifiers) {
+            (key, modifiers) if is_selection_up_key(key, modifiers) => {
+                self.mode = AppMode::AutoReviewConfirm {
+                    selected: FullAccessConfirmationAction::Enable,
+                    reviewer_id,
+                    disclosure_summary,
+                };
+            }
+            (key, modifiers) if is_selection_down_key(key, modifiers) => {
+                self.mode = AppMode::AutoReviewConfirm {
+                    selected: FullAccessConfirmationAction::Cancel,
+                    reviewer_id,
+                    disclosure_summary,
+                };
+            }
+            (KeyCode::Enter, _) if *selected == FullAccessConfirmationAction::Enable => {
+                self.request_approval_mode(ApprovalMode::AutoReview);
+                self.mode = AppMode::Normal;
+            }
+            (KeyCode::Enter | KeyCode::Esc, _) => {
+                self.status_message = String::from("auto-review cancelled");
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
     }
 
     fn handle_full_access_confirm_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
@@ -3294,6 +3383,14 @@ impl App {
             format!("connection: {connection}"),
             format!("approval: {}", self.approval_mode.as_str()),
         ];
+        if self.approval_mode == ApprovalMode::AutoReview
+            && let Some(status) = &self.reviewer_status
+        {
+            lines.push(format!(
+                "reviewer: {} (generation {}, isolation: none (process host))",
+                status.reviewer_id, status.generation
+            ));
+        }
         if let Some(stats) = &self.session_stats {
             if let Some(percent) = stats.context_used_percent {
                 lines.push(format!(
@@ -4038,6 +4135,11 @@ impl BenchmarkApp {
             model: &self.app.model,
             thinking_level: self.app.thinking_level.as_str(),
             approval_mode: self.app.approval_mode.as_str(),
+            reviewer_id: self
+                .app
+                .reviewer_status
+                .as_ref()
+                .map(|status| status.reviewer_id.as_str()),
             status_message: &self.app.status_message,
             is_connected: self.app.is_connected,
             compaction_count,
@@ -4245,6 +4347,10 @@ pub async fn run_tui_with_trace_and_options(
                 model: &model,
                 thinking_level: thinking_level.as_str(),
                 approval_mode: approval_mode.as_str(),
+                reviewer_id: app
+                    .reviewer_status
+                    .as_ref()
+                    .map(|status| status.reviewer_id.as_str()),
                 status_message: &status_message,
                 is_connected: app.is_connected,
                 compaction_count,
@@ -4349,6 +4455,21 @@ pub async fn run_tui_with_trace_and_options(
                     frame.render_widget(
                         crate::approval_selector::FullAccessConfirmation {
                             enable_selected: *selected == FullAccessConfirmationAction::Enable,
+                            theme: &app.theme,
+                        },
+                        frame.area(),
+                    );
+                }
+                AppMode::AutoReviewConfirm {
+                    selected,
+                    reviewer_id,
+                    disclosure_summary,
+                } => {
+                    frame.render_widget(
+                        crate::approval_selector::AutoReviewConfirmation {
+                            enable_selected: *selected == FullAccessConfirmationAction::Enable,
+                            reviewer_id,
+                            disclosure_summary,
                             theme: &app.theme,
                         },
                         frame.area(),
@@ -4978,6 +5099,7 @@ mod tests {
             review_state,
             diff_summary: String::from("-old\n+new"),
             diff_summary_truncated: false,
+            review_origin: None,
         }
     }
 
@@ -6747,11 +6869,31 @@ mod tests {
     }
 
     #[test]
+    fn auto_review_selection_refused_without_reviewer() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_prompt_text("/approval");
+        app.submit_input();
+        // Navigate to AutoReview (index 2 in ApprovalMode::ALL).
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(
+            app.status_message,
+            "auto-review unavailable: no reviewer selected"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn approval_picker_requires_confirmation_before_full_access() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
         app.set_prompt_text("/approval");
         app.submit_input();
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
@@ -8458,6 +8600,7 @@ mod tests {
                     review_state: LocalEditReviewState::NeedsUserApproval,
                     diff_summary: String::from("+ added"),
                     diff_summary_truncated: false,
+                    review_origin: None,
                 },
             },
         );
@@ -8486,6 +8629,7 @@ mod tests {
                     command: String::from("cargo test"),
                     workdir: None,
                     timeout_ms: 30_000,
+                    review_origin: None,
                 },
             },
         );
@@ -8806,6 +8950,7 @@ mod tests {
                     command: String::from("cat src/lib.rs"),
                     workdir: None,
                     timeout_ms: 1_000,
+                    review_origin: None,
                 },
             },
         );

@@ -70,6 +70,8 @@ pub(super) fn handle_native_local_edit_prepare(
         permission_policy: PermissionPolicy::default_local_edit(),
         edit_policy: EditPolicy::conservative(),
         tool_request_id: None,
+        review_policy: crate::ReviewPolicy::empty(),
+        authorization_revision: 0,
     };
 
     match edit_access.prepare(edit_root, request, context, &mut log) {
@@ -245,6 +247,7 @@ pub(super) fn local_edit_preview_summary(
         review_state,
         diff_summary: preview.diff_summary,
         diff_summary_truncated: preview.diff_summary_truncated,
+        review_origin: None,
     }
 }
 
@@ -253,6 +256,7 @@ const fn local_edit_review_state(review_state: &EditAccessReviewState) -> LocalE
         EditAccessReviewState::Allowed => LocalEditReviewState::Allowed,
         EditAccessReviewState::NeedsUserApproval => LocalEditReviewState::NeedsUserApproval,
         EditAccessReviewState::AutoReviewUnavailable => LocalEditReviewState::AutoReviewUnavailable,
+        EditAccessReviewState::HumanPerforms => LocalEditReviewState::HumanPerforms,
     }
 }
 
@@ -272,5 +276,6 @@ pub(super) fn local_edit_error_message(error: &EditAccessError) -> String {
         EditAccessError::EvidencePersistFailed => {
             String::from("failed to persist local edit evidence")
         }
+        EditAccessError::StaleAuthorization => String::from("local edit authorization went stale"),
     }
 }

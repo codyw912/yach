@@ -382,7 +382,7 @@ fn bundled_hashline_package_lists_disables_and_reenables_through_cli() {
         .test_unwrap();
     assert!(list.status.success());
     let list_stdout = String::from_utf8(list.stdout).test_unwrap();
-    assert!(list_stdout.contains("extension_count=1"));
+    assert!(list_stdout.contains("extension_count=2"));
     assert!(list_stdout.contains("extension id=yach.hashline"));
     assert!(list_stdout.contains("activation_state=discovered"));
 

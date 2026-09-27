@@ -15,7 +15,11 @@ pub struct ApprovalModeSelector<'a> {
 impl Widget for ApprovalModeSelector<'_> {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         Clear.render(area, buf);
-        let popup_area = centered_rect(area, 32, 5);
+        let popup_area = centered_rect(
+            area,
+            32,
+            u16::try_from(ApprovalMode::ALL.len()).unwrap_or(4) + 2,
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(self.theme.colors.border))
@@ -114,6 +118,71 @@ impl Widget for FullAccessConfirmation<'_> {
     }
 }
 
+pub struct AutoReviewConfirmation<'a> {
+    pub enable_selected: bool,
+    pub reviewer_id: &'a str,
+    pub disclosure_summary: &'a str,
+    pub theme: &'a Theme,
+}
+
+impl Widget for AutoReviewConfirmation<'_> {
+    fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        Clear.render(area, buf);
+        let popup_area = centered_rect(area, 76, 14);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(self.theme.colors.warning))
+            .title(" Auto Review — Delegated Approval ")
+            .title_style(
+                Style::new()
+                    .fg(self.theme.colors.warning)
+                    .add_modifier(Modifier::BOLD),
+            );
+        let enable_style = if self.enable_selected {
+            Style::new()
+                .fg(self.theme.colors.selected_text)
+                .bg(self.theme.colors.warning)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(self.theme.colors.warning)
+        };
+        let cancel_style = if self.enable_selected {
+            Style::new().fg(self.theme.colors.muted)
+        } else {
+            Style::new()
+                .fg(self.theme.colors.selected_text)
+                .bg(self.theme.colors.success)
+                .add_modifier(Modifier::BOLD)
+        };
+        let lines = vec![
+            Line::from(format!("Reviewer: {}", self.reviewer_id)),
+            Line::from(format!("Disclosure: {}", self.disclosure_summary)),
+            Line::from(""),
+            Line::from("The reviewer approves or holds each action before it runs."),
+            Line::from("This mode lasts for this session only."),
+            Line::from(""),
+            Line::from(Span::styled(
+                if self.enable_selected {
+                    "› Enable for this session"
+                } else {
+                    "  Enable for this session"
+                },
+                enable_style,
+            )),
+            Line::from(Span::styled(
+                if self.enable_selected {
+                    "  Cancel"
+                } else {
+                    "› Cancel"
+                },
+                cancel_style,
+            )),
+            Line::from("↑/↓ or j/k select · Enter confirm · Esc cancel"),
+        ];
+        Widget::render(Paragraph::new(lines).block(block), popup_area, buf);
+    }
+}
+
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -139,7 +208,10 @@ mod tests {
         Widget::render(
             ApprovalModeSelector {
                 current_mode: ApprovalMode::Review,
-                selected_index: 2,
+                selected_index: ApprovalMode::ALL
+                    .iter()
+                    .position(|m| *m == ApprovalMode::FullAccess)
+                    .unwrap_or(0),
                 theme: &Theme::default(),
             },
             area,

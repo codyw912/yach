@@ -16,6 +16,7 @@ const PRIORITY_MODEL: u8 = 99;
 // the always-visible mode indicators kept their space.
 const PRIORITY_STATUS: u8 = 95;
 const PRIORITY_APPROVAL: u8 = 90;
+const PRIORITY_REVIEWER: u8 = 85;
 const PRIORITY_CONNECTION: u8 = 80;
 const PRIORITY_COMPACTION: u8 = 60;
 // Below context: a narrow terminal should drop the cumulative total before
@@ -28,6 +29,7 @@ enum SegmentId {
     Connection,
     Model,
     Approval,
+    Reviewer,
     Context,
     Compaction,
     Tokens,
@@ -58,6 +60,8 @@ pub struct StatusBar<'a> {
     pub model: &'a str,
     pub thinking_level: &'a str,
     pub approval_mode: &'a str,
+    /// Active reviewer id when `approval_mode == "auto-review"`.
+    pub reviewer_id: Option<&'a str>,
     pub status_message: &'a str,
     pub is_connected: bool,
     pub compaction_count: u64,
@@ -87,6 +91,13 @@ impl StatusBar<'_> {
             format!("approval:{}", self.approval_mode),
             PRIORITY_APPROVAL,
         ));
+        if let Some(reviewer_id) = self.reviewer_id {
+            segments.push(Segment::new(
+                SegmentId::Reviewer,
+                format!("auto:{reviewer_id}"),
+                PRIORITY_REVIEWER,
+            ));
+        }
 
         if let Some(percent) = self.context_used_percent {
             segments.push(Segment::new(
@@ -217,7 +228,7 @@ fn segment_style(
         } else {
             colors.error
         }),
-        SegmentId::Model => Style::new().fg(colors.accent),
+        SegmentId::Model | SegmentId::Reviewer => Style::new().fg(colors.accent),
         SegmentId::Approval => Style::new().fg(if approval_mode == "full-access" {
             colors.error
         } else {
@@ -301,6 +312,7 @@ mod tests {
                     model: "default",
                     thinking_level: "off",
                     approval_mode: "review",
+                    reviewer_id: None,
                     status_message: message,
                     is_connected: true,
                     compaction_count: 0,
@@ -330,6 +342,7 @@ mod tests {
             model: "default",
             thinking_level: "off",
             approval_mode: "review",
+            reviewer_id: None,
             status_message: "unknown command /aproval \u{2014} did you mean /approval?",
             is_connected: true,
             compaction_count: 3,
@@ -382,6 +395,7 @@ mod tests {
                 model: "gpt-5.6-sol",
                 thinking_level: "high",
                 approval_mode: "review",
+                reviewer_id: None,
                 status_message: "ready",
                 is_connected: true,
                 compaction_count: 0,

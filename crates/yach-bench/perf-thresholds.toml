@@ -41,8 +41,8 @@ comment = "ceil(spread)+3 on p95 from six 30-sample runs on 2026-09-13: one_call
 
 [[workload]]
 id = "binary/size_bytes"
-size_pct = 1.5
-comment = "session-log batching + deferred fsync: CI measured 26488680 -> 26754776 (+1.00%) against the 0.5% default. Named here so the reviewer sees the product cost; 1.5% admits 1.00% without turning size into a waiver."
+size_pct = 5.0
+comment = "Deliberate headroom while the product is still expanding, not a target: feature-sized PRs necessarily grow the binary, and a budget fitted to each one's measurement would need raising on the next. The per-PR rule does not bound cumulative growth, so this row is a stopgap until size is also tracked against a fixed reference; tighten it once expansion slows. Set at 5.0 in PR #278 (intent-aware auto-review), which measured 26946880 -> 28158864 (+4.50%, .text +941260) against main; its only new crate in the yach binary is yach-jev-reviewer, dependency features unchanged, and the rest is review code plus generic duplication (similar's myers routines 3 -> 14 monomorphized copies with no new caller). Earlier: session-log batching + deferred fsync measured +1.00% against the 0.5% default."
 
 [[workload]]
 id = "*#alloc_count"
@@ -54,10 +54,15 @@ count = 0
 
 [[workload]]
 id = "turn/scripted/text_only#alloc_bytes"
-count = 128
-comment = "session approval grants: the gate measures 331870 -> 331998 (+128 bytes) with alloc_count unchanged, reproduced locally and in CI. Substituting a zero-sized grant store restores the byte-identical baseline, which isolates the growth to carrying the grant handle; the allocator mechanism behind it was not investigated further. Budgeted at the measured 128 exactly, so any further growth on this row fails."
+count = 1536
+comment = "intent-aware auto-review (PR #278): measured 331870 -> 333406 (+1536 bytes) against main, alloc_count unchanged (2554). Inferred, not isolated: the turn task now carries the review policy and authorization-revision handles (runner.rs:832-835) into each spawned prompt. Budgeted at the measured 1536 exactly, so any further growth fails. Earlier row: session approval grants measured +128."
 
 [[workload]]
 id = "turn/scripted/tools_4/builtin#alloc_bytes"
-count = 128
-comment = "session approval grants: the gate measures 592074 -> 592202 (+128 bytes) with alloc_count unchanged. Same cost as the row above, carried through a workload that runs four tool calls. Budgeted at the measured 128 exactly."
+count = 1536
+comment = "intent-aware auto-review (PR #278): measured 592074 -> 593610 (+1536 bytes) against main, alloc_count unchanged (4587). Same inferred cause as the text_only row; the four tool calls add nothing beyond it. Budgeted at the measured 1536 exactly."
+
+[[workload]]
+id = "review/route/*"
+latency_pct = 10.0
+comment = "first landing: no baseline measurement yet; inconclusive acceptable per convention"

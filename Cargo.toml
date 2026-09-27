@@ -4,6 +4,7 @@ members = [
     "crates/yach-bench",
     "crates/yach-catalog",
     "crates/yach-hashline-extension",
+    "crates/yach-jev-reviewer",
     "crates/yach-connections",
     "crates/yach-cli",
     "crates/yach-proto",

@@ -9,8 +9,9 @@ use yach_proto::{ApprovalMode, ThinkingLevel, ToolReviewDecision, ToolReviewPayl
 
 use crate::static_context::{StaticContextOmission, StaticContextSummary};
 use crate::{
-    EditPreviewId, EditTransactionId, PermissionDecisionId, PermissionDecisionSummary, ToolError,
-    ToolPermissionState,
+    BoundedReviewText, EditPreviewId, EditTransactionId, GrantExpiry, PermissionDecisionId,
+    PermissionDecisionSummary, PolicyRevision, ReviewAssessmentSummary, ReviewPolicySurface,
+    ReviewRequestSummary, ToolError, ToolPermissionState,
 };
 use yach_connections::{ConnectionId, ConnectionKey};
 
@@ -455,6 +456,26 @@ pub enum SessionEvent {
         bytes_freed: u64,
         reason: MaskReason,
     },
+    /// Durable restriction set changed. Carries the revision and surface only.
+    ReviewPolicyChanged {
+        project_key: BoundedReviewText,
+        revision: PolicyRevision,
+        surface: ReviewPolicySurface,
+    },
+    /// Bounded review request recorded before assessment. No command env or secrets.
+    ReviewRequestRecorded { request: ReviewRequestSummary },
+    /// Bounded assessment recorded before any effect.
+    ReviewAssessmentRecorded {
+        request_id: BoundedReviewText,
+        assessment: ReviewAssessmentSummary,
+    },
+    /// Evidence that an exact-action grant was recorded. The fingerprint is a
+    /// hash, not the raw command or environment.
+    ExactActionGrantRecorded {
+        grant_id: BoundedReviewText,
+        action_fingerprint: BoundedReviewText,
+        expires: GrantExpiry,
+    },
 }
 
 /// In-memory view reconstructed from a native append-only event log.
@@ -530,6 +551,10 @@ impl SessionLog {
             | SessionEvent::MetricRecorded { .. }
             | SessionEvent::StaticContextIncluded { .. }
             | SessionEvent::PermissionDecisionRecorded { .. }
+            | SessionEvent::ReviewPolicyChanged { .. }
+            | SessionEvent::ReviewRequestRecorded { .. }
+            | SessionEvent::ReviewAssessmentRecorded { .. }
+            | SessionEvent::ExactActionGrantRecorded { .. }
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
             | SessionEvent::SessionModelChanged { .. }
@@ -542,6 +567,27 @@ impl SessionLog {
             | SessionEvent::CompactionCheckpoint { .. }
             | SessionEvent::ToolResultMasked { .. } => None,
         })
+    }
+
+    /// Trusted user messages from the durable log, newest first, with the
+    /// entry and turn that produced them. Compaction summaries are
+    /// `Role::Assistant`/system material and never appear here.
+    #[must_use]
+    pub fn user_messages_newest_first(&self) -> Vec<(&EntryId, &TurnId, &str)> {
+        self.events
+            .iter()
+            .rev()
+            .filter_map(|event| match event {
+                SessionEvent::EntryAppended {
+                    role: Role::User,
+                    entry_id,
+                    turn_id,
+                    text,
+                    ..
+                } => Some((entry_id, turn_id, text.as_str())),
+                _ => None,
+            })
+            .collect()
     }
 
     #[must_use]
@@ -559,6 +605,10 @@ impl SessionLog {
                 | SessionEvent::MetricRecorded { .. }
                 | SessionEvent::StaticContextIncluded { .. }
                 | SessionEvent::PermissionDecisionRecorded { .. }
+                | SessionEvent::ReviewPolicyChanged { .. }
+                | SessionEvent::ReviewRequestRecorded { .. }
+                | SessionEvent::ReviewAssessmentRecorded { .. }
+                | SessionEvent::ExactActionGrantRecorded { .. }
                 | SessionEvent::ApprovalModeChanged { .. }
                 | SessionEvent::ThinkingLevelChanged { .. }
                 | SessionEvent::SessionModelChanged { .. }
@@ -711,7 +761,11 @@ fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
         SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::ApprovalModeChanged { .. }
         | SessionEvent::ThinkingLevelChanged { .. }
-        | SessionEvent::SessionModelChanged { .. } => None,
+        | SessionEvent::SessionModelChanged { .. }
+        | SessionEvent::ReviewPolicyChanged { .. }
+        | SessionEvent::ReviewRequestRecorded { .. }
+        | SessionEvent::ReviewAssessmentRecorded { .. }
+        | SessionEvent::ExactActionGrantRecorded { .. } => None,
     }
 }
 
@@ -849,5 +903,114 @@ mod tests {
         let decoded = serde_json::from_str::<SessionEvent>(&encoded);
         assert!(decoded.is_ok());
         assert_eq!(decoded.ok(), Some(log.events[1].clone()));
+    }
+
+    #[test]
+    fn review_policy_and_assessment_events_round_trip_through_session_log_jsonl() {
+        let path = std::env::temp_dir().join(format!(
+            "yach-review-events-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let policy_changed = SessionEvent::ReviewPolicyChanged {
+            project_key: BoundedReviewText::new("proj-key"),
+            revision: crate::PolicyRevision(3),
+            surface: crate::ReviewPolicySurface::Tui,
+        };
+        let assessment = SessionEvent::ReviewAssessmentRecorded {
+            request_id: BoundedReviewText::new("review-req-1"),
+            assessment: crate::ReviewAssessmentSummary {
+                reviewer_id: BoundedReviewText::new("jev-typesafe"),
+                reason: BoundedReviewText::new("reviewer_hold_risk"),
+                model: BoundedReviewText::new("jev-1.13.0"),
+            },
+        };
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::EntryAppended {
+            session_id: SessionId(String::from("s")),
+            entry_id: EntryId(String::from("entry-1")),
+            parent_entry_id: None,
+            turn_id: TurnId(String::from("turn-1")),
+            role: Role::User,
+            text: String::from("edit the nix config"),
+            provider: None,
+        });
+        log.push(policy_changed);
+        log.push(SessionEvent::ReviewRequestRecorded {
+            request: crate::ReviewRequestSummary {
+                request_id: BoundedReviewText::new("review-req-1"),
+                action_kind: BoundedReviewText::new("shell"),
+                target: BoundedReviewText::new("nixos-rebuild"),
+                policy_revision: crate::PolicyRevision(3),
+                authorization_revision: 1,
+            },
+        });
+        log.push(assessment);
+        log.push(SessionEvent::ExactActionGrantRecorded {
+            grant_id: BoundedReviewText::new("grant-1"),
+            action_fingerprint: BoundedReviewText::new("fp-abc"),
+            expires: crate::GrantExpiry::OneAction,
+        });
+
+        assert!(log.write_to_file(&path).is_ok());
+        let loaded = SessionLog::load_from_file(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else {
+            return;
+        };
+        assert_eq!(loaded.events, log.events);
+        assert_eq!(
+            loaded.last_entry_id(),
+            Some(EntryId(String::from("entry-1")))
+        );
+        assert_eq!(loaded.transcript_messages().len(), 1);
+        let summary = crate::serialize_events_for_summary(&log.events);
+        assert!(!summary.contains("jev-1.13.0"));
+        assert!(!summary.contains("reviewer_hold_risk"));
+    }
+
+    #[test]
+    fn oversized_review_text_is_truncated_in_persisted_jsonl() {
+        let path = std::env::temp_dir().join(format!(
+            "yach-review-bound-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let oversized = "n".repeat(crate::REVIEW_TEXT_MAX_BYTES * 3);
+        let mut log = SessionLog::default();
+        log.push(SessionEvent::ReviewRequestRecorded {
+            request: crate::ReviewRequestSummary {
+                request_id: BoundedReviewText::new("review-req-1"),
+                action_kind: BoundedReviewText::new("shell"),
+                target: BoundedReviewText::new(&oversized),
+                policy_revision: crate::PolicyRevision(1),
+                authorization_revision: 0,
+            },
+        });
+
+        assert!(log.write_to_file(&path).is_ok());
+        let raw = std::fs::read_to_string(&path);
+        let loaded = SessionLog::load_from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(raw.is_ok());
+        let Ok(raw) = raw else {
+            return;
+        };
+        assert!(raw.len() < oversized.len());
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else {
+            return;
+        };
+        let target = loaded.events.iter().find_map(|event| match event {
+            SessionEvent::ReviewRequestRecorded { request } => Some(request.target.as_str()),
+            _ => None,
+        });
+        assert_eq!(target.map(str::len), Some(crate::REVIEW_TEXT_MAX_BYTES));
     }
 }

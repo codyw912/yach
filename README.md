@@ -93,10 +93,23 @@ host-access warning because commands are not sandboxed and may access files,
 credentials, networks, and processes outside the project. `full-access` lasts
 only for the current session, is never persisted, and resets on restart or
 session switch. Direct `/approval full-access` opens the same warning rather
-than bypassing it. The picker works during active turns; a change affects future
-tool requests without changing a pending review. The active mode stays visible
-in the status bar and `/status`. `/help` lists commands; useful day-to-day
-commands include `/resume`, `/model`, `/approval`, `/fork`, and `/quit`.
+`auto-review` delegates approval to a reviewer extension
+(e.g. Jev) that assesses each request's hazards and scope against your recent
+messages; user restrictions are enforced by Yach, not the reviewer. The
+reviewer sees your recent user messages plus the action being requested; it is
+not a sandbox — the extension host runs with the agent's privileges. In this
+build automatic execution is compiled off (`AUTO_REVIEW_EXECUTION_ENABLED =
+false`): actions the reviewer would have allowed are shown to you for
+approval, while reviewer holds (risk, clarification, restrictions) still apply
+and human-performs restrictions are handed off, not run — until the
+evaluation gates in `docs/project/records/2026-09-25-auto-review-signals-evaluation.md`
+pass.
+`auto-review` is session-only like `full-access`, never persisted,
+and resets on restart. The picker works during active turns; a change affects
+future tool requests without changing a pending review. The active mode stays
+visible in the status bar and `/status`. `/help` lists commands; useful
+day-to-day commands include `/resume`, `/model`, `/approval`, `/fork`, and
+`/quit`.
 
 `Ctrl+T` selects provider thinking effort. An explicit selection is owned by the
 backend, recorded in the session, and written to
@@ -111,9 +124,11 @@ Applied edits show a bounded changed-line preview plus the next
 terminal screen without mouse capture: native mouse selection/copy remains
 available, and starting the next turn archives the completed prior transcript
 into terminal scrollback for Herdr, tmux, and terminal copy modes.
-
-Flags: `yach --resume` continues the latest session; `yach --backend fixture`
-runs a provider-free fixture backend (useful without credentials).
+(read-only-safe by default; `--full-auto` explicitly selects the same
+session-only, unsandboxed `full-access` backend posture; `--auto-review
+<reviewer-id>` selects the named reviewer extension for automatic approval).
+Use `--full-auto` only in disposable working directories, ideally containers.
+`--full-auto` and `--auto-review` are mutually exclusive.
 
 Headless: `yach run --prompt "..."` runs a non-interactive session
 (read-only-safe by default; `--full-auto` explicitly selects the same

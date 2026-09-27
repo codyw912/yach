@@ -30,7 +30,7 @@ use yach_proto::{
 use crate::agent_edit_tools::{
     AgentEditToolContext, AgentEditToolPrepared, PendingAgentEditToolReview,
     apply_agent_edit_tool_review, prepare_agent_edit_tool_request, prepare_extension_edit_proposal,
-    reject_agent_edit_tool_review,
+    reject_agent_edit_tool_review, reject_agent_edit_tool_review_for_human_performs,
 };
 use crate::provider_connections::{
     ConnectionFlowEffect, ConnectionListOutcome, ConnectionMutationOperation,
@@ -826,6 +826,13 @@ struct ProviderPromptProjectRuntime {
     /// Session-scoped shell approvals. Shared like the mode state because a
     /// turn runs on a spawned task, and never persisted.
     shell_session_grants: ShellSessionGrants,
+    /// Shared review policy loaded once per session from `ReviewPolicyStore`.
+    /// The coordinator and `decide_shell` read through this handle so a
+    /// policy reload mid-turn is visible to the staleness check.
+    review_policy: Arc<Mutex<crate::ReviewPolicy>>,
+    /// Shared authorization revision counter, bumped on every grant/revoke.
+    /// The coordinator reads this to detect staleness.
+    authorization_revision: Arc<Mutex<u64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -971,6 +978,7 @@ pub async fn run_native_loop(
         config,
         false,
         false,
+        false,
         native_ready_handshake(false),
         |provider| RigProviderRequester {
             adapter: provider.adapter.clone(),
@@ -991,6 +999,7 @@ pub async fn run_native_loop_with_negotiated_capabilities(
 ) {
     let structured_review_rows = negotiated.supports(Capability::StructuredReviewRows);
     let approval_modes = negotiated.supports(Capability::ApprovalModes);
+    let auto_review = negotiated.supports(Capability::AutoReview);
     let prompt_attempt_reset = negotiated.supports(Capability::PromptAttemptReset);
     let ready_handshake = negotiated.ready_handshake();
     let trace = config.trace.clone();
@@ -1000,6 +1009,7 @@ pub async fn run_native_loop_with_negotiated_capabilities(
         config,
         structured_review_rows,
         approval_modes,
+        auto_review,
         ready_handshake,
         |provider| RigProviderRequester {
             adapter: provider.adapter.clone(),
@@ -1026,6 +1036,7 @@ pub async fn run_native_loop_with_scripted_provider(
         config,
         true,
         true,
+        true,
         native_ready_handshake(true),
         move |_| provider.clone(),
     )
@@ -1046,6 +1057,7 @@ pub(crate) async fn run_native_loop_with_provider_requester<Requester>(
         rx,
         tx,
         config,
+        true,
         true,
         true,
         native_ready_handshake(true),
@@ -1075,6 +1087,7 @@ async fn run_native_loop_with_unnegotiated_provider_requester<Requester>(
         config,
         false,
         false,
+        false,
         native_ready_handshake(false),
         move |_| {
             let Some(requester) = requester.take() else {
@@ -1085,13 +1098,17 @@ async fn run_native_loop_with_unnegotiated_provider_requester<Requester>(
     )
     .await;
 }
-
+#[expect(
+    clippy::too_many_arguments,
+    reason = "capability flags are independent booleans; a struct would add no invariant"
+)]
 async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     mut rx: mpsc::UnboundedReceiver<ClientEvent>,
     tx: mpsc::UnboundedSender<BackendEvent>,
     config: RunnerConfig,
     structured_review_rows: bool,
     approval_modes: bool,
+    auto_review: bool,
     ready_handshake: Handshake,
     mut make_requester: MakeRequester,
 ) where
@@ -1270,7 +1287,17 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let extension_activation_state = Arc::new(AsyncMutex::new(
         crate::ExtensionActivationSnapshot::default(),
     ));
-    let mut discovery_in_flight = false;
+    let review_policy = Arc::new(Mutex::new(
+        project_root
+            .as_deref()
+            .and_then(|root| {
+                crate::ReviewPolicyStore::for_current_user()
+                    .and_then(|store| store.load(&project_state_key(root)))
+                    .ok()
+            })
+            .unwrap_or_else(crate::ReviewPolicy::empty),
+    ));
+    let authorization_revision = Arc::new(Mutex::new(0_u64));
     let (discovery_update_tx, mut discovery_update_rx) = mpsc::unbounded_channel();
     let mut connection_flow = ProviderConnectionFlow::new(provider.as_ref().map(|provider| {
         crate::ActiveModelTarget {
@@ -1295,6 +1322,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut chatgpt_login: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut first_render_completed = false;
+    let mut discovery_in_flight = false;
 
     loop {
         let event = tokio::select! {
@@ -1667,6 +1695,17 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     request_id: 0,
                     mode: approval_mode,
                 }));
+                // If a reviewer is already active (e.g. client reconnected
+                // mid-session), emit its status so the client can render it.
+                let snapshot = extension_activation_state.lock().await;
+                if let Some(reviewer) = &snapshot.reviewer {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::ReviewerStatusChanged {
+                        reviewer_id: reviewer.reviewer_id.clone(),
+                        generation: reviewer.generation,
+                        state: yach_proto::ReviewerState::Selected,
+                        disclosure_summary: reviewer.disclosure_summary.clone(),
+                    }));
+                }
             }
             ClientEvent::FirstRenderCompleted => {
                 first_render_completed = true;
@@ -2040,6 +2079,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     ) else {
                         continue;
                     };
+                    crate::bump_authorization_revision(&authorization_revision);
                     mark_turn(trace.as_ref(), &started_prompt.turn, "prompt_received");
                     let turn_id = started_prompt.turn.clone();
                     let requester = make_requester(&provider);
@@ -2057,6 +2097,8 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 extension_manifest_scan_state: extension_manifest_scan_state
                                     .clone(),
                                 extension_activation_state: extension_activation_state.clone(),
+                                review_policy: review_policy.clone(),
+                                authorization_revision: authorization_revision.clone(),
                                 session_mode_state: Arc::clone(&session_mode_state),
                                 shell_session_grants: shell_session_grants.clone(),
                             },
@@ -2075,7 +2117,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         cancellation,
                     });
                 } else if let Some(setup_error) = provider_setup_error.as_deref() {
-                    handle_native_prompt_unconfigured_provider(
+                    if handle_native_prompt_unconfigured_provider(
                         &tx,
                         &store,
                         &mut session_log,
@@ -2089,10 +2131,12 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             prompt_started: Instant::now(),
                             setup_error,
                         },
-                    );
+                    ) {
+                        crate::bump_authorization_revision(&authorization_revision);
+                    }
                 } else {
                     let prompt_started = Instant::now();
-                    handle_native_prompt(
+                    if handle_native_prompt(
                         &tx,
                         &store,
                         &mut session_log,
@@ -2103,7 +2147,9 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         &prompt,
                         prompt_turn_index,
                         prompt_started,
-                    );
+                    ) {
+                        crate::bump_authorization_revision(&authorization_revision);
+                    }
                 }
             }
             ClientEvent::ModelActivationRequested {
@@ -2563,6 +2609,16 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     ));
                     continue;
                 }
+                if mode == ApprovalMode::AutoReview && !auto_review {
+                    let _ = tx.send(BackendEvent::Server(
+                        ServerEvent::ApprovalModeChangeFailed {
+                            request_id,
+                            mode,
+                            message: String::from("auto_review_not_negotiated"),
+                        },
+                    ));
+                    continue;
+                }
                 let Some(project_root) = approval_project_root.as_deref() else {
                     let _ = tx.send(BackendEvent::Server(
                         ServerEvent::ApprovalModeChangeFailed {
@@ -2576,6 +2632,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     continue;
                 };
                 if mode != ApprovalMode::FullAccess
+                    && mode != ApprovalMode::AutoReview
                     && let Err(error) = crate::persist_project_approval_mode(project_root, mode)
                 {
                     let _ = tx.send(BackendEvent::Server(
@@ -2894,6 +2951,7 @@ pub(crate) fn native_ready_handshake(prompt_attempt_reset: bool) -> Handshake {
         Capability::ToolOutputStreaming,
         Capability::StructuredReviewRows,
         Capability::ModelState,
+        Capability::AutoReview,
     ];
     if prompt_attempt_reset {
         capabilities.push(Capability::PromptAttemptReset);
@@ -3260,7 +3318,6 @@ fn backend_status_message(
         )
     }
 }
-
 fn handle_native_prompt(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     store: &JsonlSessionStore,
@@ -3269,7 +3326,7 @@ fn handle_native_prompt(
     prompt: &str,
     turn_index: u64,
     prompt_started: Instant,
-) {
+) -> bool {
     let session_id =
         if session.requested_session_id.is_empty() || session.requested_session_id == "default" {
             session.current_session_id.to_owned()
@@ -3280,7 +3337,7 @@ fn handle_native_prompt(
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: format!("unknown session {session_id}"),
         }));
-        return;
+        return false;
     }
     let typed_session_id = SessionId(session_id.clone());
 
@@ -3343,7 +3400,7 @@ fn handle_native_prompt(
                     );
                     let _ = append_pending_native_session_events(store, &mut pending_events)
                         .and_then(|()| store.flush_durable());
-                    return;
+                    return true;
                 }
             }
             push_native_prompt_total_metric(
@@ -3449,6 +3506,7 @@ fn handle_native_prompt(
         message: Some(status),
     }));
     send_native_session_stats_from_log(tx, log, None);
+    true
 }
 
 /// Prompt details for a native session whose provider could not be configured.
@@ -3467,7 +3525,7 @@ fn handle_native_prompt_unconfigured_provider(
     log: &mut SessionLog,
     session: PromptSessionInput<'_>,
     prompt: &UnconfiguredProviderPrompt<'_>,
-) {
+) -> bool {
     let session_id =
         if session.requested_session_id.is_empty() || session.requested_session_id == "default" {
             session.current_session_id.to_owned()
@@ -3478,7 +3536,7 @@ fn handle_native_prompt_unconfigured_provider(
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
             message: format!("unknown session {session_id}"),
         }));
-        return;
+        return false;
     }
     let typed_session_id = SessionId(session_id);
 
@@ -3532,6 +3590,7 @@ fn handle_native_prompt_unconfigured_provider(
             trace: None,
         },
     );
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -3814,6 +3873,10 @@ pub(crate) fn provider_messages_from_event_slice(
         | SessionEvent::MetricRecorded { .. }
         | SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::PermissionDecisionRecorded { .. }
+        | SessionEvent::ReviewPolicyChanged { .. }
+        | SessionEvent::ReviewRequestRecorded { .. }
+        | SessionEvent::ReviewAssessmentRecorded { .. }
+        | SessionEvent::ExactActionGrantRecorded { .. }
         | SessionEvent::SessionModelChanged { .. }
         | SessionEvent::ApprovalModeChanged { .. }
         | SessionEvent::ThinkingLevelChanged { .. }
@@ -4715,8 +4778,12 @@ struct ProviderAgentToolRound<'a> {
     /// max_output_tokens − reserve`).
     context_window: u64,
     max_output_tokens: u64,
-    trace: Option<&'a yach_trace::TraceSink>,
+    review_policy: Arc<Mutex<crate::ReviewPolicy>>,
+    /// Shared authorization revision counter, bumped on every grant/revoke.
+    /// The coordinator reads this to detect staleness.
+    authorization_revision: Arc<Mutex<u64>>,
     provider: ProviderConfig,
+    trace: Option<&'a yach_trace::TraceSink>,
 }
 
 /// Shell approvals the user granted for the remainder of a session.
@@ -4779,6 +4846,12 @@ struct ProviderAgentToolBatch<'a> {
     trace: Option<&'a yach_trace::TraceSink>,
     pending_events: &'a mut Vec<SessionEvent>,
     current_tool_index: u32,
+    /// Live reviewer coordinator, present only when the session selected
+    /// automatic review and a reviewer host is active. `None` falls through
+    /// to the manual review path.
+    review_coordinator: Option<&'a crate::ReviewCoordinator<'a>>,
+    /// Shared review policy for `decide_shell` restriction checks.
+    review_policy: &'a Arc<Mutex<crate::ReviewPolicy>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderToolBatchOutcome {
@@ -4885,9 +4958,11 @@ async fn run_native_provider_one_agent_tool_round(
         shell_session_grants,
         cancellation,
         context_window,
-        provider,
         max_output_tokens,
+        provider,
         trace,
+        review_policy,
+        authorization_revision,
     } = round;
     let registry = extension_activation_snapshot.registry.clone();
     let active_extension_tool_names = extension_activation_snapshot.active_tool_names();
@@ -5403,6 +5478,30 @@ answer now, or call tools if more work is needed.",
         };
         let tool_round_index = loop_budget.tool_rounds + 1;
         let edit_trace_start = provider_continuation_edit_traces.len();
+        let effective_approval_mode = live_session_modes.as_ref().map_or(approval_mode, |state| {
+            approval_mode_from_code(state.approval.load(AtomicOrdering::Acquire))
+        });
+        let review_coordinator = if effective_approval_mode == ApprovalMode::AutoReview {
+            extension_activation_snapshot
+                .reviewer
+                .as_ref()
+                .map(|reviewer| {
+                    crate::ReviewCoordinator::new(
+                        review_policy.clone(),
+                        extension_activation_snapshot.reviewer_generation.clone(),
+                        authorization_revision.clone(),
+                        &edit_sink,
+                        reviewer.invoker.clone(),
+                        reviewer.reviewer_id.clone(),
+                        session_id.clone(),
+                        turn_id.clone(),
+                        crate::SandboxState::None,
+                        Arc::new(crate::DenyExtensionResources),
+                    )
+                })
+        } else {
+            None
+        };
         let ProviderToolBatchOutcome {
             results: tool_results,
             terminal_error,
@@ -5423,9 +5522,7 @@ answer now, or call tools if more work is needed.",
                 review_decisions: &mut review_decisions,
                 structured_review_rows,
                 tool_event_store,
-                approval_mode: live_session_modes.as_ref().map_or(approval_mode, |state| {
-                    approval_mode_from_code(state.approval.load(AtomicOrdering::Acquire))
-                }),
+                approval_mode: effective_approval_mode,
                 cancellation: cancellation.clone(),
                 shell_session_grants: shell_session_grants.clone(),
                 budget: &mut loop_budget,
@@ -5433,6 +5530,8 @@ answer now, or call tools if more work is needed.",
                 edit_traces: &mut provider_continuation_edit_traces,
                 log,
                 current_tool_index: 0,
+                review_coordinator: review_coordinator.as_ref(),
+                review_policy: &review_policy,
                 pending_events,
                 trace,
             },
@@ -7018,6 +7117,10 @@ fn recoverable_readonly_failure(
         | crate::ToolExecutionError::UnsupportedTool
         | crate::ToolExecutionError::MalformedResult
         | crate::ToolExecutionError::ExtensionHost { .. } => None,
+        crate::ToolExecutionError::StaleAuthorization => Some((
+            "stale_authorization",
+            "The edit preview is stale because policy or reviewer state changed; request a new preview.",
+        )),
         crate::ToolExecutionError::ResourcePath { error } => Some(resource_path_failure(*error)),
     }
 }
@@ -7415,6 +7518,14 @@ async fn execute_native_provider_extension_tool_request(
                         current_edit_permission_mode(batch),
                     ),
                     edit_policy: EditPolicy::extension_proposal(),
+                    review_policy: batch
+                        .review_policy
+                        .lock()
+                        .map_or_else(|_| crate::ReviewPolicy::empty(), |guard| guard.clone()),
+                    authorization_revision: batch
+                        .review_coordinator
+                        .and_then(crate::ReviewCoordinator::snapshot)
+                        .map_or(0, |freshness| freshness.authorization_revision),
                 },
                 request,
                 proposal,
@@ -7440,6 +7551,7 @@ fn approval_mode_code(mode: ApprovalMode) -> u8 {
         ApprovalMode::Review => 0,
         ApprovalMode::AcceptEdits => 1,
         ApprovalMode::FullAccess => 2,
+        ApprovalMode::AutoReview => 3,
     }
 }
 
@@ -7447,6 +7559,7 @@ fn approval_mode_from_code(code: u8) -> ApprovalMode {
     match code {
         1 => ApprovalMode::AcceptEdits,
         2 => ApprovalMode::FullAccess,
+        3 => ApprovalMode::AutoReview,
         _ => ApprovalMode::Review,
     }
 }
@@ -7483,6 +7596,7 @@ fn edit_permission_mode(mode: ApprovalMode) -> PermissionMode {
     match mode {
         ApprovalMode::Review => PermissionMode::Ask,
         ApprovalMode::AcceptEdits | ApprovalMode::FullAccess => PermissionMode::Allow,
+        ApprovalMode::AutoReview => PermissionMode::AutoReview,
     }
 }
 
@@ -7511,6 +7625,14 @@ async fn execute_native_provider_edit_tool_request(
             turn_id: batch.turn_id.clone(),
             permission_policy: PermissionPolicy::for_edit_mode(current_edit_permission_mode(batch)),
             edit_policy: EditPolicy::conservative(),
+            review_policy: batch
+                .review_policy
+                .lock()
+                .map_or_else(|_| crate::ReviewPolicy::empty(), |guard| guard.clone()),
+            authorization_revision: batch
+                .review_coordinator
+                .and_then(crate::ReviewCoordinator::snapshot)
+                .map_or(0, |freshness| freshness.authorization_revision),
         },
         request,
     );
@@ -7552,6 +7674,194 @@ async fn finish_prepared_edit_tool_request(
             path,
             operation,
         } => {
+            if preview.review_state == crate::EditAccessReviewState::HumanPerforms {
+                // A deterministic human-performs restriction is never an
+                // approvable review row: reject the pending preview and hand
+                // off to the user.
+                let rejected = reject_agent_edit_tool_review_for_human_performs(
+                    batch.edit_access,
+                    batch.edit_sink,
+                    PendingAgentEditToolReview {
+                        trace_id: trace_id.clone(),
+                        session_id: batch.session_id.clone(),
+                        turn_id: batch.turn_id.clone(),
+                        request_id: request_id.clone(),
+                        provider_call_id,
+                        preview_id: preview.preview_id.clone(),
+                        permission_decision_id: preview.permission_decision_id.clone(),
+                        path,
+                        operation,
+                    },
+                );
+                drain_edit_sink_events(batch)?;
+                let result = rejected.map_err(|error| {
+                    ProviderRoundError::ToolContinuation(tool_round_error_label(&error))
+                })?;
+                batch.edit_traces.push(ProviderContinuationEditTrace {
+                    trace_id,
+                    tool_name,
+                    tool_request_id: ToolRequestId(request_id),
+                    provider_call_id: result.provider_call_id.clone(),
+                    preview_id: Some(preview.preview_id),
+                    permission_decision_id: Some(preview.permission_decision_id),
+                });
+                batch
+                    .budget
+                    .record_tool_result(&result.tool_request_id, result.byte_count)
+                    .map_err(|error| provider_tool_batch_result_budget_failure(error).0)?;
+                return Ok(result);
+            }
+            if preview.review_state == crate::EditAccessReviewState::AutoReviewUnavailable
+                && let Some(coordinator) = batch.review_coordinator
+            {
+                let action = batch
+                    .edit_access
+                    .review_action_for_preview(&preview.preview_id)
+                    .unwrap_or(crate::ReviewAction::EditTransaction {
+                        operations: Vec::new(),
+                        preconditions: Vec::new(),
+                    });
+                let permission_request = PermissionRequest {
+                    request_id: request_id.clone(),
+                    actor: PermissionActor::Provider,
+                    capability: PermissionCapability::EditTransaction,
+                    target: PermissionTargetSummary {
+                        operation: operation.clone(),
+                        resource: path.clone(),
+                    },
+                    risk: PermissionRisk::WorkspaceWrite,
+                    requested_reviewer: Some(PermissionReviewer::AutoReview),
+                    command: None,
+                };
+                if let Some(freshness) = coordinator.snapshot() {
+                    let _ = batch.edit_access.rebind_reviewer_generation(
+                        &preview.preview_id,
+                        freshness.reviewer_generation,
+                    );
+                }
+                let route = match crate::user_message_evidence(batch.log, &batch.turn_id) {
+                    crate::UserMessageEvidence::IssuingTurnOverBudget => crate::ReviewRoute::Hold {
+                        reason: crate::HoldReason::EvidenceOverBudget,
+                        evidence_refs: Vec::new(),
+                    },
+                    crate::UserMessageEvidence::Ready { items, omissions } => {
+                        let mut trusted = items;
+                        trusted.push(crate::EvidenceItem {
+                            id: String::from("diff_summary"),
+                            source: String::from("edit_preview"),
+                            kind: String::from("diff_summary"),
+                            excerpt: preview.diff_summary.clone(),
+                            truncated: preview.diff_summary_truncated,
+                        });
+                        trusted.push(crate::EvidenceItem {
+                            id: String::from("path"),
+                            source: String::from("edit_preview"),
+                            kind: String::from("target_path"),
+                            excerpt: path.clone(),
+                            truncated: false,
+                        });
+                        tokio::select! {
+                            () = batch.cancellation.cancelled() => {
+                                return Err(ProviderRoundError::Cancelled(String::from(
+                                    "native provider prompt cancelled",
+                                )));
+                            }
+                            route = coordinator.review_action(
+                                permission_request,
+                                action,
+                                trusted,
+                                Vec::new(),
+                                omissions,
+                            ) => route,
+                        }
+                    }
+                };
+                match route {
+                    crate::ReviewRoute::Execute => {
+                        let reviewed = apply_agent_edit_tool_review(
+                            batch.edit_access,
+                            batch.edit_sink,
+                            PendingAgentEditToolReview {
+                                trace_id: trace_id.clone(),
+                                session_id: batch.session_id.clone(),
+                                turn_id: batch.turn_id.clone(),
+                                request_id: request_id.clone(),
+                                provider_call_id,
+                                preview_id: preview.preview_id.clone(),
+                                permission_decision_id: preview.permission_decision_id.clone(),
+                                path,
+                                operation,
+                            },
+                            coordinator.snapshot(),
+                        );
+                        drain_edit_sink_events(batch)?;
+                        let result = reviewed.map_err(|error| {
+                            ProviderRoundError::ToolContinuation(tool_round_error_label(&error))
+                        })?;
+                        batch.edit_traces.push(ProviderContinuationEditTrace {
+                            trace_id,
+                            tool_name,
+                            tool_request_id: ToolRequestId(request_id),
+                            provider_call_id: Some(
+                                result.provider_call_id.clone().unwrap_or_default(),
+                            ),
+                            preview_id: Some(preview.preview_id),
+                            permission_decision_id: Some(preview.permission_decision_id),
+                        });
+                        batch
+                            .budget
+                            .record_tool_result(&result.tool_request_id, result.byte_count)
+                            .map_err(|error| provider_tool_batch_result_budget_failure(error).0)?;
+                        return Ok(result);
+                    }
+                    crate::ReviewRoute::Hold {
+                        reason:
+                            crate::HoldReason::RestrictionApplies {
+                                restriction: crate::ReviewRestriction::HumanPerforms { .. },
+                            },
+                        ..
+                    } => {
+                        // A human-performs restriction is never an approvable
+                        // review row: reject the pending preview and hand off.
+                        let rejected = reject_agent_edit_tool_review_for_human_performs(
+                            batch.edit_access,
+                            batch.edit_sink,
+                            PendingAgentEditToolReview {
+                                trace_id: trace_id.clone(),
+                                session_id: batch.session_id.clone(),
+                                turn_id: batch.turn_id.clone(),
+                                request_id: request_id.clone(),
+                                provider_call_id,
+                                preview_id: preview.preview_id.clone(),
+                                permission_decision_id: preview.permission_decision_id.clone(),
+                                path,
+                                operation,
+                            },
+                        );
+                        drain_edit_sink_events(batch)?;
+                        let result = rejected.map_err(|error| {
+                            ProviderRoundError::ToolContinuation(tool_round_error_label(&error))
+                        })?;
+                        batch.edit_traces.push(ProviderContinuationEditTrace {
+                            trace_id,
+                            tool_name,
+                            tool_request_id: ToolRequestId(request_id),
+                            provider_call_id: result.provider_call_id.clone(),
+                            preview_id: Some(preview.preview_id),
+                            permission_decision_id: Some(preview.permission_decision_id),
+                        });
+                        batch
+                            .budget
+                            .record_tool_result(&result.tool_request_id, result.byte_count)
+                            .map_err(|error| provider_tool_batch_result_budget_failure(error).0)?;
+                        return Ok(result);
+                    }
+                    crate::ReviewRoute::Hold { .. } | crate::ReviewRoute::ReviewFailed { .. } => {
+                        // Fall through to the manual review path below — the
+                        // preview stays pending and the user sees the hold.
+                    }
+                }
+            }
             if !batch.structured_review_rows {
                 return Err(ProviderRoundError::ToolContinuation(String::from(
                     "structured_review_rows_not_negotiated",
@@ -7658,6 +7968,11 @@ async fn finish_prepared_edit_tool_request(
                             decision,
                         },
                     )?;
+                    if let Some(coordinator) = batch.review_coordinator {
+                        crate::bump_authorization_revision(
+                            coordinator.authorization_revision_handle(),
+                        );
+                    }
                     decision
                 }
                 Err(error) => {
@@ -7675,7 +7990,7 @@ async fn finish_prepared_edit_tool_request(
             };
             let reviewed = match decision {
                 ToolReviewDecision::Approve | ToolReviewDecision::ApproveForSession => {
-                    apply_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending)
+                    apply_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending, None)
                 }
                 ToolReviewDecision::Reject => {
                     reject_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending)
@@ -7825,6 +8140,9 @@ fn persist_shell_review_resolution(
         }
         ToolReviewDecision::Reject => PermissionDecisionOutcome::Denied,
     };
+    if let Some(coordinator) = batch.review_coordinator {
+        crate::bump_authorization_revision(coordinator.authorization_revision_handle());
+    }
     summary.reviewer = PermissionReviewer::User;
     // Distinct reasons so an audit can tell a one-off approval from the
     // decision that also created a session grant.
@@ -7843,6 +8161,32 @@ fn persist_shell_review_resolution(
             summary,
         },
     )
+}
+
+/// What the shell path does with a held or asked action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellHoldDisposition {
+    /// Show a one-action approval row with this origin.
+    AskUser(Option<yach_proto::ReviewOrigin>),
+    /// Never run; hand off to the user outside the agent.
+    HumanPerforms,
+}
+
+pub fn shell_disposition_for_decision(reason: &str) -> ShellHoldDisposition {
+    if reason == crate::RESTRICTION_HUMAN_PERFORMS_REASON {
+        ShellHoldDisposition::HumanPerforms
+    } else {
+        ShellHoldDisposition::AskUser(None)
+    }
+}
+
+pub fn shell_disposition_for_hold(reason: &crate::HoldReason) -> ShellHoldDisposition {
+    match reason {
+        crate::HoldReason::RestrictionApplies {
+            restriction: crate::ReviewRestriction::HumanPerforms { .. },
+        } => ShellHoldDisposition::HumanPerforms,
+        _ => ShellHoldDisposition::AskUser(Some(yach_proto::ReviewOrigin::Risk)),
+    }
 }
 
 async fn wait_for_command_review_decision(
@@ -7917,6 +8261,7 @@ async fn execute_native_provider_bash_tool_request(
         },
         risk: PermissionRisk::ProcessExecution,
         requested_reviewer: None,
+        command: Some(command.clone()),
     };
 
     let finish_failed = |batch: &mut ProviderAgentToolBatch<'_>,
@@ -7933,6 +8278,31 @@ async fn execute_native_provider_bash_tool_request(
         );
 
         Ok(result)
+    };
+
+    // A human-performs restriction never reaches a review row: record the
+    // denial and hand off with guidance instead of offering an approve
+    // button that would run the action.
+    let human_performs_handoff = |batch: &mut ProviderAgentToolBatch<'_>,
+                                  permission_summary: PermissionDecisionSummary|
+     -> Result<ProviderToolResult, ProviderRoundError> {
+        let mut summary = permission_summary;
+        summary.outcome = PermissionDecisionOutcome::Denied;
+        summary.reason = String::from(crate::RESTRICTION_HUMAN_PERFORMS_REASON);
+        persist_tool_review_event(
+            batch,
+            SessionEvent::PermissionDecisionRecorded {
+                session_id: batch.session_id.clone(),
+                turn_id: batch.turn_id.clone(),
+                summary,
+            },
+        )?;
+        finish_failed(
+            batch,
+            crate::RESTRICTION_HUMAN_PERFORMS_REASON,
+            "This action is reserved for the user to perform outside the agent. \
+Describe the exact command so the user can run it, then continue.",
+        )
     };
 
     // Resolve the working directory inside the project root.
@@ -7980,6 +8350,10 @@ exists today. Ask the user to fix .yach/config.json.",
         timeout: std::time::Duration::from_millis(shell_policy.clamp_timeout_ms(requested_timeout)),
     };
 
+    let review_policy_snapshot = batch
+        .review_policy
+        .lock()
+        .map_or_else(|_| crate::ReviewPolicy::empty(), |guard| guard.clone());
     let permission_decision = PermissionDecisionEngine::decide_shell(
         &permission_request,
         batch.approval_mode,
@@ -7987,6 +8361,7 @@ exists today. Ask the user to fix .yach/config.json.",
         batch
             .shell_session_grants
             .is_granted(&command, &prepared.cwd),
+        &review_policy_snapshot,
     );
     let permission_decision_id = permission_decision.decision_id().0;
     let permission_summary =
@@ -8000,7 +8375,285 @@ exists today. Ask the user to fix .yach/config.json.",
                 "The command was denied by shell permission policy.",
             );
         }
-        PermissionDecision::NeedsUserReview { .. } => {
+        PermissionDecision::NeedsUserReview {
+            ref reason,
+            reviewer: PermissionReviewer::AutoReview,
+            ..
+        } if reason == "route_to_reviewer" => {
+            let Some(coordinator) = batch.review_coordinator else {
+                return finish_failed(
+                    batch,
+                    "reviewer_unavailable",
+                    "Automatic review is selected but no reviewer host is active. \
+Select a reviewer extension or switch to a manual approval mode.",
+                );
+            };
+            let action = crate::ReviewAction::ShellCommand {
+                command: command.clone(),
+                cwd: prepared.cwd.to_string_lossy().into_owned(),
+                timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                env_keys: shell_policy.config.env_allow.clone(),
+            };
+            let route = match crate::user_message_evidence(batch.log, &batch.turn_id) {
+                crate::UserMessageEvidence::IssuingTurnOverBudget => crate::ReviewRoute::Hold {
+                    reason: crate::HoldReason::EvidenceOverBudget,
+                    evidence_refs: Vec::new(),
+                },
+                crate::UserMessageEvidence::Ready { items, omissions } => {
+                    let mut trusted = items;
+                    trusted.push(crate::EvidenceItem {
+                        id: String::from("command"),
+                        source: String::from("permission_request"),
+                        kind: String::from("shell_command"),
+                        excerpt: command.clone(),
+                        truncated: false,
+                    });
+                    trusted.push(crate::EvidenceItem {
+                        id: String::from("cwd"),
+                        source: String::from("permission_request"),
+                        kind: String::from("working_directory"),
+                        excerpt: prepared.cwd.to_string_lossy().into_owned(),
+                        truncated: false,
+                    });
+                    tokio::select! {
+                        () = batch.cancellation.cancelled() => {
+                            return Err(ProviderRoundError::Cancelled(String::from(
+                                "native provider prompt cancelled",
+                            )));
+                        }
+                        route = coordinator.review_action(
+                            permission_request.clone(),
+                            action,
+                            trusted,
+                            Vec::new(),
+                            omissions,
+                        ) => route,
+                    }
+                }
+            };
+            match route {
+                crate::ReviewRoute::Execute => {}
+                crate::ReviewRoute::Hold { reason, .. } => {
+                    let hold_reason = match &reason {
+                        crate::HoldReason::EvidenceOverBudget => "evidence_over_budget",
+                        crate::HoldReason::SignificantRisk => "reviewer_hold_risk",
+                        crate::HoldReason::NeedsClarification => "reviewer_hold_evidence",
+                        crate::HoldReason::RestrictionApplies { .. } => "restriction_ask_first",
+                    };
+                    let review_origin = match shell_disposition_for_hold(&reason) {
+                        ShellHoldDisposition::HumanPerforms => {
+                            return human_performs_handoff(batch, permission_summary);
+                        }
+                        ShellHoldDisposition::AskUser(origin) => origin,
+                    };
+                    if !batch.structured_review_rows {
+                        return finish_failed(
+                            batch,
+                            hold_reason,
+                            "The reviewer held this command and the client cannot show \
+structured review rows.",
+                        );
+                    }
+                    let review_id = next_command_review_id();
+                    let payload = ToolReviewPayload::Command {
+                        command: yach_proto::CommandReviewSummary {
+                            review_id: review_id.clone(),
+                            permission_decision_id: permission_decision_id.clone(),
+                            command: command.clone(),
+                            workdir: workdir.clone(),
+                            timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                            review_origin,
+                        },
+                    };
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewRequested {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(request.request_id.clone()),
+                            tool_name: String::from("bash"),
+                            payload: payload.clone(),
+                        },
+                    )?;
+                    if batch
+                        .review_tx
+                        .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                            request_id: request.request_id.clone(),
+                            tool_name: String::from("bash"),
+                            payload,
+                        }))
+                        .is_err()
+                    {
+                        persist_tool_review_event(
+                            batch,
+                            SessionEvent::ToolReviewInterrupted {
+                                session_id: batch.session_id.clone(),
+                                turn_id: batch.turn_id.clone(),
+                                tool_request_id: ToolRequestId(request.request_id.clone()),
+                                reason: String::from("ui_receiver_dropped"),
+                            },
+                        )?;
+                        return Err(ProviderRoundError::Cancelled(String::from(
+                            "ui receiver dropped during tool review",
+                        )));
+                    }
+                    let review_decision = match wait_for_command_review_decision(
+                        batch.review_decisions,
+                        &request.request_id,
+                        &review_id,
+                        &permission_decision_id,
+                        &batch.cancellation,
+                    )
+                    .await
+                    {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            persist_tool_review_event(
+                                batch,
+                                SessionEvent::ToolReviewInterrupted {
+                                    session_id: batch.session_id.clone(),
+                                    turn_id: batch.turn_id.clone(),
+                                    tool_request_id: ToolRequestId(request.request_id.clone()),
+                                    reason: provider_round_error_label(&error),
+                                },
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewDecisionRecorded {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(request.request_id.clone()),
+                            decision: review_decision,
+                        },
+                    )?;
+                    persist_shell_review_resolution(batch, permission_summary, review_decision)?;
+                    if review_decision == ToolReviewDecision::Reject {
+                        return finish_failed(
+                            batch,
+                            "user_rejected",
+                            "The user declined to run this command. Ask the user how to proceed \
+or take a different approach.",
+                        );
+                    }
+                    if review_decision == ToolReviewDecision::ApproveForSession {
+                        batch.shell_session_grants.grant(&command, &prepared.cwd);
+                    }
+                }
+                crate::ReviewRoute::ReviewFailed { reason } => {
+                    let failure_reason = match reason {
+                        crate::ReviewFailure::Disabled => "reviewer_disabled",
+                        crate::ReviewFailure::Stale => "reviewer_stale",
+                        crate::ReviewFailure::MalformedAssessment => "reviewer_malformed",
+                        crate::ReviewFailure::TimedOut => "reviewer_timed_out",
+                        crate::ReviewFailure::Unavailable => "reviewer_unavailable",
+                        crate::ReviewFailure::EvidenceWriteFailed => "reviewer_evidence_failed",
+                        crate::ReviewFailure::OversizedAssessment => "reviewer_oversized",
+                    };
+                    if !batch.structured_review_rows {
+                        return finish_failed(
+                            batch,
+                            failure_reason,
+                            "The reviewer failed and the client cannot show \
+structured review rows.",
+                        );
+                    }
+                    let review_id = next_command_review_id();
+                    let payload = ToolReviewPayload::Command {
+                        command: yach_proto::CommandReviewSummary {
+                            review_id: review_id.clone(),
+                            permission_decision_id: permission_decision_id.clone(),
+                            command: command.clone(),
+                            workdir: workdir.clone(),
+                            timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                            review_origin: Some(yach_proto::ReviewOrigin::ReviewerError),
+                        },
+                    };
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewRequested {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(request.request_id.clone()),
+                            tool_name: String::from("bash"),
+                            payload: payload.clone(),
+                        },
+                    )?;
+                    if batch
+                        .review_tx
+                        .send(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                            request_id: request.request_id.clone(),
+                            tool_name: String::from("bash"),
+                            payload,
+                        }))
+                        .is_err()
+                    {
+                        persist_tool_review_event(
+                            batch,
+                            SessionEvent::ToolReviewInterrupted {
+                                session_id: batch.session_id.clone(),
+                                turn_id: batch.turn_id.clone(),
+                                tool_request_id: ToolRequestId(request.request_id.clone()),
+                                reason: String::from("ui_receiver_dropped"),
+                            },
+                        )?;
+                        return Err(ProviderRoundError::Cancelled(String::from(
+                            "ui receiver dropped during tool review",
+                        )));
+                    }
+                    let review_decision = match wait_for_command_review_decision(
+                        batch.review_decisions,
+                        &request.request_id,
+                        &review_id,
+                        &permission_decision_id,
+                        &batch.cancellation,
+                    )
+                    .await
+                    {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            persist_tool_review_event(
+                                batch,
+                                SessionEvent::ToolReviewInterrupted {
+                                    session_id: batch.session_id.clone(),
+                                    turn_id: batch.turn_id.clone(),
+                                    tool_request_id: ToolRequestId(request.request_id.clone()),
+                                    reason: provider_round_error_label(&error),
+                                },
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                    persist_tool_review_event(
+                        batch,
+                        SessionEvent::ToolReviewDecisionRecorded {
+                            session_id: batch.session_id.clone(),
+                            turn_id: batch.turn_id.clone(),
+                            tool_request_id: ToolRequestId(request.request_id.clone()),
+                            decision: review_decision,
+                        },
+                    )?;
+                    persist_shell_review_resolution(batch, permission_summary, review_decision)?;
+                    if review_decision == ToolReviewDecision::Reject {
+                        return finish_failed(
+                            batch,
+                            "user_rejected",
+                            "The user declined to run this command. Ask the user how to proceed \
+or take a different approach.",
+                        );
+                    }
+                    if review_decision == ToolReviewDecision::ApproveForSession {
+                        batch.shell_session_grants.grant(&command, &prepared.cwd);
+                    }
+                }
+            }
+        }
+        PermissionDecision::NeedsUserReview { ref reason, .. } => {
+            if shell_disposition_for_decision(reason) == ShellHoldDisposition::HumanPerforms {
+                return human_performs_handoff(batch, permission_summary);
+            }
             if !batch.structured_review_rows {
                 return finish_failed(
                     batch,
@@ -8017,6 +8670,7 @@ non-allowlisted commands.",
                     command: command.clone(),
                     workdir: workdir.clone(),
                     timeout_ms: prepared.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                    review_origin: None,
                 },
             };
             persist_tool_review_event(
@@ -8887,6 +9541,9 @@ fn tool_round_error_label(error: &ToolContinuationError) -> String {
     match error {
         ToolContinuationError::TooManyToolCalls { .. } => String::from("tool_round_too_many_calls"),
         ToolContinuationError::Validation(_) => String::from("tool_round_validation_failed"),
+        ToolContinuationError::Execution(crate::ToolExecutionError::StaleAuthorization) => {
+            String::from("tool_round_stale_authorization")
+        }
         ToolContinuationError::Execution(_) => String::from("tool_round_execution_failed"),
         ToolContinuationError::ResultTooLarge { .. } => String::from("tool_round_result_too_large"),
     }
@@ -9119,6 +9776,8 @@ where
         extension_activation_state,
         session_mode_state,
         shell_session_grants,
+        review_policy,
+        authorization_revision,
     } = project_runtime;
     let project_context = project_context.or_else(|| effective_runner_project_context(None));
 
@@ -9152,6 +9811,8 @@ where
         structured_review_rows,
         session_mode_state,
         shell_session_grants,
+        review_policy: review_policy.clone(),
+        authorization_revision: authorization_revision.clone(),
         trace: trace.as_ref(),
     })
     .await;
@@ -9176,6 +9837,8 @@ struct ProviderPromptRequest<'a, Requester> {
     cancellation: CancellationToken,
     session_mode_state: Arc<LiveSessionModes>,
     shell_session_grants: ShellSessionGrants,
+    review_policy: Arc<Mutex<crate::ReviewPolicy>>,
+    authorization_revision: Arc<Mutex<u64>>,
     trace: Option<&'a yach_trace::TraceSink>,
 }
 
@@ -9201,6 +9864,8 @@ where
         structured_review_rows,
         session_mode_state,
         shell_session_grants,
+        review_policy,
+        authorization_revision,
         trace,
     } = request;
     let provider_name = provider.provider_label();
@@ -9270,6 +9935,8 @@ where
             ),
             live_session_modes: Some(session_mode_state),
             shell_session_grants: shell_session_grants.clone(),
+            review_policy: review_policy.clone(),
+            authorization_revision: authorization_revision.clone(),
             trace,
         },
     )
@@ -9659,12 +10326,13 @@ mod tests {
         ProviderConnectionFlow, ProviderFirstRound, ProviderRequester, ProviderRetryContext,
         ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
         ProviderToolRoundContext, RunnerConfig, SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState,
-        ThinkingLevel, active_model, apply_active_connection_rename, apply_connection_flow_effects,
-        apply_native_model_selection, backend_status_message, cancel_active_provider_turn,
-        clear_connection_catalog, collect_native_provider_first_round, edit_permission_mode,
-        execute_native_provider_agent_tool_batch, finish_native_prompt, fixture_outcome,
-        handle_native_extension_diagnostic_snapshot_request,
-        handle_native_extension_lifecycle_request, handle_native_prompt, launch_project_context,
+        ThinkingLevel, UnconfiguredProviderPrompt, active_model, apply_active_connection_rename,
+        apply_connection_flow_effects, apply_native_model_selection, backend_status_message,
+        cancel_active_provider_turn, clear_connection_catalog, collect_native_provider_first_round,
+        edit_permission_mode, execute_native_provider_agent_tool_batch, finish_native_prompt,
+        fixture_outcome, handle_native_extension_diagnostic_snapshot_request,
+        handle_native_extension_lifecycle_request, handle_native_prompt,
+        handle_native_prompt_unconfigured_provider, launch_project_context,
         launch_project_context_from_root, load_native_session_log_for_runner,
         load_native_session_log_for_runner_with_loader, local_edit_error_message,
         log_has_finished_turn, model_change_target, native_models_from_catalog,
@@ -10071,6 +10739,8 @@ mod tests {
                 }],
                 replacement_bundles: Vec::new(),
                 host_start_count: 1,
+                reviewer: None,
+                reviewer_generation: Arc::new(Mutex::new(0)),
             }));
             let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -10135,6 +10805,8 @@ mod tests {
                 }],
                 replacement_bundles: Vec::new(),
                 host_start_count: 1,
+                reviewer: None,
+                reviewer_generation: Arc::new(Mutex::new(0)),
             }));
             let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -10400,6 +11072,8 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-read-1"),
@@ -10505,6 +11179,8 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![
                 ProviderToolCall {
@@ -10626,6 +11302,8 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             request,
         )
@@ -10733,6 +11411,8 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             request,
         )
@@ -10815,6 +11495,8 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![
                 ProviderToolCall {
@@ -11235,6 +11917,90 @@ mod tests {
             "a completed fixture turn must issue exactly one durable sync"
         );
     }
+
+    #[test]
+    fn native_prompt_bumps_authorization_revision_once_per_appended_user_entry() {
+        // Every branch that appends a trusted Role::User entry must bump the
+        // authorization revision exactly once; a rejected prompt (unknown
+        // session) appends nothing and must not bump.
+        let root = TempProject::new("native-prompt-authorization-bump");
+        let store = JsonlSessionStore::new(root.root().join("session.jsonl"));
+        let mut log = SessionLog::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let revision = Mutex::new(0_u64);
+
+        let bump_on_appended = |appended: bool| {
+            if appended {
+                crate::bump_authorization_revision(&revision);
+            }
+        };
+
+        bump_on_appended(handle_native_prompt(
+            &tx,
+            &store,
+            &mut log,
+            PromptSessionInput {
+                current_session_id: "default",
+                requested_session_id: String::from("default"),
+            },
+            "hello",
+            0,
+            Instant::now(),
+        ));
+        assert_eq!(revision.lock().map_or(0, |value| *value), 1);
+
+        // Unknown session: nothing appended, no bump.
+        bump_on_appended(handle_native_prompt(
+            &tx,
+            &store,
+            &mut log,
+            PromptSessionInput {
+                current_session_id: "default",
+                requested_session_id: String::from("other"),
+            },
+            "hello",
+            1,
+            Instant::now(),
+        ));
+        assert_eq!(revision.lock().map_or(0, |value| *value), 1);
+
+        // Unconfigured-provider branch also appends a user entry and bumps.
+        bump_on_appended(handle_native_prompt_unconfigured_provider(
+            &tx,
+            &store,
+            &mut log,
+            PromptSessionInput {
+                current_session_id: "default",
+                requested_session_id: String::from("default"),
+            },
+            &UnconfiguredProviderPrompt {
+                prompt: "hello",
+                turn_index: 2,
+                prompt_started: Instant::now(),
+                setup_error: "missing key",
+            },
+        ));
+        assert_eq!(revision.lock().map_or(0, |value| *value), 2);
+
+        // Unconfigured-provider rejection on an unknown session: no bump.
+        bump_on_appended(handle_native_prompt_unconfigured_provider(
+            &tx,
+            &store,
+            &mut log,
+            PromptSessionInput {
+                current_session_id: "default",
+                requested_session_id: String::from("other"),
+            },
+            &UnconfiguredProviderPrompt {
+                prompt: "hello",
+                turn_index: 3,
+                prompt_started: Instant::now(),
+                setup_error: "missing key",
+            },
+        ));
+        assert_eq!(revision.lock().map_or(0, |value| *value), 2);
+    }
+
     #[test]
     fn provider_agent_edit_validation_failure_persists_replayable_terminal_evidence() {
         let root = TempProject::new("native-provider-agent-edit-validation");
@@ -11295,6 +12061,8 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-edit-1"),
@@ -11408,6 +12176,8 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![
                 ProviderToolCall {
@@ -11625,6 +12395,8 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![
                 ProviderToolCall {
@@ -11766,6 +12538,8 @@ mod tests {
                 pending_events: &mut pending_events,
                 trace: None,
                 current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
             },
             vec![ProviderToolCall {
                 call_id: String::from("call-replaced-1"),
@@ -12567,6 +13341,10 @@ mod tests {
                 | SessionEvent::MetricRecorded { .. }
                 | SessionEvent::StaticContextIncluded { .. }
                 | SessionEvent::PermissionDecisionRecorded { .. }
+                | SessionEvent::ReviewPolicyChanged { .. }
+                | SessionEvent::ReviewRequestRecorded { .. }
+                | SessionEvent::ReviewAssessmentRecorded { .. }
+                | SessionEvent::ExactActionGrantRecorded { .. }
                 | SessionEvent::ApprovalModeChanged { .. }
                 | SessionEvent::ThinkingLevelChanged { .. }
                 | SessionEvent::SessionModelChanged { .. }
@@ -17990,6 +18768,7 @@ mod tests {
                     Capability::ToolOutputStreaming,
                     Capability::StructuredReviewRows,
                     Capability::ModelState,
+                    Capability::AutoReview,
                 ]
         ));
     }
@@ -18098,6 +18877,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -18227,6 +19008,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -18369,6 +19152,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -18467,6 +19252,8 @@ mod tests {
             }],
             replacement_bundles: Vec::new(),
             host_start_count: 1,
+            reviewer: None,
+            reviewer_generation: Arc::new(Mutex::new(0)),
         };
         let turn_id = TurnId(String::from("turn-active-extension"));
         let model = ProviderModel {
@@ -18556,6 +19343,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -18677,6 +19466,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -18856,6 +19647,8 @@ mod tests {
                     max_output_tokens: 1_000,
                     provider: provider_test_config(),
                     trace: None,
+                    review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                    authorization_revision: Arc::new(Mutex::new(0)),
                 },
             );
             let review = async {
@@ -18998,6 +19791,8 @@ mod tests {
                     max_output_tokens: 1_000,
                     provider: provider_test_config(),
                     trace: None,
+                    review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                    authorization_revision: Arc::new(Mutex::new(0)),
                 },
             )
             .await;
@@ -19200,6 +19995,8 @@ mod tests {
                     max_output_tokens: 1_000,
                     provider: provider_test_config(),
                     trace: None,
+                    review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                    authorization_revision: Arc::new(Mutex::new(0)),
                 },
             );
             let review = async {
@@ -19390,6 +20187,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -19580,6 +20379,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -20318,6 +21119,8 @@ mod tests {
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -21436,7 +22239,7 @@ mod tests {
             trace: None,
             catalog_refresh: None,
             model_discovery: None,
-            provider_connections: None, }, true, true, super::native_ready_handshake(false), move |_| requester.clone()));
+            provider_connections: None, }, true, true, true, super::native_ready_handshake(false), move |_| requester.clone()));
 
             assert!(
                 client_tx
@@ -22669,6 +23472,7 @@ manual anchored summary"
                 },
                 true,
                 true,
+                true,
                 super::native_ready_handshake(false),
                 move |_| provider.clone(),
             ));
@@ -22966,6 +23770,7 @@ manual anchored summary"
                 model_discovery: None,
                 provider_connections: None,
             },
+            true,
             true,
             true,
             super::native_ready_handshake(false),
@@ -24635,6 +25440,8 @@ manual anchored summary"
                     pending_events: &mut pending_events,
                     trace: None,
                     current_tool_index: 0,
+                    review_coordinator: None,
+                    review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
                 },
                 round.tool_calls,
             )
@@ -24812,6 +25619,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider: provider_test_config(),
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         ));
 
@@ -25698,6 +26507,7 @@ manual anchored summary"
                 command: String::from("cargo test"),
                 workdir: Some(String::from("/workspace")),
                 timeout_ms: 30_000,
+                review_origin: None,
             },
         };
         let mut log = SessionLog::default();
@@ -25771,6 +26581,7 @@ manual anchored summary"
                 command: String::from("cargo test"),
                 workdir: None,
                 timeout_ms: 30_000,
+                review_origin: None,
             },
         };
         let second_payload = ToolReviewPayload::Command {
@@ -25780,6 +26591,7 @@ manual anchored summary"
                 command: String::from("cargo fmt"),
                 workdir: None,
                 timeout_ms: 30_000,
+                review_origin: None,
             },
         };
         let mut log = SessionLog::default();
@@ -28126,6 +28938,8 @@ manual anchored summary"
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -28274,6 +29088,8 @@ manual anchored summary"
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -28436,6 +29252,8 @@ manual anchored summary"
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -29669,6 +30487,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -29867,6 +30687,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -29980,6 +30802,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -30618,6 +31442,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -30830,6 +31656,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31046,6 +31874,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31232,6 +32062,8 @@ manual anchored summary"
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31436,6 +32268,8 @@ manual anchored summary"
                 max_output_tokens: provider.adapter.max_tokens,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31565,6 +32399,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -31687,6 +32523,8 @@ manual anchored summary"
                 max_output_tokens: 1_000,
                 provider,
                 trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
             },
         )
         .await;
@@ -32171,6 +33009,7 @@ manual anchored summary"
             },
             true,
             true,
+            true,
             super::native_ready_handshake(false),
             move |_| requester.clone(),
         ));
@@ -32329,6 +33168,8 @@ manual anchored summary"
                 Some(ThinkingLevel::High),
             ),
             shell_session_grants: super::ShellSessionGrants::default(),
+            review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+            authorization_revision: Arc::new(Mutex::new(0)),
             trace: None,
         })
         .await;
@@ -32408,5 +33249,49 @@ manual anchored summary"
         let inactive = turn_permission_policy(&registry, &[]);
         assert_eq!(inactive.authorize(&fetch), ToolPermissionState::Denied);
         assert!(!inactive.allows_provider_advertising(&fetch));
+    }
+
+    #[test]
+    fn human_performs_decision_is_handed_off_not_asked() {
+        assert_eq!(
+            super::shell_disposition_for_decision(crate::RESTRICTION_HUMAN_PERFORMS_REASON),
+            super::ShellHoldDisposition::HumanPerforms
+        );
+        assert_eq!(
+            super::shell_disposition_for_decision(crate::RESTRICTION_ASK_FIRST_REASON),
+            super::ShellHoldDisposition::AskUser(None)
+        );
+    }
+
+    #[test]
+    fn reviewer_restriction_holds_split_by_restriction_kind() {
+        let human = crate::HoldReason::RestrictionApplies {
+            restriction: crate::ReviewRestriction::HumanPerforms {
+                matcher: crate::RestrictionMatcher::ActionClass {
+                    class: crate::ActionClass::HostActivation,
+                },
+                note: String::from("I run rebuilds"),
+            },
+        };
+        let ask = crate::HoldReason::RestrictionApplies {
+            restriction: crate::ReviewRestriction::AskFirst {
+                matcher: crate::RestrictionMatcher::ActionClass {
+                    class: crate::ActionClass::ExternalPublish,
+                },
+                note: String::from("ask before publishing"),
+            },
+        };
+        assert_eq!(
+            super::shell_disposition_for_hold(&human),
+            super::ShellHoldDisposition::HumanPerforms
+        );
+        assert_eq!(
+            super::shell_disposition_for_hold(&ask),
+            super::ShellHoldDisposition::AskUser(Some(yach_proto::ReviewOrigin::Risk))
+        );
+        assert_eq!(
+            super::shell_disposition_for_hold(&crate::HoldReason::SignificantRisk),
+            super::ShellHoldDisposition::AskUser(Some(yach_proto::ReviewOrigin::Risk))
+        );
     }
 }

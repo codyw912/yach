@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{SessionEvent, SessionLoadResult, SessionLog};
 
-pub trait SessionEventSink {
+pub trait SessionEventSink: Sync {
     fn append_event(&self, event: &SessionEvent) -> io::Result<()>;
 
     fn append_events(&self, events: &[SessionEvent]) -> io::Result<()> {

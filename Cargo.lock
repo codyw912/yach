@@ -3811,6 +3811,7 @@ dependencies = [
  "yach-catalog",
  "yach-connections",
  "yach-hashline-extension",
+ "yach-jev-reviewer",
  "yach-proto",
  "yach-trace",
  "yach-ui",
@@ -3833,6 +3834,7 @@ dependencies = [
  "similar",
  "tokio",
  "tokio-util",
+ "toml",
  "toml_edit",
  "uuid",
  "yach-connections",
@@ -3852,6 +3854,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
  "toml",
  "yach-backend",
  "yach-proto",
@@ -3889,6 +3892,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "yach-jev-reviewer"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -21,6 +21,7 @@ yach-connections = { version = "0.1.0", path = "../yach-connections" }
 yach-backend = { version = "0.1.0", path = "../yach-backend" }
 yach-catalog = { version = "0.1.0", path = "../yach-catalog" }
 yach-hashline-extension = { version = "0.1.0", path = "../yach-hashline-extension" }
+yach-jev-reviewer = { version = "0.1.0", path = "../yach-jev-reviewer" }
 yach-proto = { version = "0.1.0", path = "../yach-proto" }
 yach-ui = { version = "0.1.0", path = "../yach-ui" }
 yach-trace = { version = "0.1.0", path = "../yach-trace" }

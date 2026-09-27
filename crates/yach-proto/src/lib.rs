@@ -40,6 +40,7 @@ pub enum Capability {
     ApprovalModes,
     ModelState,
     PromptAttemptReset,
+    AutoReview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -75,7 +76,7 @@ impl<'de> Deserialize<'de> for Handshake {
             protocol_version: String,
             agent_name: String,
             #[serde(default)]
-            capabilities: Option<serde_json::Value>,
+            capabilities: Option<Vec<serde_json::Value>>,
         }
 
         let wire = HandshakeWire::deserialize(deserializer)?;
@@ -89,10 +90,14 @@ impl<'de> Deserialize<'de> for Handshake {
         let Some(capabilities) = wire.capabilities else {
             return Err(serde::de::Error::missing_field("capabilities"));
         };
+        let capabilities = capabilities
+            .into_iter()
+            .filter_map(|capability| serde_json::from_value(capability).ok())
+            .collect();
         Ok(Self {
             protocol_version: wire.protocol_version,
             agent_name: wire.agent_name,
-            capabilities: serde_json::from_value(capabilities).map_err(serde::de::Error::custom)?,
+            capabilities,
         })
     }
 }
@@ -263,17 +268,24 @@ pub struct Notification {
 pub enum ApprovalMode {
     Review,
     AcceptEdits,
+    AutoReview,
     FullAccess,
 }
 
 impl ApprovalMode {
-    pub const ALL: [Self; 3] = [Self::Review, Self::AcceptEdits, Self::FullAccess];
+    pub const ALL: [Self; 4] = [
+        Self::Review,
+        Self::AcceptEdits,
+        Self::AutoReview,
+        Self::FullAccess,
+    ];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Review => "review",
             Self::AcceptEdits => "accept-edits",
+            Self::AutoReview => "auto-review",
             Self::FullAccess => "full-access",
         }
     }
@@ -688,6 +700,16 @@ pub enum LocalEditReviewState {
     Allowed,
     NeedsUserApproval,
     AutoReviewUnavailable,
+    /// Reserved for the user to perform; never an approvable review row.
+    HumanPerforms,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewOrigin {
+    Risk,
+    ReviewerError,
+    HumanPerforms,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -700,6 +722,8 @@ pub struct LocalEditPreviewSummary {
     pub review_state: LocalEditReviewState,
     pub diff_summary: String,
     pub diff_summary_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_origin: Option<ReviewOrigin>,
 }
 
 /// Command awaiting user review before execution.
@@ -710,6 +734,8 @@ pub struct CommandReviewSummary {
     pub command: String,
     pub workdir: Option<String>,
     pub timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_origin: Option<ReviewOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -920,6 +946,14 @@ pub struct ModelActivationResult {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerState {
+    Selected,
+    Unavailable,
+    Reloaded,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
@@ -995,6 +1029,14 @@ pub enum ServerEvent {
         request_id: u64,
         mode: ApprovalMode,
         message: String,
+    },
+    ReviewerStatusChanged {
+        reviewer_id: String,
+        generation: u64,
+        state: ReviewerState,
+        /// Human-readable disclosure summary from the reviewer manifest.
+        /// Shown at selection time so the user knows what the reviewer sees.
+        disclosure_summary: String,
     },
     DialogRequested(DialogRequest),
     ToolReviewRequested {
@@ -1111,6 +1153,7 @@ pub fn default_ui_handshake() -> Handshake {
             Capability::ApprovalModes,
             Capability::ModelState,
             Capability::PromptAttemptReset,
+            Capability::AutoReview,
         ],
     )
 }
@@ -1128,6 +1171,7 @@ pub fn default_backend_handshake() -> Handshake {
             Capability::SessionForking,
             Capability::StructuredReviewRows,
             Capability::ApprovalModes,
+            Capability::AutoReview,
         ],
     )
 }
@@ -1148,6 +1192,7 @@ fn tool_review_events_round_trip_as_jsonl() {
                 review_state: LocalEditReviewState::NeedsUserApproval,
                 diff_summary: String::from("-old\n+new\n"),
                 diff_summary_truncated: false,
+                review_origin: None,
             },
         },
     };
@@ -1214,6 +1259,7 @@ fn tool_review_events_round_trip_as_jsonl() {
                 command: String::from("cargo test"),
                 workdir: Some(String::from("/workspace")),
                 timeout_ms: 30_000,
+                review_origin: None,
             },
         },
     };
@@ -1303,8 +1349,8 @@ mod tests {
         LocalEditFinishedOutcome, LocalEditOperationInput, LocalEditPreviewSummary,
         LocalEditReviewState, MessageBody, MessageDirection, MessageMeta, ModelActivationIntent,
         ModelActivationResult, ModelInfo, ModelTarget, NegotiatedCapabilities, PROTOCOL_VERSION,
-        PromptAttemptResetError, ServerEvent, SessionModelState, SubmittedSecret, ThinkingLevel,
-        TransportMessage, accept_prompt_attempt_sequence, bounded_protocol_version,
+        PromptAttemptResetError, ReviewerState, ServerEvent, SessionModelState, SubmittedSecret,
+        ThinkingLevel, TransportMessage, accept_prompt_attempt_sequence, bounded_protocol_version,
         default_backend_handshake, default_ui_handshake, truncate_utf8_suffix,
     };
     use crate::{
@@ -1330,6 +1376,41 @@ mod tests {
         };
         assert!(line.contains("\"mode\":\"full-access\""));
         assert_eq!(ClientEvent::from_jsonl(&line).ok(), Some(event));
+    }
+
+    #[test]
+    fn auto_review_mode_round_trips_with_kebab_case_wire_name() {
+        let json = serde_json::to_string(&ApprovalMode::AutoReview);
+        assert!(matches!(json.as_deref(), Ok("\"auto-review\"")));
+        let decoded = json.and_then(|json| serde_json::from_str::<ApprovalMode>(&json));
+        assert!(matches!(decoded, Ok(ApprovalMode::AutoReview)));
+    }
+
+    #[test]
+    fn unknown_capability_is_dropped_not_fatal() {
+        let wire = r#"{"protocol_version":"0.3.0","agent_name":"x","capabilities":["prompt_streaming","future_thing"]}"#;
+        let parsed = serde_json::from_str::<Handshake>(wire);
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
+        assert_eq!(parsed.capabilities, vec![Capability::PromptStreaming]);
+    }
+
+    #[test]
+    fn reviewer_status_event_round_trips() {
+        let event = ServerEvent::ReviewerStatusChanged {
+            reviewer_id: String::from("jev-typesafe"),
+            generation: 7,
+            state: ReviewerState::Reloaded,
+            disclosure_summary: String::from("sends bounded action context to api.example"),
+        };
+        let wire = event.to_jsonl();
+        assert!(wire.is_ok());
+        let Ok(wire) = wire else {
+            return;
+        };
+        assert_eq!(ServerEvent::from_jsonl(&wire).ok(), Some(event));
     }
 
     #[test]
@@ -1782,6 +1863,7 @@ mod tests {
                 review_state: LocalEditReviewState::NeedsUserApproval,
                 diff_summary: String::from("-old\n+new\n"),
                 diff_summary_truncated: false,
+                review_origin: None,
             },
         };
 
@@ -2020,11 +2102,14 @@ mod tests {
     }
 
     #[test]
-    fn same_version_unknown_capability_still_fails_to_deserialize() {
+    fn same_version_unknown_capability_is_dropped() {
         let line = format!(
             r#"{{"type":"initialize","protocol_version":"{PROTOCOL_VERSION}","agent_name":"now","capabilities":["prompt_streaming","brand_new_cap"]}}"#
         );
-        assert!(ClientEvent::from_jsonl(&line).is_err());
+        let decoded = ClientEvent::from_jsonl(&line);
+        assert!(
+            matches!(decoded, Ok(ClientEvent::Initialize(handshake)) if handshake.capabilities == vec![Capability::PromptStreaming])
+        );
     }
 
     #[test]

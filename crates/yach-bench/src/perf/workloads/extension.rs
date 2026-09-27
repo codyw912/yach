@@ -97,6 +97,7 @@ fn sample_extension_runtime_profile() -> io::Result<ExtensionRuntimeProfileSampl
                 risk: ExtensionToolRisk::ReadsLocalMetadata,
                 provider_visible: true,
             }],
+            None,
             Duration::from_secs(1),
         )
         .map_err(|error| extension_profile_io_error(&error))?;

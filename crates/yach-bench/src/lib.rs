@@ -1,3 +1,4 @@
+pub mod eval_review;
 pub mod fixtures;
 pub mod latency;
 pub mod perf;

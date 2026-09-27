@@ -11,9 +11,13 @@ fn main() -> ExitCode {
             Ok(outcome) => (outcome.lines, outcome.exit_code),
             Err(message) => (vec![format!("error: {message}")], 1),
         },
+        Some("eval-review") => match yach_bench::eval_review::dispatch(&args[1..]) {
+            Ok(lines) => (lines, 0),
+            Err(message) => (vec![format!("error: {message}")], 1),
+        },
         _ => (
             vec![String::from(
-                "usage: yach-bench perf run|worker|ab|report|host-fingerprint …",
+                "usage: yach-bench perf run|worker|ab|report|host-fingerprint … | eval-review --suite e1|e2|e3|e4 --corpus <dir> --reviewer fixture|jev [--runs <n>] --out <json> | eval-review validate <dir>",
             )],
             2,
         ),

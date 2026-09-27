@@ -530,6 +530,7 @@ fn rpc_capability_drift_is_explicit() {
                 Capability::ApprovalModes,
                 Capability::ModelState,
                 Capability::PromptAttemptReset,
+                Capability::AutoReview,
             ],
         ),
     )
@@ -868,6 +869,43 @@ fn rpc_full_access_is_correlated_auditable_and_not_persisted() {
     assert!(session.contains("\"type\":\"approval_mode_changed\""));
     assert!(session.contains("\"mode\":\"full-access\""));
 }
+#[test]
+fn rpc_auto_review_is_correlated_auditable_and_not_persisted() {
+    let workspace = TempDir::new("auto-review-mode");
+    let mut child = RpcChild::spawn_with_default_session(Some("fixture"), workspace.path());
+    child.send(&ClientEvent::ApprovalModeSelected {
+        request_id: 43,
+        mode: yach_proto::ApprovalMode::AutoReview,
+    });
+    child.wait_for(|event| {
+        matches!(
+            event,
+            ServerEvent::ApprovalModeChanged {
+                request_id: 43,
+                mode: yach_proto::ApprovalMode::AutoReview,
+            }
+        )
+    });
+    child.shutdown();
+
+    let permissions = child.home_path().join(".yach/permissions");
+    assert!(!permissions.exists() || fs::read_dir(permissions).test_unwrap().next().is_none());
+    let session_file = fs::read_dir(child.home_path().join(".yach/sessions"))
+        .test_unwrap()
+        .filter_map(Result::ok)
+        .flat_map(|entry| fs::read_dir(entry.path()).into_iter().flatten())
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .test_unwrap();
+    let session = fs::read_to_string(session_file).test_unwrap();
+    assert!(session.contains("\"type\":\"approval_mode_changed\""));
+    assert!(session.contains("\"mode\":\"auto-review\""));
+}
+
 #[test]
 fn rpc_provider_cancel_interrupts_midstream() {
     let workspace = TempDir::new("provider-cancel");
