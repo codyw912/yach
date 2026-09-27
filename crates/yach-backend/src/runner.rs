@@ -6532,6 +6532,18 @@ where
             object.insert(String::from("native"), native_details);
         }
     }
+    let ignored_reason = if run.config.project_summary_prompt_ignored {
+        Some("project_scope")
+    } else {
+        run.config.summary_prompt_error
+    };
+    if let Some(reason) = ignored_reason {
+        let _ = run
+            .review_tx
+            .send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("compaction_summary_prompt_ignored reason={reason}"),
+            }));
+    }
     let _ = run
         .review_tx
         .send(BackendEvent::Server(ServerEvent::StatusUpdated {
@@ -6542,7 +6554,7 @@ where
         model: run.model.clone(),
         messages: vec![ProviderMessage::text(
             Role::User,
-            crate::build_summary_prompt(&preparation),
+            crate::build_summary_prompt(&preparation, run.config.summary_prompt.as_deref()),
         )],
         extensions: Vec::new(),
         native_request: None,

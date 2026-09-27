@@ -2249,7 +2249,7 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
         model: ProviderModel { provider, model },
         messages: vec![ProviderMessage::text(
             Role::User,
-            yach_backend::build_summary_prompt(&preparation),
+            yach_backend::build_summary_prompt(&preparation, None),
         )],
         extensions: vec![],
         native_request: None,

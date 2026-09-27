@@ -6,6 +6,7 @@
 //! The session log is never truncated; a `CompactionCheckpoint` event is
 //! appended and provider context rebuilds as summary + verbatim kept tail.
 
+use std::io::Read as _;
 use std::sync::Arc;
 
 use crate::provider::NativeRequestEnvelope;
@@ -45,6 +46,17 @@ pub struct CompactionConfig {
     pub auto_threshold_percent: u8,
     #[serde(default = "default_masking")]
     pub masking: bool,
+    /// User-scope-only: loaded text of `compaction.summary_prompt`; never
+    /// deserialized from config files.
+    #[serde(skip)]
+    pub summary_prompt: Option<String>,
+    /// Why `summary_prompt` failed to load: `"unreadable"` or `"empty"`.
+    #[serde(skip)]
+    pub summary_prompt_error: Option<&'static str>,
+    /// True when the project file set `compaction.summary_prompt`, which is
+    /// ignored (user scope only).
+    #[serde(skip)]
+    pub project_summary_prompt_ignored: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +75,9 @@ impl Default for CompactionConfig {
             keep_recent_tokens: COMPACTION_DEFAULT_KEEP_RECENT_TOKENS,
             auto_threshold_percent: COMPACTION_DEFAULT_AUTO_THRESHOLD_PERCENT,
             masking: true,
+            summary_prompt: None,
+            summary_prompt_error: None,
+            project_summary_prompt_ignored: false,
         }
     }
 }
@@ -78,11 +93,30 @@ impl CompactionConfig {
     /// values win. Unreadable or invalid config fails closed to defaults.
     #[must_use]
     pub fn load_for_project(project_root: Option<&Path>) -> Self {
-        let user = user_config_path().and_then(|path| load_compaction_config(&path));
-        let project = project_root
-            .map(|root| root.join(".yach").join("config.json"))
-            .and_then(|path| load_compaction_config(&path));
-        project.or(user).unwrap_or_default()
+        let user_path = user_config_path();
+        let project_path = project_root.map(|root| root.join(".yach").join("config.json"));
+        Self::load_from_paths(user_path.as_deref(), project_path.as_deref())
+    }
+
+    /// Testable core of [`Self::load_for_project`]: `user` and `project` are
+    /// config file paths; project values win wholesale for every deserialized
+    /// field, while `summary_prompt` is read from the user file only.
+    #[must_use]
+    pub fn load_from_paths(user: Option<&Path>, project: Option<&Path>) -> Self {
+        let mut config = project
+            .and_then(load_compaction_config)
+            .or_else(|| user.and_then(load_compaction_config))
+            .unwrap_or_default();
+        if project.is_some_and(config_summary_prompt_key) {
+            config.project_summary_prompt_ignored = true;
+        }
+        if let Some(path) = user.and_then(summary_prompt_path) {
+            match read_summary_prompt(&path) {
+                Ok(text) => config.summary_prompt = Some(text),
+                Err(error) => config.summary_prompt_error = Some(error),
+            }
+        }
+        config
     }
 
     #[must_use]
@@ -117,6 +151,51 @@ fn load_compaction_config(path: &Path) -> Option<CompactionConfig> {
     serde_json::from_str::<CompactionConfigFile>(&raw)
         .ok()
         .map(|file| file.compaction)
+}
+
+/// `compaction.summary_prompt` in a raw config file, as a path string.
+fn summary_prompt_path(config_path: &Path) -> Option<std::path::PathBuf> {
+    let raw = std::fs::read_to_string(config_path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let path = value.get("compaction")?.get("summary_prompt")?.as_str()?;
+    Some(std::path::PathBuf::from(path))
+}
+
+fn config_summary_prompt_key(config_path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("compaction")
+                .and_then(|compaction| compaction.get("summary_prompt"))
+                .cloned()
+        })
+        .is_some()
+}
+
+const SUMMARY_PROMPT_MAX_BYTES: usize = 65_536;
+
+/// Read the summary-prompt file: capped at 64 KiB, trimmed; empty after trim
+/// is `"empty"`, any read/UTF-8 failure or over-long file is `"unreadable"`.
+fn read_summary_prompt(path: &Path) -> Result<String, &'static str> {
+    let mut file = std::fs::File::open(path).map_err(|_| "unreadable")?;
+    let mut buffer = Vec::new();
+    file.by_ref()
+        .take(SUMMARY_PROMPT_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|_| "unreadable")?;
+    if buffer.len() > SUMMARY_PROMPT_MAX_BYTES {
+        return Err("unreadable");
+    }
+    let text = String::from_utf8(buffer).map_err(|_| "unreadable")?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("empty");
+    }
+    Ok(String::from(trimmed))
 }
 
 /// Rough token estimate for accounting purposes. Precision is deliberately
@@ -906,15 +985,20 @@ instruction verbatim, word-for-word; these remain in effect)
 /// Build the summarization prompt for a preparation. Pure so the prompt
 /// shape is unit-testable without a provider.
 #[must_use]
-pub fn build_summary_prompt(preparation: &CompactionPreparation) -> String {
-    let mut prompt = String::from(
-        "You are summarizing the earlier part of a coding session so work \
+pub fn build_summary_prompt(preparation: &CompactionPreparation, custom: Option<&str>) -> String {
+    let mut prompt = if let Some(custom) = custom {
+        String::from(custom)
+    } else {
+        let mut prompt = String::from(
+            "You are summarizing the earlier part of a coding session so work \
 can continue in a smaller context. The conversation below is material to \
 summarize, not a conversation to continue. Do not answer it and do not \
 mention that you are summarizing.\n\nProduce a summary with exactly these \
 sections:\n",
-    );
-    prompt.push_str(COMPACTION_SUMMARY_SCHEMA);
+        );
+        prompt.push_str(COMPACTION_SUMMARY_SCHEMA);
+        prompt
+    };
     if let Some(previous_summary) = preparation.previous_summary.as_deref() {
         prompt.push_str("\n\n<previous-summary>\n");
         prompt.push_str(previous_summary);
@@ -1398,12 +1482,120 @@ mod tests {
             }),
             native_request: None,
         };
-        let prompt = build_summary_prompt(&preparation);
+        let prompt = build_summary_prompt(&preparation, None);
         assert!(prompt.contains("verbatim"));
         assert!(prompt.contains("<previous-summary>\nprior anchored summary"));
         assert!(prompt.contains("anchored summary: preserve still-true details"));
         assert!(prompt.contains("keep the migration plan"));
         assert!(prompt.ends_with("<conversation>\n[User]: hi\n</conversation>"));
+    }
+
+    fn summary_fixture_preparation(
+        previous_summary: Option<&str>,
+        focus: Option<&str>,
+    ) -> CompactionPreparation {
+        CompactionPreparation {
+            serialized_conversation: String::from("[User]: hi"),
+            previous_summary: previous_summary.map(String::from),
+            previous_details: None,
+            first_kept_entry_id: EntryId(String::from("entry-9")),
+            tokens_before: 90_000,
+            reason: CompactionReason::Manual,
+            focus_instructions: focus.map(String::from),
+            provider: Arc::new(CompactionProviderContext {
+                provider: String::from("fixture"),
+                wire: String::from("fixture-wire"),
+                model: String::from("fixture-model"),
+                connection: String::from("fixture-connection"),
+                responses_compact: None,
+                adapter: Arc::new(RigProviderAdapterConfig {
+                    provider: RigProviderConfig::Anthropic {
+                        api_key: ProviderSecret::new(String::from("fixture-secret")),
+                        base_url: None,
+                    },
+                    timeout: Duration::from_secs(1),
+                    max_tokens: 1,
+                    context_window: 1,
+                    max_tokens_param: MaxTokensParam::MaxTokens,
+                    error_dialect: crate::DialectSelection::Missing,
+                }),
+            }),
+            native_request: None,
+        }
+    }
+
+    fn temp_config_root(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "yach-compaction-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap_or_default();
+        root
+    }
+
+    fn write_user_config(root: &Path, contents: &str) {
+        std::fs::write(root.join("user.json"), contents).unwrap_or_default();
+    }
+
+    fn write_project_config(root: &Path, contents: &str) {
+        std::fs::write(root.join("project.json"), contents).unwrap_or_default();
+    }
+
+    #[test]
+    fn custom_summary_prompt_replaces_preamble_and_keeps_kernel_framing() {
+        let preparation =
+            summary_fixture_preparation(Some("prior anchored summary"), Some("keep API names"));
+        let prompt = build_summary_prompt(&preparation, Some("Summarize tersely."));
+        assert!(prompt.starts_with("Summarize tersely."));
+        assert!(!prompt.contains("You are summarizing the earlier part"));
+        assert!(prompt.contains("<previous-summary>\nprior anchored summary"));
+        assert!(prompt.contains("User focus for this summary"));
+        assert!(prompt.contains("<conversation>\n"));
+        assert!(prompt.ends_with("\n</conversation>"));
+    }
+
+    #[test]
+    fn summary_prompt_is_user_scope_only() {
+        let root = temp_config_root("summary-scope");
+        let prompt_file = root.join("prompt.md");
+        std::fs::write(&prompt_file, "User prompt.").unwrap_or_default();
+        write_user_config(
+            &root,
+            &format!(
+                r#"{{"compaction":{{"summary_prompt":"{}"}}}}"#,
+                prompt_file.display()
+            ),
+        );
+        write_project_config(
+            &root,
+            r#"{"compaction":{"summary_prompt":"/tmp/repo-prompt.md","keep_recent_tokens":5}}"#,
+        );
+        let config = CompactionConfig::load_from_paths(
+            Some(&root.join("user.json")),
+            Some(&root.join("project.json")),
+        );
+        assert_eq!(config.summary_prompt.as_deref(), Some("User prompt."));
+        assert!(config.project_summary_prompt_ignored);
+        assert_eq!(
+            config.keep_recent_tokens, 5,
+            "other project values still win"
+        );
+    }
+
+    #[test]
+    fn unreadable_or_empty_summary_prompt_falls_back() {
+        let root = temp_config_root("summary-missing");
+        write_user_config(
+            &root,
+            r#"{"compaction":{"summary_prompt":"/nonexistent/prompt.md"}}"#,
+        );
+        let config = CompactionConfig::load_from_paths(Some(&root.join("user.json")), None);
+        assert_eq!(config.summary_prompt, None);
+        assert_eq!(config.summary_prompt_error, Some("unreadable"));
     }
 
     #[test]
