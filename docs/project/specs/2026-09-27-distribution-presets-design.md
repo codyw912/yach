@@ -246,6 +246,15 @@ states the consequences under presets:
 - **Accidental collisions fail closed**, as today. An extension tool whose name
   matches an active tool without a declared replacement is rejected with a
   diagnostic; there is no silent shadowing.
+- **Built-in names stay reserved in every preset.** The six project tool names
+  and `bash` cannot be registered by an extension even when `project-tools` is
+  disabled; only a declared replacement bundle can supply them, and only while
+  its target is active.
+- **A failed bundle contributes no tools.** When a replacement bundle does not
+  activate, its member implementations are withheld from the catalog as well,
+  so a failed bundle never appears as standalone tools. Inactive-bundle
+  diagnostics are reported when background activation finishes and at the
+  first turn that resolves them, as `tool_replacement_bundle_inactive` status.
 
 ## Compaction prompt (interim)
 
