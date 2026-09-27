@@ -641,6 +641,7 @@ pub enum ExtensionActivationErrorKind {
     HostTimedOut,
     ProtocolError,
     PolicyBlocked,
+    NotCompiledIn,
 }
 
 impl ExtensionActivationErrorKind {
@@ -656,6 +657,7 @@ impl ExtensionActivationErrorKind {
             Self::HostTimedOut => "host_timed_out",
             Self::ProtocolError => "protocol_error",
             Self::PolicyBlocked => "policy_blocked",
+            Self::NotCompiledIn => "not_compiled_in",
         }
     }
 }

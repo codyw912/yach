@@ -22,16 +22,51 @@ pub(crate) const BUNDLED: [BundledPackage; 2] = [
         source: "yach.hashline",
         dir_name: "yach-hashline",
         host_arg: "hashline",
-        manifest_json: || Some(yach_hashline_extension::MANIFEST_JSON),
+        manifest_json: hashline_manifest_json,
     },
     BundledPackage {
         component: Component::JevReviewer,
         source: "yach.jev-reviewer",
         dir_name: "yach-jev-reviewer",
         host_arg: "jev",
-        manifest_json: || Some(yach_jev_reviewer::MANIFEST_JSON),
+        manifest_json: jev_manifest_json,
     },
 ];
+
+#[cfg(feature = "bundled-hashline")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the not-compiled-in sibling returns None"
+)]
+fn hashline_manifest_json() -> Option<&'static str> {
+    Some(yach_hashline_extension::MANIFEST_JSON)
+}
+
+#[cfg(not(feature = "bundled-hashline"))]
+fn hashline_manifest_json() -> Option<&'static str> {
+    None
+}
+
+#[cfg(feature = "bundled-jev")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the not-compiled-in sibling returns None"
+)]
+fn jev_manifest_json() -> Option<&'static str> {
+    Some(yach_jev_reviewer::MANIFEST_JSON)
+}
+
+#[cfg(not(feature = "bundled-jev"))]
+fn jev_manifest_json() -> Option<&'static str> {
+    None
+}
+
+/// Whether a bundled extension source is compiled into this build.
+pub(crate) fn is_compiled_in(source: &str) -> bool {
+    BUNDLED
+        .iter()
+        .any(|package| package.source == source && (package.manifest_json)().is_some())
+}
 
 /// Materializes the bundled package under `home/.yach/bundled/<dir>/<version>`,
 /// writing the extension manifest atomically. Returns `None` when the package
@@ -82,21 +117,21 @@ pub(crate) fn materialize(home: &Path, package: &BundledPackage) -> io::Result<O
 
     Ok(Some(root))
 }
-
-/// The version segment of a materialized package root: its last path component.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "kept for Task 8 bundle diagnostics")
-)]
-pub(crate) fn materialized_version(package_root: &Path) -> Option<&str> {
-    package_root.file_name()?.to_str()
-}
-
 /// Re-materializes and repoints bundled records so the manifest's
 /// `main.command` always names the running binary. Packages whose source is
 /// in `removed` are left untouched. `materialize` skips an unchanged write
 /// and `refresh_bundled` is a no-op when the root is unchanged, so the
 /// steady state stays write-free. Returns whether the store changed.
+///
+/// `#[cfg(not(test))]` in `main.rs` hides its only production caller during
+/// test builds; the tests exercise it directly.
+#[cfg_attr(
+    all(test, not(feature = "bundled-hashline")),
+    expect(
+        dead_code,
+        reason = "only called from #[cfg(not(test))] code and bundled-hashline tests"
+    )
+)]
 pub(crate) fn refresh_on_upgrade(
     home: &Path,
     store: &mut ExtensionInstallStore,
@@ -199,6 +234,30 @@ pub(crate) fn apply_preset(
             .records
             .iter()
             .any(|record| record.source == package.source);
+        if (package.manifest_json)().is_none() {
+            // A package this build omits is never materialized and never
+            // gains a record. An existing record still records the
+            // preference so a later full build applies it.
+            if included.contains(package.component) && !bundled_removed.contains(package.source) {
+                if has_record {
+                    if preserve_existing {
+                        report.preserved.push(package.source);
+                    } else {
+                        store
+                            .set_enabled(package.source, true)
+                            .map_err(|error| crate::extension_install_io_error(&error))?;
+                        report.enabled.push(package.source);
+                    }
+                }
+                report.not_compiled_in.push(package.source);
+            } else if !included.contains(package.component) && has_record {
+                store
+                    .set_enabled(package.source, false)
+                    .map_err(|error| crate::extension_install_io_error(&error))?;
+                report.disabled.push(package.source);
+            }
+            continue;
+        }
         if included.contains(package.component) {
             if bundled_removed.contains(package.source) {
                 continue;
@@ -320,14 +379,27 @@ pub(crate) fn warn_unknown_components(unknown: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    use yach_backend::{ExtensionInstallStore, Preset, UserConfigStore};
+
+    use super::{apply_preset, ensure_first_run};
+    // Used by tests that exist whenever hashline is absent (the
+    // not-compiled-in cases) or whenever both packages materialize.
+    #[cfg(any(not(feature = "bundled-hashline"), feature = "bundled-jev"))]
+    use yach_backend::ExtensionInstallScope;
+
+    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
+    use super::ephemeral_package_roots;
+    #[cfg(feature = "bundled-hashline")]
+    use super::{BUNDLED, install, refresh_on_upgrade};
+    #[cfg(feature = "bundled-hashline")]
     use std::collections::BTreeSet;
 
-    use yach_backend::{ExtensionInstallScope, ExtensionInstallStore, Preset, UserConfigStore};
-
-    use super::{
-        BUNDLED, apply_preset, ensure_first_run, ephemeral_package_roots, install,
-        materialized_version, refresh_on_upgrade,
-    };
+    /// The version segment of a materialized package root: its last path
+    /// component.
+    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
+    fn materialized_version(package_root: &std::path::Path) -> Option<&str> {
+        package_root.file_name()?.to_str()
+    }
 
     fn temp_home(name: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -342,6 +414,7 @@ mod tests {
         path
     }
 
+    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
     #[test]
     fn upgrade_refresh_repoints_existing_and_skips_removed() {
         let home = temp_home("bundled-upgrade");
@@ -383,6 +456,7 @@ mod tests {
         assert!(matches!(unchanged, Ok(false)), "second pass is a no-op");
     }
 
+    #[cfg(feature = "bundled-hashline")]
     #[test]
     fn upgrade_refresh_repaints_manifest_command_at_the_same_version() {
         let home = temp_home("bundled-same-version");
@@ -427,6 +501,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
     #[test]
     fn first_apply_preserves_existing_disabled_record() {
         let home = temp_home("first-apply");
@@ -462,6 +537,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "bundled-hashline")]
     #[test]
     fn preset_use_never_readds_removed_until_reset() {
         let home = temp_home("preset-removed");
@@ -484,6 +560,7 @@ mod tests {
         assert!(matches!(&reset, Ok(r) if r.installed.contains(&"yach.hashline")));
     }
 
+    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
     #[test]
     fn ephemeral_roots_materialize_included_without_touching_the_store() {
         let home = temp_home("ephemeral-full");
@@ -593,6 +670,7 @@ mod tests {
 
         let report = ensure_first_run(&home, &config, &store_path);
         assert!(report.is_err(), "store save failure propagates");
+        #[cfg(any(feature = "bundled-hashline", feature = "bundled-jev"))]
         assert!(
             home.join(".yach/bundled").is_dir(),
             "reconciliation ran; only the store save failed"
@@ -634,6 +712,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
     #[test]
     fn explicit_preset_use_reenables_existing_records() {
         let home = temp_home("preset-round-trip");
@@ -663,5 +742,68 @@ mod tests {
         };
         assert_eq!(store.records.len(), 2);
         assert!(store.records.iter().all(|r| r.enabled));
+    }
+
+    #[cfg(not(feature = "bundled-hashline"))]
+    #[test]
+    fn full_preset_reports_hashline_not_compiled_in() {
+        let home = temp_home("not-compiled");
+        let config = UserConfigStore::in_home(&home);
+        let store_path = home.join(".yach/extensions.json");
+
+        let report = apply_preset(&home, &config, &store_path, Preset::Full, false, false);
+        assert!(
+            matches!(&report, Ok(r) if r.not_compiled_in.contains(&"yach.hashline")),
+            "the omitted bundled extension is reported, not installed"
+        );
+        let Ok(store) = ExtensionInstallStore::load_from_path(&store_path) else {
+            unreachable!()
+        };
+        assert!(
+            store.records.iter().all(|r| r.source != "yach.hashline"),
+            "a core build never creates a record for an omitted package"
+        );
+        let Ok(snapshot) = config.load() else {
+            unreachable!()
+        };
+        assert_eq!(
+            snapshot.preset_applied,
+            Some(Preset::Full),
+            "preset marker recorded"
+        );
+    }
+
+    #[cfg(not(feature = "bundled-hashline"))]
+    #[test]
+    fn full_preset_enables_existing_hashline_record_when_not_compiled_in() {
+        let home = temp_home("not-compiled-existing");
+        let config = UserConfigStore::in_home(&home);
+        let store_path = home.join(".yach/extensions.json");
+        // A record left behind by a full build: enabled preference is false,
+        // and the record survives even though this build omits the package.
+        let package_root = home.join(".yach/bundled/yach-hashline/0.0.1");
+        assert!(std::fs::create_dir_all(&package_root).is_ok());
+        let mut store = ExtensionInstallStore::default();
+        assert!(
+            store
+                .install_bundled("yach.hashline", &package_root, ExtensionInstallScope::User)
+                .is_ok()
+        );
+        assert!(store.set_enabled("yach.hashline", false).is_ok());
+        assert!(store.save_to_path(&store_path).is_ok());
+
+        let report = apply_preset(&home, &config, &store_path, Preset::Full, false, false);
+        assert!(
+            matches!(&report, Ok(r) if r.not_compiled_in.contains(&"yach.hashline")),
+            "the omitted bundled extension is reported, not installed"
+        );
+        let Ok(store) = ExtensionInstallStore::load_from_path(&store_path) else {
+            unreachable!()
+        };
+        let hashline = store.records.iter().find(|r| r.source == "yach.hashline");
+        assert!(
+            hashline.is_some_and(|r| r.enabled),
+            "an explicit apply records the enabled preference for a later full build"
+        );
     }
 }

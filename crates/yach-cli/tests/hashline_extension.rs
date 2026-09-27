@@ -1,18 +1,23 @@
+#[cfg(feature = "bundled-hashline")]
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(not(feature = "bundled-hashline"), feature = "bundled-jev"))]
 use std::process::Command;
+#[cfg(feature = "bundled-hashline")]
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "bundled-hashline")]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "bundled-hashline")]
 use yach_backend::{
-    ExtensionActivationState, ExtensionBackgroundActivationConfig, ExtensionInstallScope,
-    ExtensionManifestIndex, ExtensionPackageRoot, ExtensionResourceBroker,
+    ExtensionActivationState, ExtensionBackgroundActivationConfig, ExtensionResourceBroker,
     ExtensionResourceRequest, ExtensionResourceResult, ExtensionToolExecution,
     ExtensionToolResultStatus, PendingToolRequest, ToolPermissionPolicy, ToolPermissionState,
     ToolValidation, TurnId, activate_background_metadata_extensions,
 };
-
+use yach_backend::{ExtensionInstallScope, ExtensionManifestIndex, ExtensionPackageRoot};
 trait TestUnwrap {
     type Output;
 
@@ -68,10 +73,12 @@ impl Drop for TempPackage {
     }
 }
 
+#[cfg(feature = "bundled-hashline")]
 struct FixtureResources {
     files: Mutex<BTreeMap<String, String>>,
 }
 
+#[cfg(feature = "bundled-hashline")]
 impl FixtureResources {
     fn new(path: &str, text: &str) -> Self {
         Self {
@@ -86,6 +93,7 @@ impl FixtureResources {
     }
 }
 
+#[cfg(feature = "bundled-hashline")]
 impl ExtensionResourceBroker for FixtureResources {
     fn execute(&self, request: &ExtensionResourceRequest) -> ExtensionResourceResult {
         let ExtensionResourceRequest::ReadTextFile { path, .. } = request;
@@ -111,8 +119,10 @@ impl ExtensionResourceBroker for FixtureResources {
     }
 }
 
+#[cfg(feature = "bundled-hashline")]
 struct SensitiveDeniedResources;
 
+#[cfg(feature = "bundled-hashline")]
 impl ExtensionResourceBroker for SensitiveDeniedResources {
     fn execute(&self, _request: &ExtensionResourceRequest) -> ExtensionResourceResult {
         ExtensionResourceResult::Failed {
@@ -122,6 +132,7 @@ impl ExtensionResourceBroker for SensitiveDeniedResources {
     }
 }
 
+#[cfg(feature = "bundled-hashline")]
 fn request(id: &str, name: &str, arguments: serde_json::Value) -> PendingToolRequest {
     PendingToolRequest {
         request_id: id.to_owned(),
@@ -132,6 +143,7 @@ fn request(id: &str, name: &str, arguments: serde_json::Value) -> PendingToolReq
     }
 }
 
+#[cfg(feature = "bundled-hashline")]
 fn allowed(request: &PendingToolRequest) -> ToolValidation {
     ToolValidation {
         request_id: request.request_id.clone(),
@@ -140,6 +152,7 @@ fn allowed(request: &PendingToolRequest) -> ToolValidation {
     }
 }
 
+#[cfg(feature = "bundled-hashline")]
 #[test]
 fn first_party_hashline_package_activates_advertises_and_proposes_reviewed_edits() {
     let package = TempPackage::new().test_unwrap();
@@ -350,6 +363,118 @@ fn first_party_hashline_package_activates_advertises_and_proposes_reviewed_edits
     assert_eq!(stale_result.summary, "[hashline error: snapshot is stale]");
 }
 
+#[cfg(not(feature = "bundled-hashline"))]
+#[test]
+fn core_build_reports_hashline_not_compiled_in() {
+    let stores = TempPackage::new().test_unwrap();
+    let home = stores.root.join("home");
+    fs::create_dir_all(&home).test_unwrap();
+
+    let preset = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["preset", "use", "full"])
+        .env("HOME", &home)
+        .output()
+        .test_unwrap();
+    assert!(preset.status.success());
+    let preset_stdout = String::from_utf8(preset.stdout).test_unwrap();
+    let not_compiled = preset_stdout
+        .lines()
+        .find(|line| line.starts_with("not_compiled_in="))
+        .test_unwrap();
+    assert!(
+        not_compiled.contains("yach.hashline"),
+        "preset use full must report the omitted bundled id: {preset_stdout}"
+    );
+
+    let list = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["component", "list"])
+        .env("HOME", &home)
+        .output()
+        .test_unwrap();
+    assert!(list.status.success());
+    let list_stdout = String::from_utf8(list.stdout).test_unwrap();
+    let hashline = list_stdout
+        .lines()
+        .find(|line| line.contains("name=hashline"))
+        .test_unwrap();
+    assert!(
+        hashline.contains("compiled_in=false"),
+        "component list reports hashline as not compiled in: {list_stdout}"
+    );
+
+    // No record exists yet in a core build: enable must not claim a
+    // recorded preference it cannot honor later.
+    let enable = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["component", "enable", "hashline"])
+        .env("HOME", &home)
+        .output()
+        .test_unwrap();
+    assert!(enable.status.success());
+    let enable_stdout = String::from_utf8(enable.stdout).test_unwrap();
+    assert!(
+        enable_stdout.contains("no install record")
+            && !enable_stdout.contains("preference recorded"),
+        "record-less enable reports how to install, not a recorded preference: {enable_stdout}"
+    );
+
+    // A stale Bundled record left by a full build must surface in the
+    // extension diagnostics as not compiled in, never as a load failure.
+    let package_root = home.join(".yach/bundled/yach-hashline/0.0.1");
+    fs::create_dir_all(&package_root).test_unwrap();
+    let user_store = home.join(".yach/extensions.json");
+    let mut store = yach_backend::ExtensionInstallStore::default();
+    store
+        .install_bundled("yach.hashline", &package_root, ExtensionInstallScope::User)
+        .test_unwrap();
+    store.save_to_path(&user_store).test_unwrap();
+
+    // With a record, the choice is stored and a later full build honors it.
+    let disable = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["component", "disable", "hashline"])
+        .env("HOME", &home)
+        .env("YACH_EXTENSION_USER_STORE", &user_store)
+        .output()
+        .test_unwrap();
+    assert!(disable.status.success());
+    let disable_stdout = String::from_utf8(disable.stdout).test_unwrap();
+    assert!(
+        disable_stdout.contains("preference recorded"),
+        "an existing record stores the choice: {disable_stdout}"
+    );
+    let stored = yach_backend::ExtensionInstallStore::load_from_path(&user_store).test_unwrap();
+    assert!(
+        stored
+            .records
+            .iter()
+            .any(|record| record.source == "yach.hashline" && !record.enabled),
+        "disable persisted on the existing record"
+    );
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["extension", "doctor", "yach.hashline"])
+        .env("HOME", &home)
+        .env("YACH_EXTENSION_USER_STORE", &user_store)
+        .output()
+        .test_unwrap();
+    assert!(doctor.status.success());
+    let doctor_stdout = String::from_utf8(doctor.stdout).test_unwrap();
+    assert!(
+        doctor_stdout.contains("last_error_kind=not_compiled_in"),
+        "doctor must report the stale bundled record as not compiled in: {doctor_stdout}"
+    );
+
+    let extension_list = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["extension", "list"])
+        .env("HOME", &home)
+        .env("YACH_EXTENSION_USER_STORE", &user_store)
+        .output()
+        .test_unwrap();
+    assert!(
+        extension_list.status.success(),
+        "extension list stays a normal success in a core build"
+    );
+}
+
 #[test]
 fn first_party_manifest_is_loadable_from_its_package_root() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../yach-hashline-extension");
@@ -367,6 +492,7 @@ fn first_party_manifest_is_loadable_from_its_package_root() {
         1
     );
 }
+#[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
 #[test]
 fn bundled_hashline_package_lists_disables_and_reenables_through_cli() {
     let stores = TempPackage::new().test_unwrap();

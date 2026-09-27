@@ -67,18 +67,34 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("__extension-host")
         && args.get(1).map(String::as_str) == Some("hashline")
     {
-        return match yach_hashline_extension::run_stdio() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::from(1),
-        };
+        #[cfg(feature = "bundled-hashline")]
+        {
+            return match yach_hashline_extension::run_stdio() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(_) => ExitCode::from(1),
+            };
+        }
+        #[cfg(not(feature = "bundled-hashline"))]
+        {
+            let _ = writeln!(io::stderr(), "error=bundled extension not compiled in");
+            return ExitCode::from(1);
+        }
     }
     if args.first().map(String::as_str) == Some("__extension-host")
         && args.get(1).map(String::as_str) == Some("jev")
     {
-        return match yach_jev_reviewer::run_stdio() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::from(1),
-        };
+        #[cfg(feature = "bundled-jev")]
+        {
+            return match yach_jev_reviewer::run_stdio() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(_) => ExitCode::from(1),
+            };
+        }
+        #[cfg(not(feature = "bundled-jev"))]
+        {
+            let _ = writeln!(io::stderr(), "error=bundled extension not compiled in");
+            return ExitCode::from(1);
+        }
     }
     let cli = CliArgs::from_args(args.into_iter());
     if let Some(trace) = trace.as_ref() {
@@ -4340,6 +4356,7 @@ fn extension_package_roots_from_env_and_install_records(
         records
             .iter()
             .filter(|record| !record.enabled && record.kind == ExtensionInstallRefKind::Bundled)
+            .filter(|record| bundled::is_compiled_in(&record.source))
             .map(|record| ExtensionPackageRoot {
                 root: record.package_root.clone(),
                 scope: record.scope,
@@ -4369,6 +4386,10 @@ fn extension_package_roots_from_install_records(
                 record.kind,
                 ExtensionInstallRefKind::LocalPath | ExtensionInstallRefKind::Bundled
             )
+        })
+        .filter(|record| {
+            record.kind != ExtensionInstallRefKind::Bundled
+                || bundled::is_compiled_in(&record.source)
         })
         .map(|record| ExtensionPackageRoot {
             root: record.package_root.clone(),
@@ -4590,7 +4611,6 @@ fn component_list_lines(
         .map(|component| {
             let (source, state, compiled_in) = match component.bundled_extension_id() {
                 Some(id) => {
-                    let package = bundled::BUNDLED.iter().find(|package| package.source == id);
                     let state = if snapshot.bundled_removed.contains(id) {
                         "removed"
                     } else {
@@ -4600,8 +4620,7 @@ fn component_list_lines(
                             None => "not-installed",
                         }
                     };
-                    let compiled_in =
-                        package.is_some_and(|package| (package.manifest_json)().is_some());
+                    let compiled_in = bundled::is_compiled_in(id);
                     ("bundled-extension", state, compiled_in)
                 }
                 None if *component == Component::SkillIndex => ("kernel", "reserved", true),
@@ -4638,12 +4657,13 @@ fn run_component_set_enabled_command(component: Component, enabled: bool) -> Com
         } else {
             ExtensionManagementAction::Disable
         };
-        let record_state = extension_store_path(ExtensionInstallScope::User).and_then(|path| {
+        let store_path_result = extension_store_path(ExtensionInstallScope::User);
+        let store_result = store_path_result.and_then(|path| {
             ExtensionInstallStore::load_from_path(&path)
-                .map(|store| store.records.iter().any(|record| record.source == id))
+                .map(|store| (path, store))
                 .map_err(|error| extension_install_io_error(&error))
         });
-        match record_state {
+        let (path, mut store) = match store_result {
             // A load/resolve failure is reported, not silently treated as
             // "not installed".
             Err(error) => {
@@ -4653,17 +4673,47 @@ fn run_component_set_enabled_command(component: Component, enabled: bool) -> Com
                     Err(error),
                 );
             }
+            Ok(loaded) => loaded,
+        };
+        if !bundled::is_compiled_in(id) {
+            // A bundled component this build omits. An existing record keeps
+            // the choice for a later full build; without one nothing is
+            // installed, so say how to get it rather than claim a preference.
+            let result = (|| {
+                if store.records.iter().any(|record| record.source == id) {
+                    store
+                        .set_enabled(id, enabled)
+                        .map_err(|error| extension_install_io_error(&error))?;
+                    store
+                        .save_to_path(&path)
+                        .map_err(|error| extension_install_io_error(&error))?;
+                    return Ok(format!("{id} not compiled in; preference recorded"));
+                }
+                if enabled {
+                    let config = cli_user_config()?;
+                    config
+                        .persist_bundled_removed(id, false)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                }
+                Ok(format!(
+                    "{id} not compiled in; no install record (run `yach extension install --bundled {id}` from a build that includes it)"
+                ))
+            })();
+            return extension_management_result(action, ExtensionInstallScope::User, result);
+        }
+        let has_record = store.records.iter().any(|record| record.source == id);
+        match has_record {
             // `component enable` on a bundled id with no record installs it —
             // same path as `extension install --bundled`.
-            Ok(false) if enabled => return run_extension_install_bundled_command(id),
-            Ok(false) => {
+            false if enabled => return run_extension_install_bundled_command(id),
+            false => {
                 return extension_management_result(
                     action,
                     ExtensionInstallScope::User,
                     Ok(String::from("not installed")),
                 );
             }
-            Ok(true) => {}
+            true => {}
         }
         return run_extension_set_enabled_command(id, ExtensionInstallScope::User, enabled);
     }
@@ -5181,13 +5231,15 @@ fn extension_diagnostic_records_from_installs(
 fn extension_diagnostic_record_from_install(
     install: &ExtensionInstallRecord,
 ) -> ExtensionDiagnosticRecord {
-    ExtensionDiagnosticRecord::from_activation_diagnostic(
-        ExtensionActivationDiagnostic::from_install_record(install),
-        install.enabled,
-        false,
-    )
+    let mut diagnostic = ExtensionActivationDiagnostic::from_install_record(install);
+    if install.kind == ExtensionInstallRefKind::Bundled && !bundled::is_compiled_in(&install.source)
+    {
+        diagnostic.activation_state = ExtensionActivationState::Blocked;
+        diagnostic.last_error_kind = Some(ExtensionActivationErrorKind::NotCompiledIn);
+        diagnostic.last_error_summary = Some(String::from("bundled extension not compiled in"));
+    }
+    ExtensionDiagnosticRecord::from_activation_diagnostic(diagnostic, install.enabled, false)
 }
-
 fn extension_diagnostic_record_matches(
     record: &ExtensionDiagnosticRecord,
     extension_id: Option<&str>,
@@ -5745,7 +5797,6 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
         )
         .await;
         assert!(stale_cancel_prompt_finished.is_empty());
-
         handle.abort();
         let loaded = store.load();
         let _ = std::fs::remove_file(path);
@@ -5768,15 +5819,17 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "bundled-hashline"))]
+    use super::extension_diagnostic_record_from_install;
     use super::{
         CliArgs, Command, CommandResult, ExtensionDiagnosticRecord, ExtensionDiagnosticsCommand,
         ExtensionDiagnosticsOutcome, ExtensionManagementAction, ExtensionManagementOutcome,
         NativeTuiBackendSetup, RigSmokeConfigError, RigSmokeOutcome, RunnerConfigInput,
-        TuiBackendSelection, dialog_smoke_requests, extension_store_path, native_backend_handshake,
-        print_capabilities, provider_setup_error_message, run_extension_install_command,
-        run_extension_list_command, run_extension_remove_command,
-        run_extension_set_enabled_command, runner_config, tui_session_path_from_latest,
-        tui_theme_path, unconfigured_launch_setup_error,
+        TuiBackendSelection, dialog_smoke_requests, extension_package_roots_from_install_records,
+        extension_store_path, native_backend_handshake, print_capabilities,
+        provider_setup_error_message, run_extension_install_command, run_extension_list_command,
+        run_extension_remove_command, run_extension_set_enabled_command, runner_config,
+        tui_session_path_from_latest, tui_theme_path, unconfigured_launch_setup_error,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Read, Write};
@@ -8258,5 +8311,60 @@ mod tests {
 
         assert!(super::write_lines(&mut output, &lines).is_ok());
         assert_eq!(output, b"alpha\nbeta\n");
+    }
+
+    fn bundled_install_record(source: &str) -> super::ExtensionInstallRecord {
+        super::ExtensionInstallRecord {
+            source: String::from(source),
+            kind: super::ExtensionInstallRefKind::Bundled,
+            scope: ExtensionInstallScope::User,
+            enabled: true,
+            package_root: PathBuf::from("/tmp/yach-bundled-stale"),
+        }
+    }
+
+    #[cfg(feature = "bundled-hashline")]
+    #[test]
+    fn bundled_record_is_discovered_when_compiled_in() {
+        let records = vec![bundled_install_record("yach.hashline")];
+
+        let roots = extension_package_roots_from_install_records(&records);
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0].source_ref.as_deref(),
+            Some("yach.hashline"),
+            "a compiled-in bundled record contributes its package root"
+        );
+    }
+
+    #[cfg(not(feature = "bundled-hashline"))]
+    #[test]
+    fn bundled_record_is_excluded_and_reported_not_compiled_in() {
+        let records = vec![bundled_install_record("yach.hashline")];
+
+        let roots = extension_package_roots_from_install_records(&records);
+        assert!(
+            roots.is_empty(),
+            "a stale bundled record never loads in a core build"
+        );
+
+        let diagnostic = extension_diagnostic_record_from_install(&records[0]);
+        assert_eq!(
+            diagnostic.activation_state,
+            ExtensionActivationState::Blocked
+        );
+        assert_eq!(
+            diagnostic.last_error_kind,
+            Some(yach_backend::ExtensionActivationErrorKind::NotCompiledIn)
+        );
+        assert_eq!(
+            diagnostic.last_error_summary.as_deref(),
+            Some("bundled extension not compiled in")
+        );
+        assert!(
+            diagnostic.install_enabled,
+            "the recorded preference survives"
+        );
     }
 }
