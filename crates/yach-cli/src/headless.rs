@@ -357,6 +357,7 @@ pub(crate) fn run_headless_command(
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let negotiated = headless_negotiated_capabilities(provider_connections.is_some());
         let config = RunnerConfig {
+            components: yach_backend::ComponentSet::full(),
             session_path: session_path.clone(),
             project_root: project_root.clone(),
             provider,

@@ -2415,6 +2415,7 @@ async fn run_responses_compaction_runner_smoke(
         client_rx,
         backend_tx,
         RunnerConfig {
+            components: yach_backend::ComponentSet::full(),
             session_path: session_path.clone(),
             project_root: Some(workspace.root.clone()),
             provider: Some(ProviderConfig {
@@ -4100,6 +4101,7 @@ fn runner_config(input: RunnerConfigInput<'_>) -> RunnerConfig {
         provider_connections,
     } = input;
     RunnerConfig {
+        components: yach_backend::ComponentSet::full(),
         session_path,
         project_root,
         provider,
@@ -5080,6 +5082,7 @@ fn loop_resumes_existing_session_without_duplicate_turn_ids() {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: yach_backend::ComponentSet::full(),
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
@@ -5188,6 +5191,7 @@ fn loop_emits_existing_session_messages_after_explicit_path_selection() {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: yach_backend::ComponentSet::full(),
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
@@ -5270,6 +5274,7 @@ fn loop_provider_cancel_persists_user_entry() {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: yach_backend::ComponentSet::full(),
                 session_path: path.clone(),
                 project_root: None,
                 provider: Some(ProviderConfig {
@@ -5379,6 +5384,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: yach_backend::ComponentSet::full(),
                 session_path: path.clone(),
                 project_root: None,
                 provider: Some(ProviderConfig {
@@ -6346,6 +6352,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 RunnerConfig {
+                    components: yach_backend::ComponentSet::full(),
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
@@ -6488,6 +6495,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 RunnerConfig {
+                    components: yach_backend::ComponentSet::full(),
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,

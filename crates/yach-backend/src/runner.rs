@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 type ToolContextKey = (TurnId, String);
 type ToolContext = (String, Option<String>, String);
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -42,25 +43,26 @@ use crate::rig_adapter::{
     run_provider_request_attempt_with_approved_tools, run_provider_request_with_approved_tools,
 };
 use crate::{
-    DurationMetric, EditAccess, EditPolicy, EditPreviewId, EditTraceId, EditTraceOutcome,
-    EditTracePhase, EditTraceRecord, EditTraceSource, EntryId, ExtensionResourceBroker,
-    ExtensionResourceRequest, ExtensionResourceResult, ExtensionStaticContextFile,
-    ExtensionToolExecution, JsonlSessionStore, MetricAttribute, PendingToolRequest,
-    PermissionActor, PermissionCapability, PermissionDecision, PermissionDecisionEngine,
-    PermissionDecisionId, PermissionDecisionOutcome, PermissionDecisionSummary, PermissionMode,
-    PermissionPolicy, PermissionRequest, PermissionReviewer, PermissionRisk,
-    PermissionTargetSummary, ProjectReadOnlyToolExecutor, ProviderContinuationMappingError,
-    ProviderContinuationRequest, ProviderContinuationValidationPolicy, ProviderError,
-    ProviderErrorKind, ProviderFinishReason, ProviderMessage, ProviderMetadata, ProviderModel,
-    ProviderRequest, ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall,
-    ProviderToolResult, ProviderToolResultBlock, ProviderUsage, ResolvedToolCatalog,
-    ResourceReadError, ResourceReadPolicy, ResourceRoot, Role, SessionEvent, SessionEventSink,
-    SessionId, SessionLog, StaticContextBundle, StaticContextItem, StaticContextPlacement,
-    StaticContextPolicy, ToolContinuationError, ToolExecutionResult, ToolExecutor, ToolOutcome,
-    ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState, ToolRegistry, ToolRequestId,
-    ToolRisk, TurnId, TurnOutcome, assemble_project_static_context_with_extensions,
-    build_provider_continuation_submission, build_provider_tool_advertising_extension,
-    pending_tool_request_from_provider_call, record_native_tool_validation_with_resolved_catalog,
+    ComponentSet, DurationMetric, EditAccess, EditPolicy, EditPreviewId, EditTraceId,
+    EditTraceOutcome, EditTracePhase, EditTraceRecord, EditTraceSource, EntryId,
+    ExtensionResourceBroker, ExtensionResourceRequest, ExtensionResourceResult,
+    ExtensionStaticContextFile, ExtensionToolExecution, JsonlSessionStore, MetricAttribute,
+    PendingToolRequest, PermissionActor, PermissionCapability, PermissionDecision,
+    PermissionDecisionEngine, PermissionDecisionId, PermissionDecisionOutcome,
+    PermissionDecisionSummary, PermissionMode, PermissionPolicy, PermissionRequest,
+    PermissionReviewer, PermissionRisk, PermissionTargetSummary, ProjectReadOnlyToolExecutor,
+    ProviderContinuationMappingError, ProviderContinuationRequest,
+    ProviderContinuationValidationPolicy, ProviderError, ProviderErrorKind, ProviderFinishReason,
+    ProviderMessage, ProviderMetadata, ProviderModel, ProviderRequest, ProviderStreamEvent,
+    ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResult, ProviderToolResultBlock,
+    ProviderUsage, ResolvedToolCatalog, ResourceReadError, ResourceReadPolicy, ResourceRoot, Role,
+    SessionEvent, SessionEventSink, SessionId, SessionLog, StaticContextBundle, StaticContextItem,
+    StaticContextPlacement, StaticContextPolicy, ToolContinuationError, ToolExecutionResult,
+    ToolExecutor, ToolOutcome, ToolPayloadSummary, ToolPermissionPolicy, ToolPermissionState,
+    ToolRegistry, ToolRequestId, ToolRisk, TurnId, TurnOutcome,
+    assemble_project_static_context_with_extensions, build_provider_continuation_submission,
+    build_provider_tool_advertising_extension, pending_tool_request_from_provider_call,
+    record_native_tool_validation_with_resolved_catalog,
 };
 #[cfg(test)]
 use crate::{ToolContinuationContext, ToolContinuationPolicy, ToolContinuationWorkflow};
@@ -118,6 +120,7 @@ pub type ModelDiscoveryFuture =
 /// `RunnerConfig` (it's always moved by value into `run_native_loop`).
 pub struct RunnerConfig {
     pub session_path: PathBuf,
+    pub components: ComponentSet,
     pub project_root: Option<PathBuf>,
     pub provider: Option<ProviderConfig>,
     /// Explicit invocation target. It is durably appended before first-render
@@ -151,6 +154,7 @@ impl std::fmt::Debug for RunnerConfig {
         formatter
             .debug_struct("RunnerConfig")
             .field("session_path", &self.session_path)
+            .field("components", &self.components)
             .field("project_root", &self.project_root)
             .field("provider", &self.provider)
             .field("startup_model_override", &self.startup_model_override)
@@ -820,6 +824,8 @@ impl LiveSessionModes {
 #[derive(Clone)]
 struct ProviderPromptProjectRuntime {
     project_context: Option<LaunchProjectContext>,
+    components: ComponentSet,
+    inactive_bundle_notices: Arc<Mutex<HashSet<(String, String)>>>,
     extension_manifest_scan_state: ExtensionManifestScanState,
     extension_activation_state: ExtensionActivationSnapshotState,
     session_mode_state: Arc<LiveSessionModes>,
@@ -972,6 +978,7 @@ pub async fn run_native_loop(
     config: RunnerConfig,
 ) {
     let trace = config.trace.clone();
+    let components = config.components;
     run_native_loop_with_requester_factory(
         rx,
         tx,
@@ -982,7 +989,7 @@ pub async fn run_native_loop(
         native_ready_handshake(false),
         |provider| RigProviderRequester {
             adapter: provider.adapter.clone(),
-            approved_tools: provider_approved_tools(),
+            approved_tools: provider_approved_tools(components),
             prompt_attempt_reset: false,
             trace: trace.clone(),
         },
@@ -1003,6 +1010,7 @@ pub async fn run_native_loop_with_negotiated_capabilities(
     let prompt_attempt_reset = negotiated.supports(Capability::PromptAttemptReset);
     let ready_handshake = negotiated.ready_handshake();
     let trace = config.trace.clone();
+    let components = config.components;
     run_native_loop_with_requester_factory(
         rx,
         tx,
@@ -1013,7 +1021,7 @@ pub async fn run_native_loop_with_negotiated_capabilities(
         ready_handshake,
         |provider| RigProviderRequester {
             adapter: provider.adapter.clone(),
-            approved_tools: provider_approved_tools(),
+            approved_tools: provider_approved_tools(components),
             prompt_attempt_reset,
             trace: trace.clone(),
         },
@@ -1116,6 +1124,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     Requester: ProviderRequester + Send + 'static,
 {
     let RunnerConfig {
+        components,
         mut session_path,
         project_root,
         mut provider,
@@ -1285,7 +1294,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut extension_manifest_scan_scheduled = false;
     let extension_manifest_scan_state = Arc::new(AsyncMutex::new(None));
     let extension_activation_state = Arc::new(AsyncMutex::new(
-        crate::ExtensionActivationSnapshot::default(),
+        crate::ExtensionActivationSnapshot::for_components(components),
     ));
     let review_policy = Arc::new(Mutex::new(
         project_root
@@ -1298,6 +1307,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
             .unwrap_or_else(crate::ReviewPolicy::empty),
     ));
     let authorization_revision = Arc::new(Mutex::new(0_u64));
+    let inactive_bundle_notices = Arc::new(Mutex::new(HashSet::new()));
     let (discovery_update_tx, mut discovery_update_rx) = mpsc::unbounded_channel();
     let mut connection_flow = ProviderConnectionFlow::new(provider.as_ref().map(|provider| {
         crate::ActiveModelTarget {
@@ -1718,6 +1728,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     extension_package_roots,
                     extension_manifest_scan_state.clone(),
                     extension_activation_state.clone(),
+                    components,
                     trace.clone(),
                     &mut extension_manifest_scan_scheduled,
                 );
@@ -2093,6 +2104,8 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                             native_replay: native_replay.clone(),
                             started_prompt,
                             project_runtime: ProviderPromptProjectRuntime {
+                                components,
+                                inactive_bundle_notices: inactive_bundle_notices.clone(),
                                 project_context: provider_project_context.clone(),
                                 extension_manifest_scan_state: extension_manifest_scan_state
                                     .clone(),
@@ -4093,19 +4106,13 @@ impl ProviderRequester for RigProviderRequester {
     }
 }
 
-fn provider_approved_tools() -> Vec<String> {
-    [
-        "project_path_info",
-        "read_text_file",
-        "search_project",
-        "list_project_paths",
-        "edit_text_file",
-        "create_text_file",
-        "bash",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
+fn provider_approved_tools(components: ComponentSet) -> Vec<String> {
+    crate::tools::project_tool_names(components)
+        .iter()
+        .copied()
+        .chain(std::iter::once("bash"))
+        .map(String::from)
+        .collect()
 }
 
 #[expect(
@@ -4755,6 +4762,8 @@ impl SessionEventSink for ProviderBufferedEventSink<'_> {
 }
 
 struct ProviderAgentToolRound<'a> {
+    components: ComponentSet,
+    inactive_bundle_notices: Arc<Mutex<HashSet<(String, String)>>>,
     session_id: &'a SessionId,
     native_replay: crate::responses_replay::NativeReplayStore,
     model: ProviderModel,
@@ -4892,7 +4901,7 @@ const MID_TURN_COMPACTIONS_MAX: u32 = 3;
 /// therefore already established for every name reaching this function.
 /// Omitting a risk here would leave a granted tool registered but hidden from
 /// the model and denied on call.
-fn turn_permission_policy(
+pub(crate) fn turn_permission_policy(
     registry: &ToolRegistry,
     active_extension_tool_names: &[&str],
 ) -> ToolPermissionPolicy {
@@ -4940,6 +4949,8 @@ async fn run_native_provider_one_agent_tool_round(
     round: ProviderAgentToolRound<'_>,
 ) -> Result<ProviderRoundResult, ProviderRoundError> {
     let ProviderAgentToolRound {
+        components,
+        inactive_bundle_notices,
         session_id,
         native_replay: native_replay_store,
         model,
@@ -4967,25 +4978,42 @@ async fn run_native_provider_one_agent_tool_round(
     let registry = extension_activation_snapshot.registry.clone();
     let active_extension_tool_names = extension_activation_snapshot.active_tool_names();
     let permission_policy = turn_permission_policy(&registry, &active_extension_tool_names);
-    let mut routable_tool_names = vec![
-        String::from("project_path_info"),
-        String::from("read_text_file"),
-        String::from("search_project"),
-        String::from("list_project_paths"),
-        String::from("edit_text_file"),
-        String::from("create_text_file"),
-        String::from("bash"),
-    ];
+    let mut routable_tool_names: Vec<String> = crate::tools::project_tool_names(components)
+        .iter()
+        .copied()
+        .chain(std::iter::once("bash"))
+        .map(String::from)
+        .collect();
     routable_tool_names.extend(
         active_extension_tool_names
             .iter()
             .map(|name| (*name).to_owned()),
     );
-    let (resolved_catalog, _replacement_bundle_diagnostics) = extension_activation_snapshot
-        .resolve_provider_turn_catalog(
+    let (resolved_catalog, replacement_bundle_diagnostics) = extension_activation_snapshot
+        .resolve_provider_turn_catalog_dropping_failed_bundles(
             &permission_policy,
             routable_tool_names.iter().map(String::as_str),
         );
+    for diagnostic in replacement_bundle_diagnostics {
+        let key = (
+            diagnostic.extension_id.clone(),
+            diagnostic.bundle_id.clone(),
+        );
+        if inactive_bundle_notices
+            .lock()
+            .is_ok_and(|mut seen| seen.insert(key))
+        {
+            let _ = review_tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!(
+                    "tool_replacement_bundle_inactive extension={} bundle={} member={} reason={}",
+                    diagnostic.extension_id,
+                    diagnostic.bundle_id,
+                    diagnostic.member.as_deref().unwrap_or("-"),
+                    diagnostic.summary,
+                ),
+            }));
+        }
+    }
     let advertising_tools = resolved_catalog.provider_definitions();
     let approved_tool_advertising = if advertising_tools.is_empty() {
         None
@@ -9771,6 +9799,8 @@ where
         prompt_started,
     } = started_prompt;
     let ProviderPromptProjectRuntime {
+        components,
+        inactive_bundle_notices,
         project_context,
         extension_manifest_scan_state,
         extension_activation_state,
@@ -9782,6 +9812,8 @@ where
     let project_context = project_context.or_else(|| effective_runner_project_context(None));
 
     handle_native_provider_prompt(ProviderPromptRequest {
+        components,
+        inactive_bundle_notices,
         tx: &tx,
         store: &store,
         _prompt: &prompt,
@@ -9820,6 +9852,8 @@ where
 }
 
 struct ProviderPromptRequest<'a, Requester> {
+    components: ComponentSet,
+    inactive_bundle_notices: Arc<Mutex<HashSet<(String, String)>>>,
     tx: &'a mpsc::UnboundedSender<BackendEvent>,
     store: &'a JsonlSessionStore,
     _prompt: &'a str,
@@ -9847,6 +9881,8 @@ where
     Requester: ProviderRequester,
 {
     let ProviderPromptRequest {
+        components,
+        inactive_bundle_notices,
         tx,
         store,
         _prompt: _,
@@ -9910,6 +9946,8 @@ where
     let result = run_native_provider_one_agent_tool_round(
         requester,
         ProviderAgentToolRound {
+            components,
+            inactive_bundle_notices,
             session_id: &ids.session_id,
             model: ProviderModel {
                 provider: provider_name.to_owned(),
@@ -12745,7 +12783,7 @@ mod tests {
             let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::RunnerConfig { session_path,
+                super::RunnerConfig { components: crate::ComponentSet::full(), session_path,
                 project_root: Some(root.root().to_path_buf()), provider: None, startup_model_override: None, provider_setup_error: None, extension_package_roots: vec![extension_manifest_scan_package_root(&root)],
                 extension_package_root_loader: None,
                 trace: trace.clone(), catalog_refresh: None, model_discovery: None, provider_connections: None },
@@ -12863,6 +12901,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -12997,6 +13036,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -13129,6 +13169,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -13232,6 +13273,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -13291,6 +13333,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -13918,6 +13961,7 @@ mod tests {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: Some(provider),
@@ -14048,6 +14092,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: None,
                     provider: Some(provider),
@@ -14152,6 +14197,7 @@ mod tests {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: Some(provider),
@@ -14274,6 +14320,7 @@ mod tests {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(provider),
@@ -14352,6 +14399,7 @@ mod tests {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(provider),
@@ -14430,6 +14478,7 @@ mod tests {
             restart_rx,
             restart_backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(restarted_provider),
@@ -14569,6 +14618,7 @@ mod tests {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: Some(provider),
@@ -14789,6 +14839,7 @@ mod tests {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(provider),
@@ -14953,6 +15004,7 @@ mod tests {
             restart_rx,
             restart_backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(restart_provider),
@@ -15057,6 +15109,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider),
@@ -15135,6 +15188,7 @@ mod tests {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: Some(provider),
@@ -16264,6 +16318,7 @@ mod tests {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: Some(provider),
@@ -16357,6 +16412,7 @@ mod tests {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: Some(root.root().to_path_buf()),
                 provider: Some(provider),
@@ -18807,6 +18863,147 @@ mod tests {
         ));
     }
 
+    fn run_recording_agent_round_with_components(
+        components: crate::ComponentSet,
+    ) -> Vec<ProviderRequest> {
+        let (mut requester, requests) = RecordingProviderRequester::with_responses([Ok(vec![
+            ProviderStreamEvent::Started {
+                turn_id: TurnId(String::from("turn-1")),
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+            },
+            ProviderStreamEvent::TextDelta {
+                turn_id: TurnId(String::from("turn-1")),
+                delta: String::from("done"),
+            },
+            ProviderStreamEvent::Completed {
+                turn_id: TurnId(String::from("turn-1")),
+                finish_reason: Some(ProviderFinishReason::Stop),
+                usage: None,
+                provider_response_id: Some(String::from("response-1")),
+            },
+        ])]);
+        let root = temp_native_provider_root("component-tool-advertising");
+        let resource_root = ResourceRoot::project(root.path()).test_unwrap();
+        let mut log = SessionLog::default();
+        append_native_provider_test_entry(
+            &mut log,
+            &SessionId(String::from("default")),
+            "turn-1",
+            "entry-1-user",
+            Role::User,
+            "inspect project",
+        );
+        let mut pending_events = Vec::new();
+        let turn_id = TurnId(String::from("turn-1"));
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (_review_tx, review_rx) = mpsc::unbounded_channel();
+        let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
+            &mut requester,
+            ProviderAgentToolRound {
+                components,
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                live_session_modes: None,
+                shell_session_grants: super::ShellSessionGrants::default(),
+                approval_mode: ApprovalMode::Review,
+                cancellation: CancellationToken::new(),
+                structured_review_rows: true,
+                session_id: &SessionId(String::from("default")),
+                native_replay: Arc::new(Mutex::new(
+                    crate::responses_replay::NativeReplayStoreState::default(),
+                )),
+                model: ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                log: &mut log,
+                pending_events: &mut pending_events,
+                turn_id: &turn_id,
+                project_context: Some(LaunchProjectContext::from_project_root(resource_root)),
+                extension_static_context_files: Vec::new(),
+                extension_activation_snapshot: ExtensionActivationSnapshot::for_components(
+                    components,
+                ),
+                tool_event_store: None,
+                review_tx: backend_tx,
+                review_decisions: review_rx,
+                context_window: 200_000,
+                max_output_tokens: 1_000,
+                provider: provider_test_config(),
+                trace: None,
+                review_policy: Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+                authorization_revision: Arc::new(Mutex::new(0)),
+            },
+        ));
+        assert!(result.is_ok(), "{result:?}");
+        requests.lock().test_unwrap().clone()
+    }
+
+    fn advertised_tool_names(request: &ProviderRequest) -> Vec<String> {
+        request
+            .approved_tool_advertising
+            .as_ref()
+            .map_or_else(Vec::new, |advertising| {
+                crate::tools::parse_provider_tool_advertising_extensions(std::slice::from_ref(
+                    advertising,
+                ))
+                .test_unwrap()
+                .test_unwrap()
+                .tools
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect()
+            })
+    }
+
+    #[test]
+    fn minimal_components_advertise_only_bash() {
+        let requests = run_recording_agent_round_with_components(crate::ComponentSet::from_preset(
+            crate::Preset::Minimal,
+        ));
+        assert_eq!(
+            advertised_tool_names(&requests[0]),
+            vec![String::from("bash")]
+        );
+    }
+
+    #[test]
+    fn full_components_advertise_the_seven_builtins() {
+        let requests = run_recording_agent_round_with_components(crate::ComponentSet::full());
+        let mut names = advertised_tool_names(&requests[0]);
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "bash",
+                "create_text_file",
+                "edit_text_file",
+                "list_project_paths",
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn approved_tools_follow_components() {
+        assert_eq!(
+            super::provider_approved_tools(crate::ComponentSet::from_preset(
+                crate::Preset::Minimal
+            )),
+            vec![String::from("bash")],
+        );
+        assert_eq!(
+            super::provider_approved_tools(crate::ComponentSet::full()).len(),
+            7
+        );
+    }
+
     #[test]
     fn provider_initial_request_advertises_content_tools_for_agent_edit_context() {
         let mut requester = FakeProviderRequester::with_responses([Ok(vec![
@@ -18851,6 +19048,8 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -18982,6 +19181,8 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -19126,6 +19327,8 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -19320,6 +19523,8 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -19443,6 +19648,8 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -19624,6 +19831,8 @@ mod tests {
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    components: crate::ComponentSet::full(),
+                    inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                     live_session_modes: None,
                     shell_session_grants: grants_fixture.clone(),
                     approval_mode: yach_proto::ApprovalMode::Review,
@@ -19768,6 +19977,8 @@ mod tests {
             let result = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    components: crate::ComponentSet::full(),
+                    inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                     live_session_modes: None,
                     shell_session_grants: super::ShellSessionGrants::default(),
                     approval_mode: yach_proto::ApprovalMode::Review,
@@ -19972,6 +20183,8 @@ mod tests {
             let run = run_native_provider_one_agent_tool_round(
                 &mut requester,
                 ProviderAgentToolRound {
+                    components: crate::ComponentSet::full(),
+                    inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                     live_session_modes: None,
                     shell_session_grants: grants_fixture.clone(),
                     approval_mode: yach_proto::ApprovalMode::Review,
@@ -20164,6 +20377,8 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -20356,6 +20571,8 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -20423,6 +20640,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -20572,6 +20790,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -20633,7 +20852,7 @@ mod tests {
             let handle = tokio::spawn(super::run_native_loop(
                 client_rx,
                 backend_tx,
-                super::RunnerConfig { session_path: session_path.clone(),
+                super::RunnerConfig { components: crate::ComponentSet::full(), session_path: session_path.clone(),
                 project_root: Some(root.root().to_path_buf()), provider: None, startup_model_override: None, provider_setup_error: Some(setup_error.to_owned()), extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 trace: None,
@@ -20752,6 +20971,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: None,
@@ -20886,6 +21106,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -21093,6 +21314,8 @@ mod tests {
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -21198,6 +21421,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -21320,6 +21544,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -21442,6 +21667,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -21526,6 +21752,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -21634,6 +21861,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -21743,6 +21971,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -21866,6 +22095,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -21964,6 +22194,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -22133,6 +22364,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -22233,7 +22465,7 @@ mod tests {
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
             let focus = "keep the prior context goals";
-            let handle = tokio::spawn(super::run_native_loop_with_requester_factory(client_rx, backend_tx, super::RunnerConfig { session_path: session_path.clone(),
+            let handle = tokio::spawn(super::run_native_loop_with_requester_factory(client_rx, backend_tx, super::RunnerConfig { components: crate::ComponentSet::full(), session_path: session_path.clone(),
             project_root: None, provider: Some(configured_provider), startup_model_override: None, provider_setup_error: None, extension_package_roots: Vec::new(),
             extension_package_root_loader: None,
             trace: None,
@@ -22332,6 +22564,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -22427,6 +22660,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -22505,6 +22739,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -22595,6 +22830,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -22694,6 +22930,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -22794,6 +23031,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -22867,6 +23105,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -22947,6 +23186,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -23028,6 +23268,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -23129,6 +23370,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -23245,7 +23487,7 @@ manual anchored summary"
             let handle = tokio::spawn(super::run_native_loop_with_provider_requester(
                 client_rx,
                 backend_tx,
-                super::RunnerConfig { session_path: session_path.clone(),
+                super::RunnerConfig { components: crate::ComponentSet::full(), session_path: session_path.clone(),
                 project_root: Some(root.root().to_path_buf()), provider: Some(provider_test_config()), startup_model_override: None, provider_setup_error: None, extension_package_roots: Vec::new(),
                 extension_package_root_loader: None,
                 trace: None, catalog_refresh: None, model_discovery: None, provider_connections: None },
@@ -23346,6 +23588,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -23458,6 +23701,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -23585,6 +23829,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_a_path.clone(),
                     project_root: None,
                     provider: None,
@@ -23758,6 +24003,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             super::RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_a_path.clone(),
                 project_root: None,
                 provider: Some(provider_config),
@@ -23971,6 +24217,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -24101,6 +24348,7 @@ manual anchored summary"
                 client_rx,
                 backend_tx,
                 super::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path,
                     project_root: Some(root.root().to_path_buf()),
                     provider: Some(provider_test_config()),
@@ -24195,6 +24443,7 @@ manual anchored summary"
         model_discovery: Option<ModelDiscoveryFuture>,
     ) -> RunnerConfig {
         RunnerConfig {
+            components: crate::ComponentSet::full(),
             session_path,
             project_root: None,
             provider: Some(provider_test_config()),
@@ -24791,6 +25040,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: Some(provider),
@@ -25596,6 +25846,8 @@ manual anchored summary"
         let result = futures::executor::block_on(run_native_provider_one_agent_tool_round(
             &mut requester,
             ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -27029,6 +27281,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: Some(provider_test_config()),
@@ -27127,6 +27380,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: None,
@@ -27230,6 +27484,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: None,
@@ -27306,6 +27561,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: Some(provider),
@@ -27374,6 +27630,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: Some(provider),
@@ -27442,6 +27699,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: None,
@@ -27558,6 +27816,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: None,
@@ -27644,6 +27903,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: Some(provider_test_config()),
@@ -27709,6 +27969,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: None,
@@ -27925,6 +28186,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: root.path().join("session.jsonl"),
                 project_root: None,
                 provider: Some(provider_test_config()),
@@ -28010,6 +28272,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: root.path().join("session.jsonl"),
                 project_root: None,
                 provider: Some(provider_test_config()),
@@ -28151,6 +28414,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: root.path().join("session.jsonl"),
                 project_root: None,
                 provider: Some(provider),
@@ -28318,6 +28582,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: Some(provider_test_config()),
@@ -28467,6 +28732,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: None,
@@ -28575,6 +28841,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: root.path().join("session.jsonl"),
                 project_root: None,
                 provider: None,
@@ -28619,6 +28886,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: session_path.clone(),
                 project_root: None,
                 provider: None,
@@ -28914,6 +29182,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -29067,6 +29337,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -29231,6 +29503,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -30466,6 +30740,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -30666,6 +30942,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -30781,6 +31059,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -31421,6 +31701,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -31635,6 +31917,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -31853,6 +32137,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -32041,6 +32327,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -32247,6 +32535,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -32378,6 +32668,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -32502,6 +32794,8 @@ manual anchored summary"
         let result = super::run_native_provider_one_agent_tool_round(
             &mut requester,
             super::ProviderAgentToolRound {
+                components: crate::ComponentSet::full(),
+                inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 live_session_modes: None,
                 shell_session_grants: super::ShellSessionGrants::default(),
                 approval_mode: yach_proto::ApprovalMode::Review,
@@ -32995,6 +33289,7 @@ manual anchored summary"
             client_rx,
             backend_tx,
             super::RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path,
                 project_root: None,
                 provider: Some(provider),
@@ -33142,6 +33437,8 @@ manual anchored summary"
         let (_decision_tx, decision_rx) = mpsc::unbounded_channel();
 
         super::handle_native_provider_prompt(super::ProviderPromptRequest {
+            components: crate::ComponentSet::full(),
+            inactive_bundle_notices: Arc::new(Mutex::new(std::collections::HashSet::new())),
             tx: &backend_tx,
             store: &store,
             _prompt: "answer without tools",
