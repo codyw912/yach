@@ -1983,6 +1983,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     &session_log,
                     &compaction_turn,
                     &manual_static_context,
+                    components,
                 );
                 let native_request = assemble_native_replay_request(
                     &native_replay,
@@ -3912,6 +3913,8 @@ pub(crate) fn provider_messages_from_event_slice(
 /// over-apply project instructions to conversational prompts (reading
 /// orientation docs before answering "hello"). See
 /// docs/project/records/2026-07-20-baseline-prompt-cohort-check.md.
+/// Owned by the `baseline-guidance` component; omitted when that component is
+/// disabled.
 const PROVIDER_BASELINE_GUIDANCE: &str = "You are a coding agent running in the yach harness. \
 Files can change outside this conversation at any time: verify current state with \
 a tool call before asserting or acting on remembered file contents. If a tool call \
@@ -3929,8 +3932,12 @@ fn provider_messages_from_log_with_static_context(
     log: &SessionLog,
     current_turn_id: &TurnId,
     context: &StaticContextBundle,
+    components: ComponentSet,
 ) -> Vec<ProviderMessage> {
-    let mut messages = vec![provider_baseline_guidance_message()];
+    let mut messages = Vec::new();
+    if components.baseline_guidance() {
+        messages.push(provider_baseline_guidance_message());
+    }
     messages.extend(provider_messages_from_static_context(context));
     messages.extend(provider_messages_from_log(log, current_turn_id));
     messages
@@ -4564,6 +4571,7 @@ where
             log,
             turn_id,
             &static_context_assembly.bundle,
+            ComponentSet::full(),
         ),
         extensions,
         native_request: None,
@@ -5077,6 +5085,7 @@ async fn run_native_provider_one_agent_tool_round(
         log,
         turn_id,
         &static_context_assembly.bundle,
+        components,
     );
     let prospective_native_request = assemble_native_replay_request(
         &native_replay_store,
@@ -5135,6 +5144,7 @@ async fn run_native_provider_one_agent_tool_round(
                     log,
                     turn_id,
                     &static_context_assembly.bundle,
+                    components,
                 );
                 let refilled = match compacted {
                     CompactionApplication::Native => {
@@ -5145,6 +5155,7 @@ async fn run_native_provider_one_agent_tool_round(
                             log,
                             turn_id,
                             &static_context_assembly.bundle,
+                            components,
                         ),
                     ),
                     CompactionApplication::Masked { reclaimed_tokens } => {
@@ -5305,6 +5316,7 @@ narrow the request or start a fresh session",
                             log,
                             turn_id,
                             &static_context_assembly.bundle,
+                            components,
                         );
                         prior_messages.clone_from(&messages);
                         next_request = ProviderRequest {
@@ -5701,6 +5713,7 @@ answer now, or call tools if more work is needed.",
                     log,
                     turn_id,
                     &static_context_assembly.bundle,
+                    components,
                 );
                 if !mid_turn_text.trim().is_empty() {
                     rebuilt.push(ProviderMessage::text(
@@ -17838,20 +17851,52 @@ mod tests {
         assert_eq!(store.lock().test_unwrap().active().cloned(), Some(state));
     }
 
-    #[test]
-    fn native_replay_static_context_is_included_in_canonical_instructions() {
+    fn single_user_turn_log(text: &str) -> (SessionLog, TurnId) {
         let mut log = SessionLog::default();
         let session_id = SessionId(String::from("session-static-context"));
         let turn_id = TurnId(String::from("turn-static-context"));
         log.push(SessionEvent::EntryAppended {
-            session_id: session_id.clone(),
+            session_id,
             entry_id: EntryId(String::from("entry-user")),
             parent_entry_id: None,
             turn_id: turn_id.clone(),
             role: Role::User,
-            text: String::from("hello"),
+            text: String::from(text),
             provider: None,
         });
+        (log, turn_id)
+    }
+
+    #[test]
+    fn baseline_guidance_is_a_component() {
+        let (log, turn_id) = single_user_turn_log("hello");
+        let with = provider_messages_from_log_with_static_context(
+            &log,
+            &turn_id,
+            &StaticContextBundle::default(),
+            crate::ComponentSet::full(),
+        );
+        assert_eq!(with.len(), 2);
+        assert!(
+            with[0]
+                .content
+                .contains("coding agent running in the yach harness")
+        );
+
+        let without = provider_messages_from_log_with_static_context(
+            &log,
+            &turn_id,
+            &StaticContextBundle::default(),
+            crate::ComponentSet::full().with(crate::Component::BaselineGuidance, false),
+        );
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].role, Role::User);
+        assert_eq!(without[0].content, "hello");
+    }
+
+    #[test]
+    fn native_replay_static_context_is_included_in_canonical_instructions() {
+        let (log, turn_id) = single_user_turn_log("hello");
         let context = StaticContextBundle {
             items: vec![StaticContextItem {
                 source: StaticContextSource::AgentsMd,
@@ -17865,7 +17910,12 @@ mod tests {
             total_bytes: "root rules".len(),
         };
 
-        let messages = provider_messages_from_log_with_static_context(&log, &turn_id, &context);
+        let messages = provider_messages_from_log_with_static_context(
+            &log,
+            &turn_id,
+            &context,
+            crate::ComponentSet::full(),
+        );
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, Role::System);
@@ -17927,7 +17977,12 @@ mod tests {
             total_bytes: "root rulesextension guidance".len(),
         };
 
-        let messages = provider_messages_from_log_with_static_context(&log, &turn_id, &context);
+        let messages = provider_messages_from_log_with_static_context(
+            &log,
+            &turn_id,
+            &context,
+            crate::ComponentSet::full(),
+        );
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, Role::System);
@@ -29157,6 +29212,7 @@ manual anchored summary"
             &log,
             &turn_id,
             &StaticContextBundle::default(),
+            crate::ComponentSet::full(),
         );
         let expected_native = crate::responses_replay::NativeReplayState::new(
             crate::responses_replay::NativeReplayTarget {
@@ -29277,6 +29333,7 @@ manual anchored summary"
             &log,
             &turn_id,
             &StaticContextBundle::default(),
+            crate::ComponentSet::full(),
         );
         let replay_start = log.events.len().saturating_sub(1);
         let appended_input = crate::responses_replay::input_items_from_messages(
@@ -29438,6 +29495,7 @@ manual anchored summary"
             &log,
             &turn_id,
             &StaticContextBundle::default(),
+            crate::ComponentSet::full(),
         );
         let replay_start = log.events.len().saturating_sub(1);
         let appended_input = crate::responses_replay::input_items_from_messages(
@@ -32756,8 +32814,12 @@ manual anchored summary"
         let project_context = super::effective_runner_project_context(None);
         let manual_static_context =
             super::effective_static_context(project_context.as_ref(), Vec::new());
-        let manual_messages =
-            provider_messages_from_log_with_static_context(&log, &turn_id, &manual_static_context);
+        let manual_messages = provider_messages_from_log_with_static_context(
+            &log,
+            &turn_id,
+            &manual_static_context,
+            crate::ComponentSet::full(),
+        );
         let replay_state = crate::responses_replay::NativeReplayState {
             target: crate::responses_replay::NativeReplayTarget {
                 session_id: session_id.clone(),
@@ -32841,8 +32903,12 @@ manual anchored summary"
         let mut log = compaction_fixture_log();
         let project_context = super::effective_runner_project_context(None);
         let static_context = super::effective_static_context(project_context.as_ref(), Vec::new());
-        let normal_messages =
-            provider_messages_from_log_with_static_context(&log, &turn_id, &static_context);
+        let normal_messages = provider_messages_from_log_with_static_context(
+            &log,
+            &turn_id,
+            &static_context,
+            crate::ComponentSet::full(),
+        );
         let normal_request = super::assemble_native_replay_request(
             &Arc::new(Mutex::new(
                 crate::responses_replay::NativeReplayStoreState::default(),
