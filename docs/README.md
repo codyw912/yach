@@ -5,6 +5,7 @@
 | `project/roadmap.md` | Product direction: vision, non-goals, milestones, principles. Read-only mirror of decisions made elsewhere. |
 | `protocol/yach-proto-v0.md` | The UI/backend protocol contract (`ClientEvent`/`ServerEvent` over JSONL). |
 | `extensions.md` | Declaring extension tool risk, granting and revoking capabilities, and reading diagnostics. |
+| `presets.md` | Distribution presets and reference components: enabling, disabling, removing, and per-session selection. |
 | `benchmarks/` | Benchmark methodology and dated measurement reports; `yach-bench` writes here. |
 | `project/specs/` | Accepted design documents, one per nontrivial feature. |
 | `project/plans/` | Numbered implementation plans that execute those specs. |

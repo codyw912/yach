@@ -51,6 +51,7 @@ pub(super) fn schedule_extension_manifest_scan(
     package_roots: Vec<crate::ExtensionPackageRoot>,
     scan_state: ExtensionManifestScanState,
     activation_state: ExtensionActivationSnapshotState,
+    components: crate::ComponentSet,
     trace: Option<yach_trace::TraceSink>,
     scan_scheduled: &mut bool,
 ) {
@@ -101,6 +102,7 @@ pub(super) fn schedule_extension_manifest_scan(
                     &tx,
                     activation_records,
                     activation_state,
+                    components,
                     trace.clone(),
                 );
             }
@@ -138,6 +140,7 @@ fn schedule_extension_background_activation(
     tx: &mpsc::UnboundedSender<BackendEvent>,
     package_records: Vec<crate::ExtensionPackageRecord>,
     activation_state: ExtensionActivationSnapshotState,
+    components: crate::ComponentSet,
     trace: Option<yach_trace::TraceSink>,
 ) {
     mark_extension_scan(trace.as_ref(), "extension_background_activation_scheduled");
@@ -159,12 +162,38 @@ fn schedule_extension_background_activation(
             activate_background_metadata_extensions(
                 &package_records,
                 crate::ExtensionBackgroundActivationConfig::conservative(),
+                components,
                 activation_trace.as_ref(),
             )
         })
         .await;
 
         if let Ok(snapshot) = activation {
+            // Only replacement bundles can be inactive; skip resolving the
+            // catalog (a full clone of every tool definition) when none exist.
+            if !snapshot.replacement_bundles.is_empty() {
+                let active_tool_names = snapshot.active_tool_names();
+                let policy = super::turn_permission_policy(&snapshot.registry, &active_tool_names);
+                let executable_tools = crate::tools::project_tool_names(components)
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once("bash"))
+                    .chain(active_tool_names.iter().copied());
+                let (_, diagnostics) = snapshot
+                    .resolve_provider_turn_catalog_dropping_failed_bundles(
+                        &policy,
+                        executable_tools,
+                    );
+                for diagnostic in diagnostics {
+                    let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                        message: format!(
+                            "tool_replacement_bundle_inactive extension={} bundle={} member={} reason={}",
+                            diagnostic.extension_id, diagnostic.bundle_id,
+                            diagnostic.member.as_deref().unwrap_or("-"), diagnostic.summary,
+                        ),
+                    }));
+                }
+            }
             mark_extension_scan(trace.as_ref(), "extension_background_activation_finished");
             let active_extension_count = snapshot
                 .diagnostics

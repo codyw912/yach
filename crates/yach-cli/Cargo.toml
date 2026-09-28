@@ -7,8 +7,10 @@ license = "MIT"
 repository = "https://github.com/codyw912/yach"
 
 [features]
-default = []
+default = ["bundled-hashline", "bundled-jev"]
 bench = ["yach-backend/bench"]
+bundled-hashline = ["dep:yach-hashline-extension"]
+bundled-jev = ["dep:yach-jev-reviewer"]
 
 [dependencies]
 futures = "0.3"
@@ -20,8 +22,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 yach-connections = { version = "0.1.0", path = "../yach-connections" }
 yach-backend = { version = "0.1.0", path = "../yach-backend" }
 yach-catalog = { version = "0.1.0", path = "../yach-catalog" }
-yach-hashline-extension = { version = "0.1.0", path = "../yach-hashline-extension" }
-yach-jev-reviewer = { version = "0.1.0", path = "../yach-jev-reviewer" }
+yach-hashline-extension = { version = "0.1.0", path = "../yach-hashline-extension", optional = true }
+yach-jev-reviewer = { version = "0.1.0", path = "../yach-jev-reviewer", optional = true }
 yach-proto = { version = "0.1.0", path = "../yach-proto" }
 yach-ui = { version = "0.1.0", path = "../yach-ui" }
 yach-trace = { version = "0.1.0", path = "../yach-trace" }

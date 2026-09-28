@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -8,6 +9,8 @@ use serde::Deserialize;
 use toml_edit::{DocumentMut, Item, Table, value};
 use yach_connections::ConnectionKey;
 use yach_proto::ThinkingLevel;
+
+use crate::components::{Component, ComponentSet, Preset};
 
 const CONFIG_NAME: &str = "config.toml";
 const LOCK_NAME: &str = "config.toml.lock";
@@ -23,6 +26,21 @@ pub struct UserModelDefault {
 pub struct UserConfigSnapshot {
     pub thinking_default: Option<ThinkingLevel>,
     pub model_default: Option<UserModelDefault>,
+    pub preset_applied: Option<Preset>,
+    pub component_overrides: BTreeMap<Component, bool>,
+    pub bundled_removed: BTreeSet<String>,
+    pub unknown_components: Vec<String>,
+}
+
+impl UserConfigSnapshot {
+    #[must_use]
+    pub fn kernel_components(&self) -> ComponentSet {
+        self.component_overrides
+            .iter()
+            .fold(ComponentSet::full(), |set, (component, enabled)| {
+                set.with(*component, *enabled)
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +141,76 @@ impl UserConfigStore {
                     default.remove("connection");
                 }
             }
+            Ok(())
+        })
+    }
+
+    pub fn persist_component(
+        &self,
+        component: Component,
+        enabled: bool,
+    ) -> Result<(), UserConfigError> {
+        if !component.is_kernel() {
+            return Err(UserConfigError::Invalid);
+        }
+        self.update(|document| {
+            let components = table_mut(document.as_table_mut(), "components")?;
+            components[component.name()] = value(enabled);
+            Ok(())
+        })
+    }
+
+    /// Writes the preset marker and the kernel component set. When
+    /// `preserve_existing` is true (the implicit first-run apply only), a
+    /// `[components]` key that already exists keeps its value — spec rule 3:
+    /// only components with no prior record take the preset's default.
+    /// `--reset` is always explicit and never preserves.
+    pub fn persist_preset(
+        &self,
+        preset: Preset,
+        reset: bool,
+        preserve_existing: bool,
+    ) -> Result<(), UserConfigError> {
+        let selected = ComponentSet::from_preset(preset);
+        self.update(|document| {
+            table_mut(document.as_table_mut(), "preset")?["applied"] = value(preset.name());
+            let components = table_mut(document.as_table_mut(), "components")?;
+            for component in Component::ALL.into_iter().filter(|c| c.is_kernel()) {
+                if preserve_existing && components.get(component.name()).is_some() {
+                    continue;
+                }
+                components[component.name()] = value(selected.contains(component));
+            }
+            if reset {
+                table_mut(document.as_table_mut(), "bundled")?.remove("removed");
+            }
+            Ok(())
+        })
+    }
+
+    pub fn persist_bundled_removed(&self, id: &str, removed: bool) -> Result<(), UserConfigError> {
+        self.update(|document| {
+            let bundled = table_mut(document.as_table_mut(), "bundled")?;
+            let mut ids: BTreeSet<String> = bundled
+                .get("removed")
+                .and_then(Item::as_array)
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if removed {
+                ids.insert(id.to_owned());
+            } else {
+                ids.remove(id);
+            }
+            let mut array = toml_edit::Array::new();
+            for id in ids {
+                array.push(id);
+            }
+            bundled["removed"] = value(array);
             Ok(())
         })
     }
@@ -254,9 +342,54 @@ fn parse_snapshot(document: &DocumentMut) -> Result<UserConfigSnapshot, UserConf
         }
     };
 
+    let preset_applied = match document.get("preset") {
+        None => None,
+        Some(item) => {
+            let table = item.as_table().ok_or(UserConfigError::Invalid)?;
+            match table.get("applied") {
+                None => None,
+                Some(value) => {
+                    let raw = value.as_str().ok_or(UserConfigError::Invalid)?;
+                    Some(Preset::parse(raw).ok_or(UserConfigError::Invalid)?)
+                }
+            }
+        }
+    };
+
+    let mut component_overrides = BTreeMap::new();
+    let mut unknown_components = Vec::new();
+    if let Some(item) = document.get("components") {
+        let table = item.as_table().ok_or(UserConfigError::Invalid)?;
+        for (key, value) in table {
+            match Component::parse(key).filter(|component| component.is_kernel()) {
+                Some(component) => {
+                    let enabled = value.as_bool().ok_or(UserConfigError::Invalid)?;
+                    component_overrides.insert(component, enabled);
+                }
+                None => unknown_components.push(key.to_owned()),
+            }
+        }
+    }
+
+    let mut bundled_removed = BTreeSet::new();
+    if let Some(item) = document.get("bundled") {
+        let table = item.as_table().ok_or(UserConfigError::Invalid)?;
+        if let Some(removed) = table.get("removed") {
+            let array = removed.as_array().ok_or(UserConfigError::Invalid)?;
+            for value in array {
+                let id = value.as_str().ok_or(UserConfigError::Invalid)?;
+                bundled_removed.insert(id.to_owned());
+            }
+        }
+    }
+
     Ok(UserConfigSnapshot {
         thinking_default,
         model_default,
+        preset_applied,
+        component_overrides,
+        bundled_removed,
+        unknown_components,
     })
 }
 
@@ -423,6 +556,13 @@ mod tests {
         let path = directory.join(CONFIG_NAME);
         (directory, UserConfigStore::at_path(path))
     }
+    fn set_private(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert!(fs::set_permissions(path, fs::Permissions::from_mode(0o600)).is_ok());
+        }
+    }
 
     #[test]
     fn targeted_updates_preserve_unrelated_content() {
@@ -505,5 +645,87 @@ mod tests {
             Some(0o700)
         );
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn preset_tables_parse_and_unknown_components_are_diagnostics() {
+        let (_directory, store) = temp_store("preset-parse");
+        assert!(
+            fs::write(
+                store.path(),
+                "[preset]\napplied = \"minimal\"\n\n[components]\nproject-tools = false\nlaser = true\n\n[bundled]\nremoved = [\"yach.hashline\"]\n",
+            )
+            .is_ok()
+        );
+        set_private(store.path());
+        let snapshot = store.load();
+        assert!(snapshot.is_ok(), "{snapshot:?}");
+        let Ok(snapshot) = snapshot else { return };
+        assert_eq!(snapshot.preset_applied, Some(Preset::Minimal));
+        assert!(!snapshot.kernel_components().project_tools());
+        assert!(snapshot.kernel_components().baseline_guidance());
+        assert!(snapshot.bundled_removed.contains("yach.hashline"));
+        assert_eq!(snapshot.unknown_components, vec![String::from("laser")]);
+    }
+
+    #[test]
+    fn persist_preset_writes_components_preserving_unrelated_content_and_removed() {
+        let (_directory, store) = temp_store("preset-persist");
+        assert!(
+            fs::write(
+                store.path(),
+                "# keep me\n[thinking]\ndefault = \"low\"\n\n[bundled]\nremoved = [\"yach.jev-reviewer\"]\n",
+            )
+            .is_ok()
+        );
+        set_private(store.path());
+        assert!(store.persist_preset(Preset::Minimal, false, false).is_ok());
+        let raw = fs::read_to_string(store.path()).unwrap_or_default();
+        assert!(raw.contains("# keep me"));
+        assert!(raw.contains("default = \"low\""));
+        let Ok(snapshot) = store.load() else {
+            unreachable!("valid config")
+        };
+        assert_eq!(snapshot.preset_applied, Some(Preset::Minimal));
+        assert!(!snapshot.kernel_components().project_tools());
+        assert!(snapshot.bundled_removed.contains("yach.jev-reviewer"));
+
+        assert!(store.persist_preset(Preset::Full, true, false).is_ok());
+        let Ok(snapshot) = store.load() else {
+            unreachable!("valid config")
+        };
+        assert!(snapshot.kernel_components().project_tools());
+        assert!(
+            snapshot.bundled_removed.is_empty(),
+            "--reset clears removals"
+        );
+    }
+
+    #[test]
+    fn persist_preset_first_run_preserves_existing_component_toggles() {
+        let (_directory, store) = temp_store("preset-preserve");
+        assert!(fs::write(store.path(), "[components]\nproject-tools = false\n").is_ok());
+        set_private(store.path());
+        assert!(store.persist_preset(Preset::Full, false, true).is_ok());
+        let Ok(snapshot) = store.load() else {
+            unreachable!("valid config")
+        };
+        assert_eq!(snapshot.preset_applied, Some(Preset::Full));
+        assert!(
+            !snapshot.kernel_components().project_tools(),
+            "existing project-tools = false record must survive the first-run apply"
+        );
+        assert!(
+            snapshot.kernel_components().baseline_guidance(),
+            "components with no prior record take the preset default"
+        );
+    }
+
+    #[test]
+    fn malformed_component_value_is_invalid() {
+        let (_directory, store) = temp_store("preset-malformed");
+        assert!(fs::write(store.path(), "[components]\nproject-tools = \"yes\"\n").is_ok());
+        set_private(store.path());
+        assert_eq!(store.load(), Err(UserConfigError::Invalid));
     }
 }

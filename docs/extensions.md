@@ -50,7 +50,12 @@ manifest `version` string without changing those risks does not require a
 new grant.
 
 The bundled `yach.hashline` package declares only file-scoped tools, so it
-does not need a grant.
+does not need a grant. Bundled extensions are removable: removing one
+deletes its install record and remembers the id in `[bundled] removed` in
+`~/.yach/config.toml`. `yach extension install --bundled yach.hashline`,
+`yach component enable hashline`, or `yach preset use <name> --reset`
+restores it (`--reset` reinstalls only the bundled components that preset
+includes); see [presets.md](presets.md).
 
 ## Activation without a grant
 

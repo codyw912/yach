@@ -77,6 +77,12 @@ Use `cargo install yach --force` to replace an older installed release. The
 crates.io release is the supported install boundary; `main` may contain
 unreleased changes.
 
+The default install applies the `full` preset on first run, which enables
+yach's reference components (the project tools, baseline guidance, and the
+bundled hashline and Jev extensions). To build a core binary without the
+bundled extension code, install with `--no-default-features`. See
+[docs/presets.md](docs/presets.md) for presets, components, and removal.
+
 ## Quickstart
 
 ```sh
@@ -183,7 +189,22 @@ default = "high"
 [model.default]
 provider = "anthropic"
 model = "claude-sonnet-5"
+
+[preset]
+applied = "full"
+
+[components]
+project-tools = true
+baseline-guidance = true
+
+[bundled]
+removed = []
 ```
+
+`preset.applied` is the last applied preset (absent means the first run has
+not happened yet). `[components]` toggles kernel components;
+`[bundled] removed` remembers bundled extension ids you removed. See
+[docs/presets.md](docs/presets.md).
 
 `thinking.default` accepts `off`, `low`, `medium`, `high`, or `max`. A resumed
 session uses its own recorded level; a new session in any project uses the

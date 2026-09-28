@@ -59,6 +59,9 @@ pub(crate) struct RunOptions {
     /// `None` writes the outcome document to stdout.
     pub outcome_path: Option<PathBuf>,
     pub quiet: bool,
+    /// `yach run --preset <name>` applies a preset to this session only;
+    /// user state is never read for components nor written.
+    pub preset: Option<yach_backend::Preset>,
 }
 
 pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
@@ -73,6 +76,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
     let mut turn_timeout_secs = DEFAULT_TURN_TIMEOUT_SECS;
     let mut outcome_path = None;
     let mut quiet = false;
+    let mut preset = None;
 
     let mut index = 0;
     let value_of = |flag: &str, args: &[String], index: usize| -> Result<String, String> {
@@ -134,6 +138,14 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
                 outcome_path = (raw != "-").then(|| PathBuf::from(raw));
                 index += 2;
             }
+            "--preset" => {
+                let raw = value_of("--preset", args, index)?;
+                preset = Some(
+                    yach_backend::Preset::parse(&raw)
+                        .ok_or_else(|| format!("unknown preset '{raw}'"))?,
+                );
+                index += 2;
+            }
             "--quiet" => {
                 quiet = true;
                 index += 1;
@@ -173,6 +185,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
         auto_review,
         turn_timeout: Duration::from_secs(turn_timeout_secs),
         outcome_path,
+        preset,
         quiet,
     })
 }
@@ -314,6 +327,21 @@ pub(crate) fn run_headless_command(
         session_log_path_in(&session_dir, &session_id)
     };
 
+    // `--preset` makes this session ephemeral: no first-run apply, no user
+    // state writes; the config is still loaded once for unknown-component
+    // warnings. Without it, the first-run `full` apply runs.
+    let components = match options.preset {
+        Some(preset) => {
+            super::warn_unknown_config_components();
+            yach_backend::ComponentSet::from_preset(preset)
+        }
+        None => super::first_run_session_components(),
+    };
+    let extension_package_root_loader = match options.preset {
+        Some(preset) => Some(super::ephemeral_loader(preset)),
+        None => extension_package_root_loader,
+    };
+
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -357,6 +385,7 @@ pub(crate) fn run_headless_command(
         let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
         let negotiated = headless_negotiated_capabilities(provider_connections.is_some());
         let config = RunnerConfig {
+            components,
             session_path: session_path.clone(),
             project_root: project_root.clone(),
             provider,
@@ -1457,6 +1486,7 @@ mod tests {
                 turn_timeout: Duration::from_secs(30),
                 outcome_path: None,
                 quiet: true,
+                preset: None,
             })
         );
     }
@@ -1490,6 +1520,13 @@ mod tests {
         assert!(parse_run_args(&args(&["--prompt", "hi", "--nope"])).is_err());
         assert!(parse_run_args(&args(&["--prompt", "hi", "--turn-timeout-secs", "0"])).is_err());
         assert!(parse_run_args(&args(&["--prompt", "hi", "--turn-timeout-secs", "abc"])).is_err());
+    }
+
+    #[test]
+    fn run_accepts_preset() {
+        let options = parse_run_args(&args(&["--preset", "minimal", "--prompt", "hi"]));
+        assert!(matches!(options, Ok(o) if o.preset == Some(yach_backend::Preset::Minimal)));
+        assert!(parse_run_args(&args(&["--preset", "tiny", "--prompt", "hi"])).is_err());
     }
 
     #[test]
@@ -1531,6 +1568,7 @@ mod tests {
             turn_timeout: Duration::from_secs(5),
             outcome_path: None,
             quiet: true,
+            preset: None,
         }
     }
 

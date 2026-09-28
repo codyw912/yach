@@ -174,6 +174,7 @@ pub fn run_scripted_turn(config: ScriptedTurnConfig) -> Result<ScriptedTurnProfi
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: crate::ComponentSet::full(),
                 session_path: config.session_path.clone(),
                 project_root: Some(config.project_root),
                 provider: Some(scripted_provider_config()),
@@ -408,6 +409,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 crate::runner::RunnerConfig {
+                    components: crate::ComponentSet::full(),
                     session_path: session_path.clone(),
                     project_root: Some(root.clone()),
                     provider: Some(super::scripted_provider_config()),

@@ -7,6 +7,7 @@
 //! continuation without credentials or network access.
 
 use std::collections::VecDeque;
+#[cfg(feature = "bundled-hashline")]
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -213,6 +214,7 @@ fn rpc_review_deny_bash_continues_and_finishes() {
     provider.join();
 }
 
+#[cfg(feature = "bundled-hashline")]
 #[test]
 fn rpc_hashline_extension_recovers_from_malformed_edit_then_applies_reviewed_edit() {
     let project = TempDir::new("rpc-hashline-project");
@@ -502,6 +504,7 @@ fn follow_up_sse() -> String {
     .to_owned()
 }
 
+#[cfg(feature = "bundled-hashline")]
 struct MockHashlineProvider {
     base_url: String,
     posts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -512,6 +515,7 @@ struct MockHashlineProvider {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(feature = "bundled-hashline")]
 impl MockHashlineProvider {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").test_unwrap();
@@ -663,6 +667,7 @@ impl MockHashlineProvider {
     }
 }
 
+#[cfg(feature = "bundled-hashline")]
 fn hashline_snapshot_header(request: &str) -> Option<String> {
     let marker = "[src/lib.rs#";
     request.find(marker).and_then(|start| {
@@ -672,6 +677,7 @@ fn hashline_snapshot_header(request: &str) -> Option<String> {
     })
 }
 
+#[cfg(feature = "bundled-hashline")]
 fn advertises_hashline_replacement_contracts(request: &str) -> bool {
     let Some((_, body)) = request.split_once("\r\n\r\n") else {
         return false;
@@ -704,6 +710,7 @@ fn advertises_hashline_replacement_contracts(request: &str) -> bool {
         && function("hashline_edit").is_none()
 }
 
+#[cfg(feature = "bundled-hashline")]
 fn hashline_tool_call_sse(
     completion_id: &str,
     tool_name: &str,
@@ -752,6 +759,7 @@ fn hashline_tool_call_sse(
     format!("data: {content}\n\ndata: {tool_call}\n\ndata: {finished}\n\ndata: [DONE]\n\n")
 }
 
+#[cfg(feature = "bundled-hashline")]
 fn hashline_final_sse() -> String {
     let content = serde_json::json!({
         "id": "chatcmpl-hashline-4",

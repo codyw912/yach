@@ -641,6 +641,7 @@ pub enum ExtensionActivationErrorKind {
     HostTimedOut,
     ProtocolError,
     PolicyBlocked,
+    NotCompiledIn,
 }
 
 impl ExtensionActivationErrorKind {
@@ -656,6 +657,7 @@ impl ExtensionActivationErrorKind {
             Self::HostTimedOut => "host_timed_out",
             Self::ProtocolError => "protocol_error",
             Self::PolicyBlocked => "policy_blocked",
+            Self::NotCompiledIn => "not_compiled_in",
         }
     }
 }
@@ -744,8 +746,15 @@ pub struct ExtensionActivationSnapshot {
 
 impl Default for ExtensionActivationSnapshot {
     fn default() -> Self {
+        Self::for_components(crate::ComponentSet::full())
+    }
+}
+
+impl ExtensionActivationSnapshot {
+    #[must_use]
+    pub fn for_components(components: crate::ComponentSet) -> Self {
         Self {
-            registry: ToolRegistry::with_project_read_only_and_agent_edit_tools(),
+            registry: ToolRegistry::for_components(components),
             executor: ExtensionToolExecutorRouter::default(),
             diagnostics: Vec::new(),
             replacement_bundles: Vec::new(),
@@ -754,9 +763,7 @@ impl Default for ExtensionActivationSnapshot {
             reviewer_generation: Arc::new(Mutex::new(0)),
         }
     }
-}
 
-impl ExtensionActivationSnapshot {
     #[must_use]
     pub fn active_tool_names(&self) -> Vec<&str> {
         self.diagnostics
@@ -871,6 +878,57 @@ impl ExtensionActivationSnapshot {
             }
         }
         (resolved_catalog, diagnostics)
+    }
+
+    #[must_use]
+    pub fn resolve_provider_turn_catalog_dropping_failed_bundles<'a>(
+        &self,
+        permission_policy: &ToolPermissionPolicy,
+        executable_tools: impl IntoIterator<Item = &'a str>,
+    ) -> (ResolvedToolCatalog, Vec<ToolReplacementBundleDiagnostic>) {
+        // With no replacement bundles nothing can fail, so the single-pass
+        // resolve is exact; skip the fixpoint bookkeeping on the hot path.
+        if self.replacement_bundles.is_empty() {
+            return self.resolve_provider_turn_catalog(permission_policy, executable_tools);
+        }
+        let mut executable_tools: BTreeSet<&str> = executable_tools.into_iter().collect();
+        let mut failed: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut diagnostics = Vec::new();
+        loop {
+            let (catalog, round_diagnostics) = self
+                .resolve_provider_turn_catalog(permission_policy, executable_tools.iter().copied());
+            if round_diagnostics.is_empty() {
+                return (catalog, diagnostics);
+            }
+            let pass_new_diagnostics: Vec<ToolReplacementBundleDiagnostic> = round_diagnostics
+                .into_iter()
+                .filter(|diagnostic| {
+                    !failed.contains(&(
+                        diagnostic.extension_id.clone(),
+                        diagnostic.bundle_id.clone(),
+                    ))
+                })
+                .collect();
+            if pass_new_diagnostics.is_empty() {
+                return (catalog, diagnostics);
+            }
+            for diagnostic in pass_new_diagnostics {
+                failed.insert((
+                    diagnostic.extension_id.clone(),
+                    diagnostic.bundle_id.clone(),
+                ));
+                diagnostics.push(diagnostic);
+            }
+            let dropped: BTreeSet<&str> = self
+                .replacement_bundles
+                .iter()
+                .filter(|bundle| {
+                    failed.contains(&(bundle.extension_id.clone(), bundle.bundle_id.clone()))
+                })
+                .flat_map(|bundle| bundle.members.iter().map(|member| member.tool.as_str()))
+                .collect();
+            executable_tools.retain(|name| !dropped.contains(name));
+        }
     }
 
     pub fn stop_extension(
@@ -1309,9 +1367,10 @@ fn capability_block_reason_with_grant(
 pub fn activate_background_metadata_extensions(
     package_records: &[ExtensionPackageRecord],
     config: ExtensionBackgroundActivationConfig,
+    components: crate::ComponentSet,
     trace: Option<&yach_trace::TraceSink>,
 ) -> ExtensionActivationSnapshot {
-    let mut snapshot = ExtensionActivationSnapshot::default();
+    let mut snapshot = ExtensionActivationSnapshot::for_components(components);
     let mut handlers = BTreeMap::new();
 
     for record in package_records {
@@ -3730,6 +3789,235 @@ done
     }
 
     #[test]
+    fn replacement_bundle_is_inactive_when_project_tools_are_disabled() -> Result<(), String> {
+        let mut snapshot = ExtensionActivationSnapshot::for_components(
+            crate::ComponentSet::from_preset(crate::Preset::Minimal),
+        );
+        expect_equal(&snapshot.registry.get("read_text_file").is_some(), &false)?;
+        expect_equal(&snapshot.registry.get("bash").is_some(), &true)?;
+        let read_schema =
+            ToolInputSchema::string_object(["path"], std::iter::empty::<&str>(), 4096);
+        for (name, risk) in [
+            ("hashline_read", ToolRisk::ReadsLocalContent),
+            ("hashline_edit", ToolRisk::MutatesLocalState),
+        ] {
+            snapshot
+                .registry
+                .register_extension_tool(ToolDefinition::extension_tool_with_version(
+                    "example.hashline",
+                    Some("0.1.0"),
+                    name,
+                    "hashline tool",
+                    read_schema.clone(),
+                    risk,
+                    ProviderToolVisibility::Visible,
+                ))
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        snapshot.replacement_bundles = vec![ActivatedToolReplacementBundle {
+            extension_id: String::from("example.hashline"),
+            extension_version: String::from("0.1.0"),
+            bundle_id: String::from("hashline"),
+            source: ToolReplacementSource::User,
+            members: vec![
+                ExtensionToolReplacementMember {
+                    builtin: String::from("read_text_file"),
+                    tool: String::from("hashline_read"),
+                    contract: ExtensionToolReplacementContract::Preserve,
+                },
+                ExtensionToolReplacementMember {
+                    builtin: String::from("edit_text_file"),
+                    tool: String::from("hashline_edit"),
+                    contract: ExtensionToolReplacementContract::Replace,
+                },
+            ],
+        }];
+        let policy = crate::runner::turn_permission_policy(
+            &snapshot.registry,
+            &["hashline_read", "hashline_edit"],
+        );
+        let (catalog, diagnostics) = snapshot
+            .resolve_provider_turn_catalog(&policy, ["bash", "hashline_read", "hashline_edit"]);
+        expect_equal(
+            &catalog.implementation_name_for_provider_tool("read_text_file"),
+            &None,
+        )?;
+        expect_equal(
+            &catalog.implementation_name_for_provider_tool("edit_text_file"),
+            &None,
+        )?;
+        expect_equal(&diagnostics.len(), &1)?;
+        expect_equal(&diagnostics[0].member.as_deref(), &Some("read_text_file"))?;
+
+        let (dropped, dropped_diagnostics) = snapshot
+            .resolve_provider_turn_catalog_dropping_failed_bundles(
+                &policy,
+                ["bash", "hashline_read", "hashline_edit"],
+            );
+        expect_equal(
+            &dropped.implementation_name_for_provider_tool("hashline_read"),
+            &None,
+        )?;
+        expect_equal(
+            &dropped.implementation_name_for_provider_tool("hashline_edit"),
+            &None,
+        )?;
+        expect_equal(&dropped_diagnostics.len(), &1)
+    }
+    #[test]
+    fn failed_bundles_with_shared_member_reach_fixed_point() -> Result<(), String> {
+        let mut snapshot = ExtensionActivationSnapshot::for_components(crate::ComponentSet::full());
+        let schema = ToolInputSchema::string_object(["path"], std::iter::empty::<&str>(), 4096);
+        for (extension_id, name, risk) in [
+            ("example.shared-a", "shared", ToolRisk::ReadsLocalContent),
+            ("example.shared-a", "bad", ToolRisk::ReadsLocalContent),
+            ("example.shared-a", "other", ToolRisk::ReadsLocalContent),
+        ] {
+            snapshot
+                .registry
+                .register_extension_tool(ToolDefinition::extension_tool_with_version(
+                    extension_id,
+                    Some("0.1.0"),
+                    name,
+                    "member",
+                    schema.clone(),
+                    risk,
+                    ProviderToolVisibility::Visible,
+                ))
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        snapshot.replacement_bundles = vec![
+            ActivatedToolReplacementBundle {
+                extension_id: String::from("example.shared-a"),
+                extension_version: String::from("0.1.0"),
+                bundle_id: String::from("a"),
+                source: ToolReplacementSource::User,
+                members: vec![
+                    ExtensionToolReplacementMember {
+                        builtin: String::from("read_text_file"),
+                        tool: String::from("shared"),
+                        contract: ExtensionToolReplacementContract::Replace,
+                    },
+                    ExtensionToolReplacementMember {
+                        builtin: String::from("edit_text_file"),
+                        tool: String::from("bad"),
+                        contract: ExtensionToolReplacementContract::Replace,
+                    },
+                ],
+            },
+            ActivatedToolReplacementBundle {
+                extension_id: String::from("example.shared-a"),
+                extension_version: String::from("0.1.0"),
+                bundle_id: String::from("b"),
+                source: ToolReplacementSource::User,
+                members: vec![
+                    ExtensionToolReplacementMember {
+                        builtin: String::from("search_project"),
+                        tool: String::from("shared"),
+                        contract: ExtensionToolReplacementContract::Replace,
+                    },
+                    ExtensionToolReplacementMember {
+                        builtin: String::from("list_project_paths"),
+                        tool: String::from("other"),
+                        contract: ExtensionToolReplacementContract::Replace,
+                    },
+                ],
+            },
+        ];
+        let policy =
+            crate::runner::turn_permission_policy(&snapshot.registry, &["shared", "bad", "other"]);
+
+        let executable_names = crate::tools::BUILTIN_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(["shared", "bad", "other"])
+            .collect::<Vec<_>>();
+        let (initial_catalog, initial_diagnostics) =
+            snapshot.resolve_provider_turn_catalog(&policy, executable_names.iter().copied());
+        expect_equal(
+            &initial_catalog.implementation_name_for_provider_tool("search_project"),
+            &Some("shared"),
+        )?;
+        expect_equal(
+            &initial_catalog.implementation_name_for_provider_tool("list_project_paths"),
+            &Some("other"),
+        )?;
+        expect_equal(&initial_diagnostics.len(), &1)?;
+        expect_equal(
+            &initial_diagnostics[0].extension_id.as_str(),
+            &"example.shared-a",
+        )?;
+        expect_equal(&initial_diagnostics[0].bundle_id.as_str(), &"a")?;
+
+        let (catalog, diagnostics) = snapshot
+            .resolve_provider_turn_catalog_dropping_failed_bundles(
+                &policy,
+                executable_names.iter().copied(),
+            );
+
+        for builtin in [
+            "read_text_file",
+            "edit_text_file",
+            "search_project",
+            "list_project_paths",
+        ] {
+            expect_equal(
+                &catalog.implementation_name_for_provider_tool(builtin),
+                &Some(builtin),
+            )?;
+        }
+        expect_equal(
+            &catalog.implementation_name_for_provider_tool("shared"),
+            &None,
+        )?;
+        expect_equal(&catalog.implementation_name_for_provider_tool("bad"), &None)?;
+        expect_equal(
+            &catalog.implementation_name_for_provider_tool("other"),
+            &None,
+        )?;
+        let failed_bundles: BTreeSet<(String, String)> = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.extension_id.clone(),
+                    diagnostic.bundle_id.clone(),
+                )
+            })
+            .collect();
+        expect_equal(&failed_bundles.len(), &2)?;
+        expect_equal(
+            &failed_bundles.contains(&(String::from("example.shared-a"), String::from("a"))),
+            &true,
+        )?;
+        expect_equal(
+            &failed_bundles.contains(&(String::from("example.shared-a"), String::from("b"))),
+            &true,
+        )
+    }
+
+    #[test]
+    fn builtin_names_stay_reserved_when_project_tools_are_disabled() {
+        let mut registry =
+            ToolRegistry::for_components(crate::ComponentSet::from_preset(crate::Preset::Minimal));
+        for name in crate::tools::BUILTIN_TOOL_NAMES {
+            let result =
+                registry.register_extension_tool(ToolDefinition::extension_tool_with_version(
+                    "example.squatter",
+                    Some("0.1.0"),
+                    name,
+                    "squats on a built-in name",
+                    ToolInputSchema::string_object(["path"], std::iter::empty::<&str>(), 4096),
+                    ToolRisk::ReadsLocalContent,
+                    ProviderToolVisibility::Visible,
+                ));
+            assert!(
+                matches!(result, Err(ToolRegistrationError::DuplicateToolName { .. })),
+                "{name} must stay reserved"
+            );
+        }
+    }
+
+    #[test]
     fn extension_manifest_rejects_malformed_identity_and_tool_names() {
         let mut invalid_id = toy_tool_manifest_json();
         invalid_id["id"] = serde_json::json!("bad id with spaces");
@@ -5019,6 +5307,7 @@ done
                 max_stdout_line_bytes: 4096,
                 max_result_bytes: 4096,
             },
+            crate::ComponentSet::full(),
             None,
         );
 
@@ -5091,6 +5380,7 @@ done
                 max_stdout_line_bytes: 4096,
                 max_result_bytes: 4096,
             },
+            crate::ComponentSet::full(),
             None,
         );
 
@@ -5138,7 +5428,12 @@ done
             max_stdout_line_bytes: 4096,
             max_result_bytes: 4096,
         };
-        let mut snapshot = activate_background_metadata_extensions(index.records(), config, None);
+        let mut snapshot = activate_background_metadata_extensions(
+            index.records(),
+            config,
+            crate::ComponentSet::full(),
+            None,
+        );
 
         snapshot
             .stop_extension("example.toy-tools")
@@ -5209,6 +5504,7 @@ done
         let snapshot = activate_background_metadata_extensions(
             std::slice::from_ref(&record),
             ExtensionBackgroundActivationConfig::conservative(),
+            crate::ComponentSet::full(),
             None,
         );
 
@@ -5352,6 +5648,7 @@ done
                 max_stdout_line_bytes: 4096,
                 max_result_bytes: 4096,
             },
+            crate::ComponentSet::full(),
             None,
         );
         expect_equal(&snapshot.host_start_count, &1)?;

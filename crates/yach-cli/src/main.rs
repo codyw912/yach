@@ -35,6 +35,7 @@ use yach_backend::{
     run_native_loop, run_native_loop_with_negotiated_capabilities, select_error_dialect,
     session_log_path_in, start_backend_session,
 };
+use yach_backend::{Component, ComponentSet, Preset};
 use yach_proto::{
     BackendEvent, Capability, ClientEvent, DialogKind, DialogRequest, Handshake, ModelInfo,
     NegotiatedCapabilities, PromptOutcome, ServerEvent, ThinkingLevel,
@@ -43,6 +44,7 @@ use yach_ui::{
     RunTuiOptions, Theme, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
     run_tui_with_trace_and_options,
 };
+mod bundled;
 mod model_discovery_cache;
 mod provider_connections;
 
@@ -65,18 +67,34 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("__extension-host")
         && args.get(1).map(String::as_str) == Some("hashline")
     {
-        return match yach_hashline_extension::run_stdio() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::from(1),
-        };
+        #[cfg(feature = "bundled-hashline")]
+        {
+            return match yach_hashline_extension::run_stdio() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(_) => ExitCode::from(1),
+            };
+        }
+        #[cfg(not(feature = "bundled-hashline"))]
+        {
+            let _ = writeln!(io::stderr(), "error=bundled extension not compiled in");
+            return ExitCode::from(1);
+        }
     }
     if args.first().map(String::as_str) == Some("__extension-host")
         && args.get(1).map(String::as_str) == Some("jev")
     {
-        return match yach_jev_reviewer::run_stdio() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::from(1),
-        };
+        #[cfg(feature = "bundled-jev")]
+        {
+            return match yach_jev_reviewer::run_stdio() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(_) => ExitCode::from(1),
+            };
+        }
+        #[cfg(not(feature = "bundled-jev"))]
+        {
+            let _ = writeln!(io::stderr(), "error=bundled extension not compiled in");
+            return ExitCode::from(1);
+        }
     }
     let cli = CliArgs::from_args(args.into_iter());
     if let Some(trace) = trace.as_ref() {
@@ -133,6 +151,8 @@ impl CliArgs {
             Some("smoke-responses-compaction") => Command::SmokeResponsesCompaction,
             Some("install") => extension_install_command_from_args(&positional[1..]),
             Some("extension") => extension_command_from_args(&positional[1..]),
+            Some("preset") => preset_command_from_args(&positional[1..]),
+            Some("component") => component_command_from_args(&positional[1..]),
             Some("rpc") => Command::Rpc {
                 args: positional[1..].to_vec(),
             },
@@ -208,6 +228,20 @@ enum Command {
     ExtensionRevoke {
         selector: String,
     },
+    ExtensionInstallBundled {
+        id: String,
+    },
+    PresetList,
+    PresetShow,
+    PresetUse {
+        preset: Preset,
+        reset: bool,
+    },
+    ComponentList,
+    ComponentSetEnabled {
+        component: Component,
+        enabled: bool,
+    },
     Rpc {
         args: Vec<String>,
     },
@@ -248,6 +282,49 @@ fn extension_command_from_args(args: &[String]) -> Command {
     }
 }
 
+fn preset_command_from_args(args: &[String]) -> Command {
+    match args.first().map(String::as_str) {
+        Some("list") => Command::PresetList,
+        Some("show") => Command::PresetShow,
+        Some("use") => {
+            let name = args.iter().skip(1).find(|arg| !arg.starts_with("--"));
+            match name.and_then(|name| Preset::parse(name)) {
+                Some(preset) => Command::PresetUse {
+                    preset,
+                    reset: args.iter().any(|arg| arg == "--reset"),
+                },
+                None => Command::Unknown {
+                    name: format!("preset use {}", name.map_or("", String::as_str)),
+                },
+            }
+        }
+        other => Command::Unknown {
+            name: format!("preset {}", other.unwrap_or_default()),
+        },
+    }
+}
+
+fn component_command_from_args(args: &[String]) -> Command {
+    match args.first().map(String::as_str) {
+        Some("list") => Command::ComponentList,
+        Some(action @ ("enable" | "disable")) => {
+            let name = args.get(1).map(String::as_str).unwrap_or_default();
+            match Component::parse(name) {
+                Some(component) => Command::ComponentSetEnabled {
+                    component,
+                    enabled: action == "enable",
+                },
+                None => Command::Unknown {
+                    name: format!("component {action} {name}"),
+                },
+            }
+        }
+        other => Command::Unknown {
+            name: format!("component {}", other.unwrap_or_default()),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExtensionSelectorAction {
     Remove,
@@ -256,6 +333,15 @@ enum ExtensionSelectorAction {
 }
 
 fn extension_install_command_from_args(args: &[String]) -> Command {
+    if args.iter().any(|arg| arg == "--bundled") {
+        let id = args
+            .iter()
+            .skip_while(|arg| *arg != "--bundled")
+            .nth(1)
+            .cloned()
+            .unwrap_or_default();
+        return Command::ExtensionInstallBundled { id };
+    }
     let scope = extension_scope_from_args(args);
     let enabled = !args.iter().any(|arg| arg == "--disabled");
     let source = args
@@ -390,6 +476,14 @@ impl Command {
                 scope,
                 enabled,
             } => run_extension_set_enabled_command(selector, *scope, *enabled),
+            Self::ExtensionInstallBundled { id } => run_extension_install_bundled_command(id),
+            Self::PresetList => run_preset_list_command(),
+            Self::PresetShow => run_preset_show_command(),
+            Self::PresetUse { preset, reset } => run_preset_use_command(*preset, *reset),
+            Self::ComponentList => run_component_list_command(),
+            Self::ComponentSetEnabled { component, enabled } => {
+                run_component_set_enabled_command(*component, *enabled)
+            }
             Self::ExtensionList => run_extension_list_command(),
             Self::ExtensionDoctor { extension_id } => {
                 run_extension_doctor_command(extension_id.as_deref())
@@ -476,6 +570,12 @@ enum CommandResult {
     /// through the command result.
     Rpc {
         exit_code: u8,
+    },
+    /// `preset` and `component` commands render caller-supplied lines;
+    /// `failed` drives the exit code.
+    Preset {
+        lines: Vec<String>,
+        failed: bool,
     },
 }
 
@@ -580,6 +680,7 @@ impl CommandResult {
             | Self::Tui { .. }
             | Self::CompactionSmoke { .. }
             | Self::ResponsesCompactionSmoke { .. } => 0,
+            Self::Preset { failed, .. } => *failed as u8,
         }
     }
 
@@ -742,6 +843,7 @@ impl CommandResult {
                 rendered
             }
             Self::HeadlessRun { .. } | Self::Rpc { .. } => Vec::new(),
+            Self::Preset { lines, .. } => lines.clone(),
         }
     }
 }
@@ -855,6 +957,9 @@ fn usage_lines() -> Vec<String> {
     vec![
         String::from("usage: yach [options]            start an interactive session"),
         String::from("       yach <command> [options]"),
+        String::from("       yach preset list | show | use <minimal|full> [--reset]"),
+        String::from("       yach component list | enable <name> | disable <name>"),
+        String::from("       yach extension install --bundled <yach.hashline|yach.jev-reviewer>"),
         String::from("commands: run, rpc, extension, install, print-capabilities"),
         String::from("options: --resume, --backend fixture, --version, --help"),
         String::from(
@@ -2249,7 +2354,7 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
         model: ProviderModel { provider, model },
         messages: vec![ProviderMessage::text(
             Role::User,
-            yach_backend::build_summary_prompt(&preparation),
+            yach_backend::build_summary_prompt(&preparation, None),
         )],
         extensions: vec![],
         native_request: None,
@@ -2415,6 +2520,7 @@ async fn run_responses_compaction_runner_smoke(
         client_rx,
         backend_tx,
         RunnerConfig {
+            components: yach_backend::ComponentSet::full(),
             session_path: session_path.clone(),
             project_root: Some(workspace.root.clone()),
             provider: Some(ProviderConfig {
@@ -4000,6 +4106,7 @@ async fn run_tui_with_native_backend_config_observed(
     }
 
     let event_tx = backend_session.endpoints.backend_tx.clone();
+    let components = first_run_session_components();
     let backend_config = runner_config(RunnerConfigInput {
         session_path,
         project_root,
@@ -4009,6 +4116,8 @@ async fn run_tui_with_native_backend_config_observed(
         catalog_refresh,
         model_discovery,
         provider_connections,
+        components,
+        ephemeral_preset: None,
     });
     let backend_handle = {
         #[cfg(feature = "bench")]
@@ -4065,6 +4174,43 @@ async fn run_tui_with_native_backend_config_observed(
     ui_result
 }
 
+/// Sessions without `--preset` own the first-run `full` apply: it runs before
+/// the backend config is built, prints one stderr notice when it applied,
+/// and the session's component set comes from the persisted config.
+pub(crate) fn first_run_session_components() -> ComponentSet {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return ComponentSet::full();
+    };
+    let Ok(config) = yach_backend::UserConfigStore::for_current_user() else {
+        return ComponentSet::full();
+    };
+    match extension_store_path(ExtensionInstallScope::User) {
+        Ok(store_path) => match bundled::ensure_first_run(&home, &config, &store_path) {
+            Ok(Some(report)) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "yach: applied preset {} (first run)",
+                    report.preset.name()
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "warning: failed to apply first-run preset: {error}"
+                );
+            }
+        },
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "warning: failed to resolve extension store for first-run preset: {error}"
+            );
+        }
+    }
+    bundled::session_components(&config, None)
+}
+
 fn tui_session_path_from_latest(
     resume: bool,
     latest_session_path: Option<PathBuf>,
@@ -4086,6 +4232,10 @@ struct RunnerConfigInput<'a> {
     catalog_refresh: Option<std::sync::mpsc::Receiver<String>>,
     model_discovery: Option<ModelDiscoveryFuture>,
     provider_connections: Option<Arc<dyn yach_backend::ProviderConnectionRuntime>>,
+    /// The session's component set; `ephemeral_preset` additionally filters
+    /// the loader's package roots without touching user state.
+    components: ComponentSet,
+    ephemeral_preset: Option<Preset>,
 }
 
 fn runner_config(input: RunnerConfigInput<'_>) -> RunnerConfig {
@@ -4098,15 +4248,22 @@ fn runner_config(input: RunnerConfigInput<'_>) -> RunnerConfig {
         catalog_refresh,
         model_discovery,
         provider_connections,
+        components,
+        ephemeral_preset,
     } = input;
+    let extension_package_root_loader = match ephemeral_preset {
+        Some(preset) => Some(ephemeral_loader(preset)),
+        None => Some(extension_package_root_loader()),
+    };
     RunnerConfig {
+        components,
         session_path,
         project_root,
         provider,
         startup_model_override: None,
         provider_setup_error,
         extension_package_roots: extension_package_roots_from_env(),
-        extension_package_root_loader: Some(extension_package_root_loader()),
+        extension_package_root_loader,
         trace: trace.cloned(),
         catalog_refresh,
         model_discovery,
@@ -4136,6 +4293,60 @@ fn extension_package_roots_from_env() -> Vec<ExtensionPackageRoot> {
         })
         .unwrap_or_default()
 }
+/// Enabled non-bundled install roots, read with no refresh and no save —
+/// the persisted input for an ephemeral `--preset` session.
+fn persisted_nonbundled_package_roots() -> Vec<ExtensionPackageRoot> {
+    loaded_extension_install_records()
+        .unwrap_or_default()
+        .iter()
+        .filter(|record| record.enabled)
+        .filter(|record| record.kind != ExtensionInstallRefKind::Bundled)
+        .map(|record| ExtensionPackageRoot {
+            root: record.package_root.clone(),
+            scope: record.scope,
+            source_ref: Some(record.source.clone()),
+        })
+        .collect()
+}
+
+/// The package-root loader for an ephemeral `--preset` session: resolves
+/// bundled roots in memory via `bundled::materialize` and never writes user
+/// state.
+fn ephemeral_loader(preset: Preset) -> ExtensionPackageRootLoader {
+    ExtensionPackageRootLoader::new(move || {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return persisted_nonbundled_package_roots();
+        };
+        match bundled::ephemeral_package_roots(&home, preset, persisted_nonbundled_package_roots())
+        {
+            Ok(roots) => roots,
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "warning: failed to resolve ephemeral bundled roots: {error}"
+                );
+                persisted_nonbundled_package_roots()
+            }
+        }
+    })
+}
+
+/// Warn about unknown component names in the user config at session start,
+/// without applying or writing anything.
+pub(crate) fn warn_unknown_config_components() {
+    let Ok(config) = yach_backend::UserConfigStore::for_current_user() else {
+        return;
+    };
+    match config.load() {
+        Ok(snapshot) => bundled::warn_unknown_components(&snapshot.unknown_components),
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "warning: failed to load user config for components: {error}"
+            );
+        }
+    }
+}
 
 fn extension_package_roots_from_env_and_install_records(
     records: &[ExtensionInstallRecord],
@@ -4145,6 +4356,7 @@ fn extension_package_roots_from_env_and_install_records(
         records
             .iter()
             .filter(|record| !record.enabled && record.kind == ExtensionInstallRefKind::Bundled)
+            .filter(|record| bundled::is_compiled_in(&record.source))
             .map(|record| ExtensionPackageRoot {
                 root: record.package_root.clone(),
                 scope: record.scope,
@@ -4163,141 +4375,6 @@ fn installed_extension_package_roots() -> Vec<ExtensionPackageRoot> {
     extension_package_roots_from_install_records(&installed_extension_records())
 }
 
-#[cfg(not(test))]
-fn bundled_hashline_package_root() -> io::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    let root = home
-        .join(".yach/bundled/yach-hashline")
-        .join(env!("CARGO_PKG_VERSION"));
-    std::fs::create_dir_all(&root)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-
-    let executable = std::env::current_exe()?;
-    let executable = executable.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "yach executable path is not UTF-8",
-        )
-    })?;
-    let mut manifest =
-        serde_json::from_str::<serde_json::Value>(yach_hashline_extension::MANIFEST_JSON)
-            .map_err(io::Error::other)?;
-    manifest["main"]["command"] = serde_json::Value::String(executable.to_owned());
-    manifest["main"]["args"] = serde_json::json!(["__extension-host", "hashline"]);
-    let mut bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
-    bytes.push(b'\n');
-
-    let manifest_path = root.join("yach.extension.json");
-    if std::fs::read(&manifest_path).ok().as_deref() != Some(bytes.as_slice()) {
-        let temp_path = root.join(format!(".yach.extension.json.{}.tmp", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&temp_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temp_path, &manifest_path)?;
-    }
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        &manifest_path,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )?;
-
-    Ok(root)
-}
-
-#[cfg(not(test))]
-fn ensure_bundled_hashline_install_record() -> io::Result<()> {
-    let package_root = bundled_hashline_package_root()?;
-    let path = extension_store_path(ExtensionInstallScope::User)?;
-    let mut store = ExtensionInstallStore::load_from_path(&path)
-        .map_err(|error| extension_install_io_error(&error))?;
-    let before = store.clone();
-    store
-        .install_bundled("yach.hashline", &package_root, ExtensionInstallScope::User)
-        .map_err(|error| extension_install_io_error(&error))?;
-    if store != before {
-        store
-            .save_to_path(&path)
-            .map_err(|error| extension_install_io_error(&error))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(test))]
-fn bundled_jev_package_root() -> io::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    let root = home
-        .join(".yach/bundled/yach-jev-reviewer")
-        .join(env!("CARGO_PKG_VERSION"));
-    std::fs::create_dir_all(&root)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-
-    let executable = std::env::current_exe()?;
-    let executable = executable.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "yach executable path is not UTF-8",
-        )
-    })?;
-    let mut manifest = serde_json::from_str::<serde_json::Value>(yach_jev_reviewer::MANIFEST_JSON)
-        .map_err(io::Error::other)?;
-    manifest["main"]["command"] = serde_json::Value::String(executable.to_owned());
-    manifest["main"]["args"] = serde_json::json!(["__extension-host", "jev"]);
-    let mut bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
-    bytes.push(b'\n');
-
-    let manifest_path = root.join("yach.extension.json");
-    if std::fs::read(&manifest_path).ok().as_deref() != Some(bytes.as_slice()) {
-        let temp_path = root.join(format!(".yach.extension.json.{}.tmp", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&temp_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temp_path, &manifest_path)?;
-    }
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        &manifest_path,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )?;
-
-    Ok(root)
-}
-
-#[cfg(not(test))]
-fn ensure_bundled_jev_install_record() -> io::Result<()> {
-    let package_root = bundled_jev_package_root()?;
-    let path = extension_store_path(ExtensionInstallScope::User)?;
-    let mut store = ExtensionInstallStore::load_from_path(&path)
-        .map_err(|error| extension_install_io_error(&error))?;
-    let before = store.clone();
-    store
-        .install_bundled(
-            "yach.jev-reviewer",
-            &package_root,
-            ExtensionInstallScope::User,
-        )
-        .map_err(|error| extension_install_io_error(&error))?;
-    if store != before {
-        store
-            .save_to_path(&path)
-            .map_err(|error| extension_install_io_error(&error))?;
-    }
-    Ok(())
-}
-
 fn extension_package_roots_from_install_records(
     records: &[ExtensionInstallRecord],
 ) -> Vec<ExtensionPackageRoot> {
@@ -4309,6 +4386,10 @@ fn extension_package_roots_from_install_records(
                 record.kind,
                 ExtensionInstallRefKind::LocalPath | ExtensionInstallRefKind::Bundled
             )
+        })
+        .filter(|record| {
+            record.kind != ExtensionInstallRefKind::Bundled
+                || bundled::is_compiled_in(&record.source)
         })
         .map(|record| ExtensionPackageRoot {
             root: record.package_root.clone(),
@@ -4365,20 +4446,32 @@ fn run_extension_install_command(
 
 fn run_extension_remove_command(selector: &str, scope: ExtensionInstallScope) -> CommandResult {
     let result = (|| {
-        #[cfg(not(test))]
-        ensure_bundled_hashline_install_record()?;
-        #[cfg(not(test))]
-        ensure_bundled_jev_install_record()?;
         let path = extension_store_path(scope)?;
         let mut store = ExtensionInstallStore::load_from_path(&path)
             .map_err(|error| extension_install_io_error(&error))?;
         let resolved_selector = resolve_extension_install_selector(&store, selector);
+        let removed_bundled_source = store
+            .records
+            .iter()
+            .find(|record| {
+                record.kind == ExtensionInstallRefKind::Bundled
+                    && (record.source == resolved_selector
+                        || record.package_root == Path::new(&resolved_selector))
+            })
+            .map(|record| record.source.clone());
         store
             .remove(&resolved_selector)
             .map_err(|error| extension_install_io_error(&error))?;
         store
             .save_to_path(&path)
             .map_err(|error| extension_install_io_error(&error))?;
+        if let Some(source) = removed_bundled_source {
+            let config = yach_backend::UserConfigStore::for_current_user()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            config
+                .persist_bundled_removed(&source, true)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
         Ok(format!("removed {selector}"))
     })();
     extension_management_result(ExtensionManagementAction::Remove, scope, result)
@@ -4396,10 +4489,6 @@ fn run_extension_set_enabled_command(
     };
     let result = (|| {
         let path = extension_store_path(scope)?;
-        #[cfg(not(test))]
-        ensure_bundled_hashline_install_record()?;
-        #[cfg(not(test))]
-        ensure_bundled_jev_install_record()?;
         let mut store = ExtensionInstallStore::load_from_path(&path)
             .map_err(|error| extension_install_io_error(&error))?;
         let resolved_selector = resolve_extension_install_selector(&store, selector);
@@ -4415,6 +4504,271 @@ fn run_extension_set_enabled_command(
         ))
     })();
     extension_management_result(action, scope, result)
+}
+
+fn cli_home() -> io::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
+}
+
+fn cli_user_config() -> io::Result<yach_backend::UserConfigStore> {
+    yach_backend::UserConfigStore::for_current_user()
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+fn run_preset_list_command() -> CommandResult {
+    preset_result(Ok(vec![
+        String::from("preset=minimal"),
+        String::from("preset=full"),
+    ]))
+}
+
+fn preset_result(result: io::Result<Vec<String>>) -> CommandResult {
+    match result {
+        Ok(lines) => CommandResult::Preset {
+            lines,
+            failed: false,
+        },
+        Err(error) => CommandResult::Preset {
+            lines: vec![format!("error={error}")],
+            failed: true,
+        },
+    }
+}
+
+/// Loads the user config snapshot for `preset show` / `component list`,
+/// emitting the unknown-component warnings once per invocation.
+fn load_snapshot_for_listing(
+    config: &yach_backend::UserConfigStore,
+) -> io::Result<yach_backend::UserConfigSnapshot> {
+    let snapshot = config
+        .load()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    bundled::warn_unknown_components(&snapshot.unknown_components);
+    Ok(snapshot)
+}
+
+fn run_preset_show_command() -> CommandResult {
+    let result = (|| {
+        let config = cli_user_config()?;
+        let snapshot = load_snapshot_for_listing(&config)?;
+        let mut lines = vec![format!(
+            "preset_applied={}",
+            snapshot.preset_applied.map_or("none", Preset::name)
+        )];
+        lines.extend(component_list_lines(&config, &snapshot)?);
+        Ok(lines)
+    })();
+    preset_result(result)
+}
+
+fn run_preset_use_command(preset: Preset, reset: bool) -> CommandResult {
+    let result = (|| {
+        let home = cli_home()?;
+        let config = cli_user_config()?;
+        let store_path = extension_store_path(ExtensionInstallScope::User)?;
+        let report = bundled::apply_preset(&home, &config, &store_path, preset, reset, false)?;
+        let mut lines = vec![
+            String::from("preset_action=use"),
+            format!("preset={}", preset.name()),
+            format!("installed={}", report.installed.join(",")),
+            format!("enabled={}", report.enabled.join(",")),
+            format!("disabled={}", report.disabled.join(",")),
+            format!("preserved={}", report.preserved.join(",")),
+            format!("not_compiled_in={}", report.not_compiled_in.join(",")),
+        ];
+        if preset == Preset::Minimal {
+            lines.extend([
+                String::from(
+                    "note=review and auto-review treat every file read and write as a shell command",
+                ),
+                String::from(
+                    "note=accept-edits has no hash-checked structured edits to auto-apply",
+                ),
+                String::from(
+                    "note=reads lose the bounded-result and resource-broker path of read_text_file",
+                ),
+            ]);
+        }
+        Ok(lines)
+    })();
+    preset_result(result)
+}
+
+/// One `component name=… source=… state=… compiled_in=…` line per component.
+fn component_list_lines(
+    config: &yach_backend::UserConfigStore,
+    snapshot: &yach_backend::UserConfigSnapshot,
+) -> io::Result<Vec<String>> {
+    let store =
+        ExtensionInstallStore::load_from_path(&extension_store_path(ExtensionInstallScope::User)?)
+            .map_err(|error| extension_install_io_error(&error))?;
+    let _ = config;
+    let kernel_components = snapshot.kernel_components();
+    Ok(Component::ALL
+        .iter()
+        .map(|component| {
+            let (source, state, compiled_in) = match component.bundled_extension_id() {
+                Some(id) => {
+                    let state = if snapshot.bundled_removed.contains(id) {
+                        "removed"
+                    } else {
+                        match store.records.iter().find(|record| record.source == id) {
+                            Some(record) if record.enabled => "enabled",
+                            Some(_) => "disabled",
+                            None => "not-installed",
+                        }
+                    };
+                    let compiled_in = bundled::is_compiled_in(id);
+                    ("bundled-extension", state, compiled_in)
+                }
+                None if *component == Component::SkillIndex => ("kernel", "reserved", true),
+                None => {
+                    let state = if kernel_components.contains(*component) {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    };
+                    ("kernel", state, true)
+                }
+            };
+            format!(
+                "component name={} source={source} state={state} compiled_in={compiled_in}",
+                component.name()
+            )
+        })
+        .collect())
+}
+
+fn run_component_list_command() -> CommandResult {
+    let result = (|| {
+        let config = cli_user_config()?;
+        let snapshot = load_snapshot_for_listing(&config)?;
+        component_list_lines(&config, &snapshot)
+    })();
+    preset_result(result)
+}
+
+fn run_component_set_enabled_command(component: Component, enabled: bool) -> CommandResult {
+    if let Some(id) = component.bundled_extension_id() {
+        let action = if enabled {
+            ExtensionManagementAction::Enable
+        } else {
+            ExtensionManagementAction::Disable
+        };
+        let store_path_result = extension_store_path(ExtensionInstallScope::User);
+        let store_result = store_path_result.and_then(|path| {
+            ExtensionInstallStore::load_from_path(&path)
+                .map(|store| (path, store))
+                .map_err(|error| extension_install_io_error(&error))
+        });
+        let (path, mut store) = match store_result {
+            // A load/resolve failure is reported, not silently treated as
+            // "not installed".
+            Err(error) => {
+                return extension_management_result(
+                    action,
+                    ExtensionInstallScope::User,
+                    Err(error),
+                );
+            }
+            Ok(loaded) => loaded,
+        };
+        if !bundled::is_compiled_in(id) {
+            // A bundled component this build omits. An existing record keeps
+            // the choice for a later full build; without one nothing is
+            // installed, so say how to get it rather than claim a preference.
+            let result = (|| {
+                if store.records.iter().any(|record| record.source == id) {
+                    store
+                        .set_enabled(id, enabled)
+                        .map_err(|error| extension_install_io_error(&error))?;
+                    store
+                        .save_to_path(&path)
+                        .map_err(|error| extension_install_io_error(&error))?;
+                    return Ok(format!("{id} not compiled in; preference recorded"));
+                }
+                if enabled {
+                    let config = cli_user_config()?;
+                    config
+                        .persist_bundled_removed(id, false)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                }
+                Ok(format!(
+                    "{id} not compiled in; no install record (run `yach extension install --bundled {id}` from a build that includes it)"
+                ))
+            })();
+            return extension_management_result(action, ExtensionInstallScope::User, result);
+        }
+        let has_record = store.records.iter().any(|record| record.source == id);
+        match has_record {
+            // `component enable` on a bundled id with no record installs it —
+            // same path as `extension install --bundled`.
+            false if enabled => return run_extension_install_bundled_command(id),
+            false => {
+                return extension_management_result(
+                    action,
+                    ExtensionInstallScope::User,
+                    Ok(String::from("not installed")),
+                );
+            }
+            true => {}
+        }
+        return run_extension_set_enabled_command(id, ExtensionInstallScope::User, enabled);
+    }
+    // Kernel component: persist the toggle.
+    let result = (|| {
+        let config = cli_user_config()?;
+        config
+            .persist_component(component, enabled)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(format!(
+            "{} {}",
+            if enabled { "enabled" } else { "disabled" },
+            component.name()
+        ))
+    })();
+    let action = if enabled {
+        ExtensionManagementAction::Enable
+    } else {
+        ExtensionManagementAction::Disable
+    };
+    extension_management_result(action, ExtensionInstallScope::User, result)
+}
+
+fn run_extension_install_bundled_command(id: &str) -> CommandResult {
+    let result = (|| {
+        let Some(package) = bundled::BUNDLED.iter().find(|package| package.source == id) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown bundled extension '{id}'"),
+            ));
+        };
+        let home = cli_home()?;
+        let config = cli_user_config()?;
+        let store_path = extension_store_path(ExtensionInstallScope::User)?;
+        let mut store = ExtensionInstallStore::load_from_path(&store_path)
+            .map_err(|error| extension_install_io_error(&error))?;
+        // Installing a bundled id the user previously removed clears the
+        // removal marker — this command is the documented way back.
+        config
+            .persist_bundled_removed(id, false)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if bundled::install(&home, &mut store, package)? {
+            store
+                .save_to_path(&store_path)
+                .map_err(|error| extension_install_io_error(&error))?;
+            Ok(format!("installed {id}"))
+        } else {
+            Err(io::Error::other(format!("{id} not compiled in")))
+        }
+    })();
+    extension_management_result(
+        ExtensionManagementAction::Install,
+        ExtensionInstallScope::User,
+        result,
+    )
 }
 
 fn resolve_extension_install_selector(store: &ExtensionInstallStore, selector: &str) -> String {
@@ -4483,7 +4837,6 @@ fn extension_install_error_label(error: &ExtensionInstallError) -> &'static str 
         ExtensionInstallError::StoreIo => "store_io",
         ExtensionInstallError::StoreMalformed => "store_malformed",
         ExtensionInstallError::RecordNotFound { .. } => "record_not_found",
-        ExtensionInstallError::BundledCannotRemove { .. } => "bundled_cannot_remove",
     }
 }
 
@@ -4610,18 +4963,6 @@ fn run_extension_revoke_command(selector: &str) -> CommandResult {
 fn loaded_extension_package_record(
     selector: &str,
 ) -> Result<Option<ExtensionPackageRecord>, String> {
-    #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_hashline_install_record() {
-        return Err(format!(
-            "failed to prepare bundled hashline extension: {error}"
-        ));
-    }
-    #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_jev_install_record() {
-        return Err(format!(
-            "failed to prepare bundled jev reviewer extension: {error}"
-        ));
-    }
     let install_records = loaded_extension_install_records()?;
     let index = ExtensionManifestIndex::from_package_roots(
         extension_package_roots_from_env_and_install_records(&install_records),
@@ -4670,26 +5011,6 @@ fn extension_diagnostics_result(
     command: ExtensionDiagnosticsCommand,
     extension_id: Option<&str>,
 ) -> CommandResult {
-    #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_hashline_install_record() {
-        return CommandResult::ExtensionDiagnostics {
-            command,
-            outcome: ExtensionDiagnosticsOutcome::Failed,
-            records: Vec::new(),
-            message: Some(format!("extension diagnostics failed: {error}")),
-            host_start_count: 0,
-        };
-    }
-    #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_jev_install_record() {
-        return CommandResult::ExtensionDiagnostics {
-            command,
-            outcome: ExtensionDiagnosticsOutcome::Failed,
-            records: Vec::new(),
-            message: Some(format!("extension diagnostics failed: {error}")),
-            host_start_count: 0,
-        };
-    }
     let install_records = match loaded_extension_install_records() {
         Ok(records) => records,
         Err(message) => {
@@ -4744,20 +5065,53 @@ fn extension_diagnostics_result(
 
 fn installed_extension_records() -> Vec<ExtensionInstallRecord> {
     #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_hashline_install_record() {
-        let _ = writeln!(
-            io::stderr(),
-            "warning: failed to prepare bundled hashline extension: {error}"
-        );
-    }
-    #[cfg(not(test))]
-    if let Err(error) = ensure_bundled_jev_install_record() {
-        let _ = writeln!(
-            io::stderr(),
-            "warning: failed to prepare bundled jev reviewer extension: {error}"
-        );
-    }
+    refresh_bundled_install_records();
     loaded_extension_install_records().unwrap_or_default()
+}
+
+#[cfg(not(test))]
+fn refresh_bundled_install_records() {
+    if let Err(error) = refresh_bundled_install_records_inner() {
+        let _ = writeln!(
+            io::stderr(),
+            "warning: failed to refresh bundled extensions: {error}"
+        );
+    }
+}
+
+#[cfg(not(test))]
+fn refresh_bundled_install_records_inner() -> io::Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let path = extension_store_path(ExtensionInstallScope::User)?;
+    let mut store = ExtensionInstallStore::load_from_path(&path)
+        .map_err(|error| extension_install_io_error(&error))?;
+    let bundled_removed = match yach_backend::UserConfigStore::for_current_user() {
+        Ok(config) => match config.load() {
+            Ok(snapshot) => snapshot.bundled_removed,
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "warning: failed to load user config for bundled extensions: {error}"
+                );
+                BTreeSet::new()
+            }
+        },
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "warning: failed to load user config for bundled extensions: {error}"
+            );
+            BTreeSet::new()
+        }
+    };
+    if bundled::refresh_on_upgrade(&home, &mut store, &bundled_removed)? {
+        store
+            .save_to_path(&path)
+            .map_err(|error| extension_install_io_error(&error))?;
+    }
+    Ok(())
 }
 
 fn loaded_extension_install_records() -> Result<Vec<ExtensionInstallRecord>, String> {
@@ -4877,13 +5231,15 @@ fn extension_diagnostic_records_from_installs(
 fn extension_diagnostic_record_from_install(
     install: &ExtensionInstallRecord,
 ) -> ExtensionDiagnosticRecord {
-    ExtensionDiagnosticRecord::from_activation_diagnostic(
-        ExtensionActivationDiagnostic::from_install_record(install),
-        install.enabled,
-        false,
-    )
+    let mut diagnostic = ExtensionActivationDiagnostic::from_install_record(install);
+    if install.kind == ExtensionInstallRefKind::Bundled && !bundled::is_compiled_in(&install.source)
+    {
+        diagnostic.activation_state = ExtensionActivationState::Blocked;
+        diagnostic.last_error_kind = Some(ExtensionActivationErrorKind::NotCompiledIn);
+        diagnostic.last_error_summary = Some(String::from("bundled extension not compiled in"));
+    }
+    ExtensionDiagnosticRecord::from_activation_diagnostic(diagnostic, install.enabled, false)
 }
-
 fn extension_diagnostic_record_matches(
     record: &ExtensionDiagnosticRecord,
     extension_id: Option<&str>,
@@ -5080,6 +5436,7 @@ fn loop_resumes_existing_session_without_duplicate_turn_ids() {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: yach_backend::ComponentSet::full(),
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
@@ -5188,6 +5545,7 @@ fn loop_emits_existing_session_messages_after_explicit_path_selection() {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: yach_backend::ComponentSet::full(),
                 session_path: path.clone(),
                 project_root: None,
                 provider: None,
@@ -5270,6 +5628,7 @@ fn loop_provider_cancel_persists_user_entry() {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: yach_backend::ComponentSet::full(),
                 session_path: path.clone(),
                 project_root: None,
                 provider: Some(ProviderConfig {
@@ -5379,6 +5738,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
             client_rx,
             backend_tx,
             RunnerConfig {
+                components: yach_backend::ComponentSet::full(),
                 session_path: path.clone(),
                 project_root: None,
                 provider: Some(ProviderConfig {
@@ -5387,6 +5747,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
                             auth_file: path.with_extension("missing-token-dir").join("auth.json"),
                         },
                         timeout: std::time::Duration::from_millis(1),
+
                         max_tokens: 1,
                         context_window: 200_000,
                         max_tokens_param: MaxTokensParam::default(),
@@ -5436,7 +5797,6 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
         )
         .await;
         assert!(stale_cancel_prompt_finished.is_empty());
-
         handle.abort();
         let loaded = store.load();
         let _ = std::fs::remove_file(path);
@@ -5459,15 +5819,17 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "bundled-hashline"))]
+    use super::extension_diagnostic_record_from_install;
     use super::{
         CliArgs, Command, CommandResult, ExtensionDiagnosticRecord, ExtensionDiagnosticsCommand,
         ExtensionDiagnosticsOutcome, ExtensionManagementAction, ExtensionManagementOutcome,
         NativeTuiBackendSetup, RigSmokeConfigError, RigSmokeOutcome, RunnerConfigInput,
-        TuiBackendSelection, dialog_smoke_requests, extension_store_path, native_backend_handshake,
-        print_capabilities, provider_setup_error_message, run_extension_install_command,
-        run_extension_list_command, run_extension_remove_command,
-        run_extension_set_enabled_command, runner_config, tui_session_path_from_latest,
-        tui_theme_path, unconfigured_launch_setup_error,
+        TuiBackendSelection, dialog_smoke_requests, extension_package_roots_from_install_records,
+        extension_store_path, native_backend_handshake, print_capabilities,
+        provider_setup_error_message, run_extension_install_command, run_extension_list_command,
+        run_extension_remove_command, run_extension_set_enabled_command, runner_config,
+        tui_session_path_from_latest, tui_theme_path, unconfigured_launch_setup_error,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Read, Write};
@@ -5748,6 +6110,38 @@ mod tests {
                 resume: false,
             }
         );
+    }
+
+    fn parse_command(args: &[&str]) -> Command {
+        CliArgs::from_args(args.iter().map(|arg| String::from(*arg))).command
+    }
+
+    #[test]
+    fn preset_and_component_commands_parse() {
+        assert_eq!(
+            parse_command(&["preset", "use", "minimal", "--reset"]),
+            Command::PresetUse {
+                preset: yach_backend::Preset::Minimal,
+                reset: true
+            }
+        );
+        assert_eq!(
+            parse_command(&["component", "disable", "project-tools"]),
+            Command::ComponentSetEnabled {
+                component: yach_backend::Component::ProjectTools,
+                enabled: false
+            }
+        );
+        assert_eq!(
+            parse_command(&["extension", "install", "--bundled", "yach.hashline"]),
+            Command::ExtensionInstallBundled {
+                id: String::from("yach.hashline")
+            }
+        );
+        assert!(matches!(
+            parse_command(&["preset", "use", "profile"]),
+            Command::Unknown { .. }
+        ));
     }
 
     #[test]
@@ -6265,6 +6659,8 @@ mod tests {
                 catalog_refresh: Some(std::sync::mpsc::channel().1),
                 model_discovery: None,
                 provider_connections: None,
+                components: yach_backend::ComponentSet::full(),
+                ephemeral_preset: None,
             });
 
             expect_true(
@@ -6346,6 +6742,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 RunnerConfig {
+                    components: yach_backend::ComponentSet::full(),
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
@@ -6417,6 +6814,8 @@ mod tests {
             catalog_refresh: Some(std::sync::mpsc::channel().1),
             model_discovery: None,
             provider_connections: None,
+            components: yach_backend::ComponentSet::full(),
+            ephemeral_preset: None,
         });
 
         assert_eq!(config.project_root, expected);
@@ -6488,6 +6887,7 @@ mod tests {
                 client_rx,
                 backend_tx,
                 RunnerConfig {
+                    components: yach_backend::ComponentSet::full(),
                     session_path: path.clone(),
                     project_root: None,
                     provider: None,
@@ -6866,6 +7266,8 @@ mod tests {
                         provider_connections: Some(
                             runtime.clone() as Arc<dyn yach_backend::ProviderConnectionRuntime>
                         ),
+                        components: yach_backend::ComponentSet::full(),
+                        ephemeral_preset: None,
                     }),
                 ));
                 let client = backend_session.channels.client_tx;
@@ -7909,5 +8311,60 @@ mod tests {
 
         assert!(super::write_lines(&mut output, &lines).is_ok());
         assert_eq!(output, b"alpha\nbeta\n");
+    }
+
+    fn bundled_install_record(source: &str) -> super::ExtensionInstallRecord {
+        super::ExtensionInstallRecord {
+            source: String::from(source),
+            kind: super::ExtensionInstallRefKind::Bundled,
+            scope: ExtensionInstallScope::User,
+            enabled: true,
+            package_root: PathBuf::from("/tmp/yach-bundled-stale"),
+        }
+    }
+
+    #[cfg(feature = "bundled-hashline")]
+    #[test]
+    fn bundled_record_is_discovered_when_compiled_in() {
+        let records = vec![bundled_install_record("yach.hashline")];
+
+        let roots = extension_package_roots_from_install_records(&records);
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0].source_ref.as_deref(),
+            Some("yach.hashline"),
+            "a compiled-in bundled record contributes its package root"
+        );
+    }
+
+    #[cfg(not(feature = "bundled-hashline"))]
+    #[test]
+    fn bundled_record_is_excluded_and_reported_not_compiled_in() {
+        let records = vec![bundled_install_record("yach.hashline")];
+
+        let roots = extension_package_roots_from_install_records(&records);
+        assert!(
+            roots.is_empty(),
+            "a stale bundled record never loads in a core build"
+        );
+
+        let diagnostic = extension_diagnostic_record_from_install(&records[0]);
+        assert_eq!(
+            diagnostic.activation_state,
+            ExtensionActivationState::Blocked
+        );
+        assert_eq!(
+            diagnostic.last_error_kind,
+            Some(yach_backend::ExtensionActivationErrorKind::NotCompiledIn)
+        );
+        assert_eq!(
+            diagnostic.last_error_summary.as_deref(),
+            Some("bundled extension not compiled in")
+        );
+        assert!(
+            diagnostic.install_enabled,
+            "the recorded preference survives"
+        );
     }
 }

@@ -12,6 +12,35 @@ use crate::{
     SessionEvent, SessionId, SessionLog, ToolOutcome, ToolPayloadSummary, ToolRequestId, TurnId,
 };
 
+const PROJECT_TOOL_NAMES: [&str; 6] = [
+    "project_path_info",
+    "read_text_file",
+    "search_project",
+    "list_project_paths",
+    "edit_text_file",
+    "create_text_file",
+];
+
+/// Built-in names remain reserved even when their component is disabled.
+pub const BUILTIN_TOOL_NAMES: [&str; 7] = [
+    "project_path_info",
+    "read_text_file",
+    "search_project",
+    "list_project_paths",
+    "edit_text_file",
+    "create_text_file",
+    "bash",
+];
+
+#[must_use]
+pub fn project_tool_names(components: crate::ComponentSet) -> &'static [&'static str] {
+    if components.project_tools() {
+        &PROJECT_TOOL_NAMES
+    } else {
+        &[]
+    }
+}
+
 /// Risk class for yach-owned native tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRisk {
@@ -2088,6 +2117,17 @@ impl ToolRegistry {
     }
 
     #[must_use]
+    pub fn for_components(components: crate::ComponentSet) -> Self {
+        if components.project_tools() {
+            Self::with_project_read_only_and_agent_edit_tools()
+        } else {
+            Self {
+                definitions: vec![ToolDefinition::bash()],
+            }
+        }
+    }
+
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&ToolDefinition> {
         self.definitions
             .iter()
@@ -2109,7 +2149,9 @@ impl ToolRegistry {
         &self,
         definition: &ToolDefinition,
     ) -> Option<ToolRegistrationError> {
-        if self.get(&definition.name).is_some() {
+        if BUILTIN_TOOL_NAMES.contains(&definition.name.as_str())
+            || self.get(&definition.name).is_some()
+        {
             return Some(ToolRegistrationError::DuplicateToolName {
                 name: definition.name.clone(),
             });
