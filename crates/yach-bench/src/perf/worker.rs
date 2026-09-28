@@ -119,9 +119,7 @@ fn measure_restricted(
         {
             continue;
         }
-        let wants_row = !deterministic || matches!(workload.class, Class::Size | Class::Count);
-        let wants_alloc = workload.emits_alloc_rows()
-            && classes.is_none_or(|allowed| allowed.contains(&Class::Count));
+        let (wants_row, wants_alloc) = planned_rows(workload, deterministic, classes);
         if !wants_row && !wants_alloc {
             continue;
         }
@@ -207,6 +205,32 @@ fn measure_restricted(
         grouped.entry(index).or_default().extend(rows);
     }
     grouped.into_values().flatten().collect()
+}
+
+/// Whether the planner measures `workload`'s own row and its derived
+/// `#alloc_*` rows. Deterministic runs keep only exact rows (size, count,
+/// derived allocation counts).
+fn planned_rows(
+    workload: &Workload,
+    deterministic: bool,
+    classes: Option<&[Class]>,
+) -> (bool, bool) {
+    let wants_row = !deterministic || matches!(workload.class, Class::Size | Class::Count);
+    let wants_alloc = workload.emits_alloc_rows()
+        && classes.is_none_or(|allowed| allowed.contains(&Class::Count));
+    (wants_row, wants_alloc)
+}
+
+/// Whether a run with these settings measures any workload that needs the
+/// `--features bench` yach binary. The A/B controller skips that release
+/// build when nothing would use it, which is always true for deterministic
+/// runs today: every `Bin::Bench` workload is child-process latency or memory.
+pub(crate) fn needs_bench_binary(filter: Option<&glob::Pattern>, deterministic: bool) -> bool {
+    registry::all().iter().any(|workload| {
+        workload.bin == Some(Bin::Bench)
+            && filter.is_none_or(|pattern| id_matches(pattern, workload.id))
+            && planned_rows(workload, deterministic, None) != (false, false)
+    })
 }
 
 fn unmet(workload: &Workload, ctx: &RunCtx, has_tty: bool) -> Option<&'static str> {
@@ -844,11 +868,42 @@ fn alloc_cell(rows: &[WorkloadRow], row: &WorkloadRow) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cargo_invocation, list_workloads, measure, unix_secs_to_rfc3339_utc};
+    use super::{
+        cargo_invocation, list_workloads, measure, needs_bench_binary, unix_secs_to_rfc3339_utc,
+    };
     use crate::perf::alloc::lock_window_for_test;
     use crate::perf::registry::{self, RunCtx};
     use crate::perf::schema::{Class, Status};
     use std::collections::BTreeSet;
+
+    /// The A/B controller skips the `--features bench` release build (one per
+    /// side) whenever this is false, so it must be false exactly when no
+    /// selected workload would run against that binary.
+    #[test]
+    fn bench_binary_is_needed_only_when_a_selected_workload_uses_it() {
+        assert!(
+            !needs_bench_binary(None, true),
+            "deterministic runs measure no Bench-binary workload"
+        );
+        assert!(
+            needs_bench_binary(None, false),
+            "latency runs include Bench-binary workloads"
+        );
+        let Ok(request_only) = glob::Pattern::new("request/*") else {
+            unreachable!("fixture pattern must parse")
+        };
+        assert!(
+            !needs_bench_binary(Some(&request_only), false),
+            "a filter excluding every Bench-binary workload needs no bench build"
+        );
+        let Ok(child_turn) = glob::Pattern::new("turn/scripted/tools_4/builtin_child") else {
+            unreachable!("fixture pattern must parse")
+        };
+        assert!(
+            needs_bench_binary(Some(&child_turn), false),
+            "a filter selecting a Bench-binary workload needs the bench build"
+        );
+    }
 
     #[test]
     fn deterministic_measure_emits_only_size_and_count_rows_with_alloc_derivatives() {

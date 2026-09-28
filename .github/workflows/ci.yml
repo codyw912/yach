@@ -62,12 +62,17 @@ jobs:
       - name: Materialize base
         run: git worktree add .perf/base "${{ github.event.pull_request.base.sha }}"
 
+      # Build the controller into the same target directory `perf ab` uses for
+      # the current side (`target/release-root`), so Compare reuses this build
+      # instead of compiling the current revision a second time.
       - name: Build yach-bench
         run: cargo build --release --locked -p yach-bench
+        env:
+          CARGO_TARGET_DIR: target/release-root
 
       - name: Compare
-        run: ./target/release/yach-bench perf ab --base-dir .perf/base --deterministic --rounds 1 --build-cmd cargo --out ab.json
+        run: ./target/release-root/release/yach-bench perf ab --base-dir .perf/base --deterministic --rounds 1 --build-cmd cargo --out ab.json
 
       - name: Summarize
         if: always()
-        run: ./target/release/yach-bench perf report ab.json >> "$GITHUB_STEP_SUMMARY"
+        run: ./target/release-root/release/yach-bench perf report ab.json >> "$GITHUB_STEP_SUMMARY"

@@ -355,6 +355,15 @@ pub fn run(opts: &AbRunOptions) -> Result<(AbDoc, u8), String> {
     } else {
         base_checkout.join("target")
     };
+    // The `--features bench` yach build is a full release build per side.
+    // Skip it when no selected workload would run against that binary
+    // (always the case for `--deterministic`).
+    let worker_stage =
+        if worker::needs_bench_binary(opts.options.filter.as_ref(), opts.options.deterministic) {
+            BuildStage::BenchAndWorker
+        } else {
+            BuildStage::Shipping
+        };
 
     let mut base_side = if opts.no_build {
         side_from_paths(&base_checkout, &base_target)?
@@ -366,7 +375,10 @@ pub fn run(opts: &AbRunOptions) -> Result<(AbDoc, u8), String> {
             &opts.build_cmd,
         )?
     };
-    if !opts.no_build && probe_worker(&base_side.yach_bench_bin) == Some(SCHEMA) {
+    if !opts.no_build
+        && worker_stage == BuildStage::BenchAndWorker
+        && probe_worker(&base_side.yach_bench_bin) == Some(SCHEMA)
+    {
         base_side = build_side(
             &base_checkout,
             &base_target,
@@ -381,7 +393,7 @@ pub fn run(opts: &AbRunOptions) -> Result<(AbDoc, u8), String> {
         build_side(
             &current_checkout,
             &current_target,
-            BuildStage::BenchAndWorker,
+            worker_stage,
             &opts.build_cmd,
         )?
     };
