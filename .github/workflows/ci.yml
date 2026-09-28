@@ -29,6 +29,11 @@ jobs:
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
 
+      # Keeps compiled dependencies in target/ between runs. Pushes to main
+      # save the cache that pull requests restore.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2.9.2
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -41,12 +46,18 @@ jobs:
   # CI intentionally uses the explicit Rust toolchain above rather than the
   # contributor devenv environment. Pass `--build-cmd cargo` so the performance
   # controller builds both revisions with that same CI toolchain.
+  #
+  # Nearly all of this job is release builds: `perf ab` builds each side into
+  # its own target directories. rust-cache keeps both trees' compiled
+  # dependencies. Pull requests can only restore caches saved on main, so
+  # pushes to main also run the comparison (against the previous main commit)
+  # and save the cache that pull requests start from.
   perf-deterministic:
     name: Perf (deterministic)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     env:
       CARGO_TERM_COLOR: always
+      BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -59,20 +70,42 @@ jobs:
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
 
+      # A new branch or force-push has no usable previous commit to compare.
       - name: Materialize base
-        run: git worktree add .perf/base "${{ github.event.pull_request.base.sha }}"
+        id: base
+        run: |
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != 0000000000000000000000000000000000000000 ] \
+            && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git worktree add .perf/base "$BASE_SHA"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No base commit to compare against; skipping."
+          fi
+
+      # After the worktree exists: restoring .perf/base/target first would
+      # make `git worktree add` refuse a non-empty directory.
+      - name: Cache Rust builds
+        if: steps.base.outputs.available == 'true'
+        uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: perf
+          workspaces: |
+            . -> target
+            .perf/base -> target
 
       # Build the controller into the same target directory `perf ab` uses for
       # the current side (`target/release-root`), so Compare reuses this build
       # instead of compiling the current revision a second time.
       - name: Build yach-bench
+        if: steps.base.outputs.available == 'true'
         run: cargo build --release --locked -p yach-bench
         env:
           CARGO_TARGET_DIR: target/release-root
 
       - name: Compare
+        if: steps.base.outputs.available == 'true'
         run: ./target/release-root/release/yach-bench perf ab --base-dir .perf/base --deterministic --rounds 1 --build-cmd cargo --out ab.json
 
       - name: Summarize
-        if: always()
+        if: always() && steps.base.outputs.available == 'true'
         run: ./target/release-root/release/yach-bench perf report ab.json >> "$GITHUB_STEP_SUMMARY"
