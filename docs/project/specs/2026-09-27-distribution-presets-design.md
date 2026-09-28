@@ -4,6 +4,15 @@
 
 Status: draft for owner review, 2026-09-27.
 
+Revision 2026-09-27: reconciled with the shipped implementation (PR #279);
+each change needs owner acceptance or revert. Baseline guidance stays the
+separate leading system message; presets disable rather than delete bundled
+records; the bundled refresh runs on every start when the manifest differs;
+core builds keep choices only on existing install records, **dropping the
+earlier promise that a recorded preference applies to never-installed
+components**; `compaction.enabled = false` gates automatic compaction only,
+and the native compactor still sends the summary prompt.
+
 ## Problem and outcome
 
 Yach is meant to be a minimal, compiled, extension-first harness: a Pi-like
@@ -72,7 +81,7 @@ First-party, versioned with the binary, each toggled as one unit.
 | Component | Provides | Implementation |
 |---|---|---|
 | `project-tools` | `project_path_info`, `read_text_file`, `search_project`, `list_project_paths`, `edit_text_file`, `create_text_file` | In-process (see below) |
-| `baseline-guidance` | The text now in `PROVIDER_BASELINE_GUIDANCE`, as a system-placement static-context item | In-process static-context contribution |
+| `baseline-guidance` | The text now in `PROVIDER_BASELINE_GUIDANCE`, as the separate leading system message | In-process, gated per request |
 | `hashline` | Coordinated replacement of `read_text_file` / `edit_text_file` | Existing subprocess extension, unchanged |
 | `jev-reviewer` | Automatic-review reviewer | Existing subprocess extension, unchanged |
 | `skill-index` | Reserved for plane:YACH-14 | Defined by the skills spec |
@@ -167,8 +176,8 @@ preset does not change the approval mode to compensate; user documentation and
   diagnostic and are ignored. `[bundled] removed` is a separate table so it is
   never mistaken for a component.
 - **Extension components** (`hashline`, `jev-reviewer`) stay install records in
-  `~/.yach/extensions.json`. Applying a preset installs and enables, or
-  removes, their bundled records.
+  `~/.yach/extensions.json`. Applying a preset installs and enables its
+  bundled records and disables the others; it never deletes a record.
 - **Bundled records become removable.** `ExtensionInstallStore::remove` stops
   rejecting `Bundled` records, and normal startup and management commands stop
   calling `ensure_bundled_*` to seed missing records. Seeding happens only when
@@ -204,23 +213,27 @@ and today's per-start `install_bundled` call is what repoints an existing
 record's `package_root` to the new version (`extension_install.rs:192-195`).
 Dropping per-start seeding must not drop that refresh.
 
-On startup, when the running yach version differs from a bundled record's
-materialized version, the kernel re-materializes that package's manifest for
-the current version and updates the record's `package_root`, keeping its
-`enabled` value. The materialized version is the last path component of
-`package_root` (`~/.yach/bundled/<package>/<version>`); no new record field is
-added. This refresh only touches records that exist: it never creates a record,
-and never touches ids in `[bundled] removed`. It is cheap (one
-manifest write per bundled package per upgrade) and runs before extension
-discovery, which is already post-first-paint.
+On every start, for each existing bundled record not in `[bundled] removed`,
+the kernel re-materializes that package's manifest for the running binary and
+repoints the record's `package_root` when it changed, keeping its `enabled`
+value. This covers version upgrades and same-version rebuilds whose
+executable path moved. The materialized version is the last path component
+of `package_root` (`~/.yach/bundled/<package>/<version>`); no new record
+field is added. This refresh only touches records that exist: it never
+creates a record, and never touches ids in `[bundled] removed`. It is cheap
+(the manifest is byte-compared and written only when it differs) and runs
+before extension discovery, which is already post-first-paint.
 
 ### Components not compiled into this build
 
 A preset or component command naming a bundled extension that this build
-omits (see Build packaging) records the preference, reports "not compiled in"
-in `yach component list` and the extension diagnostics, and continues. It is
-never a startup failure. If the same user state is later used by a build that
-includes the component, the recorded preference applies.
+omits (see Build packaging) reports "not compiled in" in `yach component
+list` and the extension diagnostics, and continues. It is never a startup
+failure. An existing install record keeps the enabled/disabled choice the
+command set, and a later build that includes the component honors it. A
+core build creates no record for an omitted package, so a component that was
+never installed stays uninstalled until `yach preset use` or `yach extension
+install --bundled` runs from a build that includes it.
 
 ## Tool resolution
 
@@ -280,9 +293,10 @@ guidance to the live turn but never rewrites persisted state.
 
 The prompt can be replaced, not omitted: `build_summary_prompt` is the entire
 instruction to the summarizing model, and without it the model would answer
-the conversation instead of summarizing it. Users who want no yach
-summarization prompt set `compaction.enabled = false` or select the native
-`compactor = "openai-responses"`. `minimal` does not change compaction.
+the conversation instead of summarizing it. `compaction.enabled = false`
+disables automatic compaction; a manual `/compact` still sends the prompt.
+The native `compactor = "openai-responses"` still runs the portable summary
+pass. `minimal` does not change compaction.
 
 ## Build packaging
 
