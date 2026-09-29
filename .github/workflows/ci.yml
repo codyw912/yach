@@ -10,6 +10,8 @@ jobs:
   rust:
     name: Rust workspace
     runs-on: ubuntu-latest
+    # Normally 3-4 minutes; a hung test should fail fast, not run for hours.
+    timeout-minutes: 15
     env:
       CARGO_TERM_COLOR: always
 
@@ -55,6 +57,8 @@ jobs:
   perf-deterministic:
     name: Perf (deterministic)
     runs-on: ubuntu-latest
+    # Normally 5-10 minutes with the build cache, about 20 without it.
+    timeout-minutes: 35
     env:
       CARGO_TERM_COLOR: always
       BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
