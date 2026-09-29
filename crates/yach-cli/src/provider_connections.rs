@@ -2477,8 +2477,11 @@ mod tests {
             super::super::model_layers_fixture(),
             None,
             Arc::new(move |_| {
-                started_sender.send(()).test_unwrap();
+                // Take the reply channel before signaling. Signaling first let
+                // the second refresh pop the first channel in the gap, so each
+                // refresh waited on the other's reply and the test hung.
                 let receiver = receivers.lock().test_unwrap().pop_front().test_unwrap();
+                started_sender.send(()).test_unwrap();
                 Box::pin(async move { receiver.await.test_unwrap() })
             }),
         );
