@@ -99,6 +99,15 @@
 
   # Enter shell message
   enterShell = ''
+    # Route Cargo through mbx (a shared build cache) on hosts that provide it,
+    # such as the agent hosts; a no-op everywhere else.
+    if [ -n "''${MBX_CARGO_SHIM_DIR:-}" ] && [ -x "$MBX_CARGO_SHIM_DIR/cargo" ]; then
+      export PATH="$MBX_CARGO_SHIM_DIR:$PATH"
+      # devenv's clang/lld linker reaches rustc as `-C linker`, which mbx 1.21
+      # does not model, so it bypasses every compilation. Link with the default
+      # `cc` instead while mbx is active.
+      unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
+    fi
     echo "🦀 Rust development environment activated"
     echo "Available commands:"
     echo "  - just      # list common recipes"
