@@ -3902,6 +3902,7 @@ pub(crate) fn provider_messages_from_event_slice(
         | SessionEvent::EditTransactionFinished { .. }
         | SessionEvent::CompactionCheckpoint { .. }
         | SessionEvent::ToolResultMasked { .. }
+        | SessionEvent::ProviderAttemptFinished { .. }
         | SessionEvent::Unknown => Vec::new(),
     }));
     messages
@@ -4053,6 +4054,17 @@ pub(crate) trait ProviderRequester: Send {
     ) -> BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>> {
         let _ = live;
         self.request_attempt(request)
+    }
+
+    /// Labels the attempt about to start. Default is a no-op so existing
+    /// requesters keep compiling.
+    fn begin_attempt(&mut self, label: AttemptLabel) {
+        let _ = label;
+    }
+
+    /// Diagnostics captured for the attempt that just settled. Called once.
+    fn take_attempt_diagnostics(&mut self) -> AttemptDiagnostics {
+        AttemptDiagnostics::default()
     }
 }
 
@@ -5254,6 +5266,13 @@ narrow the request or start a fresh session",
                 session_id: session_id.0.as_str(),
                 attempt_sequence: &mut attempt_sequence,
                 trace,
+                attempts: Some(AttemptSink {
+                    session_id,
+                    purpose: crate::ProviderAttemptPurpose::Turn,
+                    log: &mut *log,
+                    pending_events: &mut *pending_events,
+                    store: tool_event_store,
+                }),
             },
         )
         .await;
@@ -5827,6 +5846,64 @@ fn build_native_provider_tool_continuation_request(
 
 const PROVIDER_RETRY_DELAYS_MS: [u64; 2] = [1_000, 2_000];
 const PROVIDER_RETRY_DELAY_BUDGET_MS: u64 = 30_000;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AttemptDiagnostics {
+    pub provider_request_id: Option<String>,
+    pub first_event_ms: Option<u64>,
+    pub capture: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttemptLabel {
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub purpose: crate::ProviderAttemptPurpose,
+    pub attempt_sequence: u64,
+}
+
+/// Where settled attempts go. With a store, each event is appended directly
+/// (never through the pending batch, so failure exits cannot drop it);
+/// without one it joins log + pending like any other event.
+pub(crate) struct AttemptSink<'a> {
+    pub session_id: &'a SessionId,
+    pub purpose: crate::ProviderAttemptPurpose,
+    pub log: &'a mut SessionLog,
+    pub pending_events: &'a mut Vec<SessionEvent>,
+    pub store: Option<&'a JsonlSessionStore>,
+}
+
+impl AttemptSink<'_> {
+    pub(crate) fn record(&mut self, turn_id: TurnId, attempt: crate::ProviderAttemptSummary) {
+        let event = SessionEvent::ProviderAttemptFinished {
+            session_id: self.session_id.clone(),
+            turn_id,
+            attempt,
+        };
+        self.log.push(event.clone());
+        if let Some(store) = self.store {
+            let _ = store.append_event(&event);
+        } else {
+            self.pending_events.push(event);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AttemptStart {
+    instant: Instant,
+    at_ms: u64,
+}
+
+enum AttemptSettle<'a> {
+    Stream {
+        events: &'a [ProviderStreamEvent],
+        partial_error: Option<&'a ProviderError>,
+        tool_round_used: bool,
+    },
+    Error(&'a ProviderError),
+    Cancelled,
+}
+
 struct ProviderRetryContext<'a> {
     review_tx: &'a mpsc::UnboundedSender<BackendEvent>,
     live: Option<&'a crate::rig_adapter::LiveDeltaSink>,
@@ -5835,6 +5912,7 @@ struct ProviderRetryContext<'a> {
     session_id: &'a str,
     trace: Option<&'a yach_trace::TraceSink>,
     attempt_sequence: &'a mut u64,
+    attempts: Option<AttemptSink<'a>>,
 }
 
 fn provider_retry_delay_ms(
@@ -5939,12 +6017,132 @@ fn finish_provider_retry_events(
     std::mem::take(completed_prefix)
 }
 
+#[derive(Default)]
+struct AttemptErrorFields {
+    kind: Option<ProviderErrorKind>,
+    classification_source: Option<crate::ClassificationSource>,
+    variant: Option<String>,
+    status_code: Option<u16>,
+    provider_code: Option<String>,
+    timeout_phase: Option<crate::TimeoutPhase>,
+    retry_after_ms: Option<u64>,
+}
+
+fn attempt_error_fields(error: Option<&ProviderError>) -> AttemptErrorFields {
+    let Some(error) = error else {
+        return AttemptErrorFields::default();
+    };
+    AttemptErrorFields {
+        kind: Some(error.kind),
+        classification_source: Some(error.metadata.classification_source),
+        variant: error.metadata.error_variant.map(str::to_owned),
+        status_code: error.metadata.status_code,
+        provider_code: error.metadata.provider_code.clone(),
+        timeout_phase: error.metadata.timeout_phase,
+        retry_after_ms: error.metadata.retry_after_ms,
+    }
+}
+
+fn stream_attempt_settle<'a>(
+    events: &'a [ProviderStreamEvent],
+    partial_error: Option<&'a ProviderError>,
+    tool_round_used: bool,
+) -> (crate::ProviderAttemptOutcome, Option<&'a ProviderError>) {
+    if events
+        .iter()
+        .any(|event| matches!(event, ProviderStreamEvent::Cancelled { .. }))
+    {
+        return (crate::ProviderAttemptOutcome::Cancelled, None);
+    }
+    if let Some(error) = events.iter().find_map(|event| match event {
+        ProviderStreamEvent::Failed { error, .. } => Some(error),
+        _ => None,
+    }) {
+        return (crate::ProviderAttemptOutcome::Failed, Some(error));
+    }
+    if events
+        .iter()
+        .any(|event| matches!(event, ProviderStreamEvent::Completed { .. }))
+    {
+        return match partial_error {
+            Some(error) => (crate::ProviderAttemptOutcome::Partial, Some(error)),
+            None => (crate::ProviderAttemptOutcome::Succeeded, None),
+        };
+    }
+    if tool_round_used {
+        return (crate::ProviderAttemptOutcome::Partial, partial_error);
+    }
+    (crate::ProviderAttemptOutcome::Failed, partial_error)
+}
+
+fn settle_attempt(
+    context: &mut ProviderRetryContext<'_>,
+    requester: &mut impl ProviderRequester,
+    request: &ProviderRequest,
+    start: AttemptStart,
+    settle: &AttemptSettle<'_>,
+    retry_index: usize,
+    next_delay_ms: Option<u64>,
+) {
+    let Some(sink) = context.attempts.as_mut() else {
+        return;
+    };
+    let diagnostics = requester.take_attempt_diagnostics();
+    let purpose = sink.purpose;
+    let (outcome, error, malformed) = match settle {
+        AttemptSettle::Cancelled => (crate::ProviderAttemptOutcome::Cancelled, None, false),
+        AttemptSettle::Error(error) => (crate::ProviderAttemptOutcome::Failed, Some(*error), false),
+        AttemptSettle::Stream {
+            events,
+            partial_error,
+            tool_round_used,
+        } => {
+            let (outcome, error) = stream_attempt_settle(events, *partial_error, *tool_round_used);
+            let malformed =
+                matches!(outcome, crate::ProviderAttemptOutcome::Failed) && error.is_none();
+            (outcome, error, malformed)
+        }
+    };
+    let mut fields = attempt_error_fields(error);
+    if malformed {
+        fields.kind = Some(ProviderErrorKind::MalformedStream);
+        fields.classification_source = Some(crate::ClassificationSource::Variant);
+    }
+    if matches!(outcome, crate::ProviderAttemptOutcome::Cancelled) {
+        fields.kind = None;
+        fields.classification_source = None;
+    }
+    sink.record(
+        request.turn_id.clone(),
+        crate::ProviderAttemptSummary {
+            purpose,
+            attempt_sequence: *context.attempt_sequence,
+            retry_index: u8::try_from(retry_index).unwrap_or(u8::MAX),
+            outcome,
+            error_kind: fields.kind,
+            classification_source: fields.classification_source,
+            error_variant: fields.variant,
+            status_code: fields.status_code,
+            provider_code: fields.provider_code,
+            timeout_phase: fields.timeout_phase,
+            retry_after_ms: fields.retry_after_ms,
+            next_delay_ms,
+            started_at_ms: start.at_ms,
+            duration_ms: u64::try_from(start.instant.elapsed().as_millis()).unwrap_or(u64::MAX),
+            first_event_ms: diagnostics.first_event_ms,
+            provider_request_id: diagnostics.provider_request_id,
+            model: request.model.model.clone(),
+            capture: diagnostics.capture,
+        },
+    );
+}
+
 /// Issue a provider request, retrying transient failures with backoff and
 /// a visible status per attempt. Non-transient errors return immediately.
 async fn provider_request_with_retry_context<Requester>(
     requester: &mut Requester,
     initial_request: &ProviderRequest,
-    context: ProviderRetryContext<'_>,
+    mut context: ProviderRetryContext<'_>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError>
 where
     Requester: ProviderRequester,
@@ -5952,8 +6150,8 @@ where
     let mut request = initial_request.clone();
     let mut completed_prefix = Vec::new();
     let mut completed_output = Vec::new();
-    let mut retry_index = 0;
-    let mut delay_spent_ms = 0;
+    let mut retry_index = 0_usize;
+    let mut delay_spent_ms = 0_u64;
     let mut pending_reset = None;
     let mut prefix_resume_active = false;
     *context.attempt_sequence = context.attempt_sequence.saturating_add(1).max(1);
@@ -5970,12 +6168,13 @@ where
         let live_bytes_baseline = context
             .live
             .map_or(0, crate::rig_adapter::LiveDeltaSink::byte_count);
+        let mut start: Option<AttemptStart> = None;
         let attempt = tokio::select! {
             biased;
             () = context.cancellation.cancelled() => {
-                return Err(ProviderError::cancelled(
+                Err(ProviderError::cancelled(
                     "native provider prompt cancelled during attempt"
-                ));
+                ))
             }
             result = async {
                 if let Some((attempt_sequence, discarded_utf8_bytes)) = pending_reset.take()
@@ -5992,15 +6191,56 @@ where
                         "native provider prompt reset delivery failed",
                     ));
                 }
+                start = Some(AttemptStart {
+                    instant: Instant::now(),
+                    at_ms: crate::unix_ms_now().unwrap_or(0),
+                });
+                if let Some(sink) = context.attempts.as_ref() {
+                    requester.begin_attempt(AttemptLabel {
+                        session_id: sink.session_id.clone(),
+                        turn_id: request.turn_id.clone(),
+                        purpose: sink.purpose,
+                        attempt_sequence: *context.attempt_sequence,
+                    });
+                }
                 mark_turn(context.trace, &request.turn_id, "provider_request_sent");
                 requester
                     .request_attempt_streaming(request.clone(), context.live.cloned())
                     .await
             } => result,
         };
+        let started = start;
+        let settle = |requester: &mut Requester,
+                      context: &mut ProviderRetryContext<'_>,
+                      request: &ProviderRequest,
+                      settle: &AttemptSettle<'_>,
+                      next_delay_ms: Option<u64>| {
+            if let Some(start) = started {
+                settle_attempt(
+                    context,
+                    requester,
+                    request,
+                    start,
+                    settle,
+                    retry_index,
+                    next_delay_ms,
+                );
+            }
+        };
 
         let (error, retry_request, visible_restart) = match attempt {
             Ok(ProviderStreamAttempt::Complete(events)) => {
+                settle(
+                    requester,
+                    &mut context,
+                    &request,
+                    &AttemptSettle::Stream {
+                        events: &events,
+                        partial_error: None,
+                        tool_round_used: false,
+                    },
+                    None,
+                );
                 return Ok(finish_provider_retry_events(
                     &mut completed_prefix,
                     &mut completed_output,
@@ -6016,6 +6256,17 @@ where
                     .iter()
                     .any(|event| matches!(event, ProviderStreamEvent::Completed { .. }))
                 {
+                    settle(
+                        requester,
+                        &mut context,
+                        &request,
+                        &AttemptSettle::Stream {
+                            events: &events,
+                            partial_error: Some(&error),
+                            tool_round_used: true,
+                        },
+                        None,
+                    );
                     return Ok(finish_provider_retry_events(
                         &mut completed_prefix,
                         &mut completed_output,
@@ -6026,23 +6277,36 @@ where
                     ProviderStreamEvent::ToolCallCompleted { turn_id, .. } => Some(turn_id.clone()),
                     _ => None,
                 }) {
-                    if !tool_round_complete
-                        || error.metadata.hard_non_retryable_status()
-                        || !provider_error_is_transient(error.kind)
-                    {
-                        return Err(error);
+                    let used = tool_round_complete
+                        && !error.metadata.hard_non_retryable_status()
+                        && provider_error_is_transient(error.kind);
+                    if used {
+                        events.push(ProviderStreamEvent::Completed {
+                            turn_id,
+                            finish_reason: Some(ProviderFinishReason::ToolCalls),
+                            usage: None,
+                            provider_response_id: None,
+                        });
                     }
-                    events.push(ProviderStreamEvent::Completed {
-                        turn_id,
-                        finish_reason: Some(ProviderFinishReason::ToolCalls),
-                        usage: None,
-                        provider_response_id: None,
-                    });
-                    return Ok(finish_provider_retry_events(
-                        &mut completed_prefix,
-                        &mut completed_output,
-                        events,
-                    ));
+                    settle(
+                        requester,
+                        &mut context,
+                        &request,
+                        &AttemptSettle::Stream {
+                            events: &events,
+                            partial_error: Some(&error),
+                            tool_round_used: used,
+                        },
+                        None,
+                    );
+                    if used {
+                        return Ok(finish_provider_retry_events(
+                            &mut completed_prefix,
+                            &mut completed_output,
+                            events,
+                        ));
+                    }
+                    return Err(error);
                 }
                 let supports_prefix_resume = requester.supports_prefix_resume(&request);
                 let retry_request = provider_retry_request_with_completed_prefix(
@@ -6055,6 +6319,17 @@ where
                         .live
                         .is_some_and(|sink| sink.count() > live_count_baseline);
                 if visible_restart && !context.reset_negotiated {
+                    settle(
+                        requester,
+                        &mut context,
+                        &request,
+                        &AttemptSettle::Stream {
+                            events: &events,
+                            partial_error: Some(&error),
+                            tool_round_used: false,
+                        },
+                        None,
+                    );
                     return Err(error);
                 }
                 if let Some(next_request) = retry_request.as_ref() {
@@ -6077,9 +6352,32 @@ where
                 }
                 (error, retry_request, visible_restart)
             }
-            Err(error) => (error, None, false),
+            Err(error) => {
+                if started.is_none() {
+                    return Err(error);
+                }
+                if error.kind == ProviderErrorKind::Cancelled {
+                    settle(
+                        requester,
+                        &mut context,
+                        &request,
+                        &AttemptSettle::Cancelled,
+                        None,
+                    );
+                    return Err(error);
+                }
+                (error, None, false)
+            }
         };
 
+        let next_delay_ms = provider_retry_delay_ms(&error, retry_index, delay_spent_ms);
+        settle(
+            requester,
+            &mut context,
+            &request,
+            &AttemptSettle::Error(&error),
+            next_delay_ms,
+        );
         wait_for_provider_retry(&error, retry_index, &mut delay_spent_ms, &context).await?;
         retry_index += 1;
         *context.attempt_sequence = context.attempt_sequence.saturating_add(1).max(1);
@@ -6126,6 +6424,7 @@ where
             session_id: "test",
             attempt_sequence: &mut attempt_sequence,
             trace: None,
+            attempts: None,
         },
     )
     .await
@@ -6436,7 +6735,10 @@ where
     let Some(cut) = crate::select_compaction_cut(run.log, run.config.keep_recent_tokens) else {
         return Ok(CompactionApplication::NotApplied);
     };
-    let previous = crate::newest_compaction_checkpoint(run.log);
+    let previous_summary =
+        crate::newest_compaction_checkpoint(run.log).map(|view| view.summary.to_owned());
+    let previous_details =
+        crate::newest_compaction_checkpoint(run.log).map(|view| view.details.clone());
     let mut mask_map = crate::masked_result_map(&run.log.events);
     mask_map.extend(crate::masked_result_map(&staged_masks));
     let preparation = crate::CompactionPreparation {
@@ -6444,8 +6746,8 @@ where
             &run.log.events[cut.fold_range.clone()],
             &mask_map,
         ),
-        previous_summary: previous.as_ref().map(|view| view.summary.to_owned()),
-        previous_details: previous.as_ref().map(|view| view.details.clone()),
+        previous_summary: previous_summary.clone(),
+        previous_details: previous_details.clone(),
         first_kept_entry_id: cut.first_kept_entry_id.clone(),
         tokens_before: pre_mask_estimate,
         reason: run.reason,
@@ -6460,14 +6762,56 @@ where
         *attempt_sequence = attempt_sequence.saturating_add(1).max(1);
     }
     let native = if native_selected {
-        match tokio::select! {
+        let native_start = AttemptStart {
+            instant: Instant::now(),
+            at_ms: crate::unix_ms_now().unwrap_or(0),
+        };
+        let native_outcome = tokio::select! {
             () = run.cancellation.cancelled() => {
+                record_native_compaction_attempt(
+                    &mut AttemptSink {
+                        session_id: run.session_id,
+                        purpose: crate::ProviderAttemptPurpose::CompactionNative,
+                        log: &mut *run.log,
+                        pending_events: &mut *run.pending_events,
+                        store: run.tool_event_store,
+                    },
+                    run.turn_id,
+                    run.model,
+                    *attempt_sequence,
+                    native_start,
+                    NativeAttemptSettle::Cancelled,
+                );
                 return Err(ProviderRoundError::Cancelled(String::from(
                     "native provider prompt cancelled",
                 )));
             }
             outcome = compactor.compact(preparation.clone()) => outcome,
-        } {
+        };
+        let settle = match &native_outcome {
+            Ok(outcome) if crate::native_window_is_replayable(&outcome.artifact.window) => {
+                NativeAttemptSettle::Succeeded
+            }
+            Ok(_) => NativeAttemptSettle::Malformed,
+            Err(error) => native_attempt_settle(error),
+        };
+        if !matches!(settle, NativeAttemptSettle::NotAttempted) {
+            record_native_compaction_attempt(
+                &mut AttemptSink {
+                    session_id: run.session_id,
+                    purpose: crate::ProviderAttemptPurpose::CompactionNative,
+                    log: &mut *run.log,
+                    pending_events: &mut *run.pending_events,
+                    store: run.tool_event_store,
+                },
+                run.turn_id,
+                run.model,
+                *attempt_sequence,
+                native_start,
+                settle,
+            );
+        }
+        match native_outcome {
             Ok(outcome) if crate::native_window_is_replayable(&outcome.artifact.window) => {
                 Some(outcome)
             }
@@ -6510,7 +6854,7 @@ where
         None
     };
     let mut details = crate::merge_compaction_file_details(
-        previous.as_ref().map(|view| view.details),
+        previous_details.as_ref(),
         &run.log.events[cut.fold_range.clone()],
     );
     if let Some(object) = details.as_object_mut() {
@@ -6572,6 +6916,13 @@ where
             session_id: "compaction",
             attempt_sequence,
             trace: None,
+            attempts: Some(AttemptSink {
+                session_id: run.session_id,
+                purpose: crate::ProviderAttemptPurpose::CompactionSummary,
+                log: &mut *run.log,
+                pending_events: &mut *run.pending_events,
+                store: run.tool_event_store,
+            }),
         },
     )
     .await
@@ -7058,6 +7409,96 @@ fn commit_native_replay_round(
     state.input.extend(raw_output);
     state.input.extend(tool_outputs);
     state.synced_event_count = synced_event_count;
+}
+
+#[derive(Clone, Copy)]
+enum NativeAttemptSettle {
+    Succeeded,
+    Malformed,
+    Failed {
+        kind: ProviderErrorKind,
+        status_code: Option<u16>,
+    },
+    Cancelled,
+    NotAttempted,
+}
+
+fn native_attempt_settle(error: &crate::CompactionError) -> NativeAttemptSettle {
+    match error {
+        crate::CompactionError::UnsupportedProvider { .. }
+        | crate::CompactionError::MissingNativeRequest => NativeAttemptSettle::NotAttempted,
+        crate::CompactionError::Timeout => NativeAttemptSettle::Failed {
+            kind: ProviderErrorKind::Timeout,
+            status_code: None,
+        },
+        crate::CompactionError::Transport => NativeAttemptSettle::Failed {
+            kind: ProviderErrorKind::Network,
+            status_code: None,
+        },
+        crate::CompactionError::HttpStatus { status } => NativeAttemptSettle::Failed {
+            kind: crate::error_dialect::generic_status_kind(Some(*status))
+                .unwrap_or(ProviderErrorKind::Unknown),
+            status_code: Some(*status),
+        },
+        crate::CompactionError::Decode | crate::CompactionError::InvalidOutput => {
+            NativeAttemptSettle::Malformed
+        }
+    }
+}
+
+fn record_native_compaction_attempt(
+    sink: &mut AttemptSink<'_>,
+    turn_id: &TurnId,
+    model: &ProviderModel,
+    attempt_sequence: u64,
+    start: AttemptStart,
+    settle: NativeAttemptSettle,
+) {
+    let (outcome, error_kind, status_code) = match settle {
+        NativeAttemptSettle::Succeeded => (crate::ProviderAttemptOutcome::Succeeded, None, None),
+        NativeAttemptSettle::Malformed => (
+            crate::ProviderAttemptOutcome::Failed,
+            Some(ProviderErrorKind::MalformedStream),
+            None,
+        ),
+        NativeAttemptSettle::Failed { kind, status_code } => (
+            crate::ProviderAttemptOutcome::Failed,
+            Some(kind),
+            status_code,
+        ),
+        NativeAttemptSettle::Cancelled => (crate::ProviderAttemptOutcome::Cancelled, None, None),
+        NativeAttemptSettle::NotAttempted => return,
+    };
+    let classification_source = error_kind.map(|_| {
+        if status_code.is_some() {
+            crate::ClassificationSource::Status
+        } else {
+            crate::ClassificationSource::Variant
+        }
+    });
+    sink.record(
+        turn_id.clone(),
+        crate::ProviderAttemptSummary {
+            purpose: crate::ProviderAttemptPurpose::CompactionNative,
+            attempt_sequence,
+            retry_index: 0,
+            outcome,
+            error_kind,
+            classification_source,
+            error_variant: None,
+            status_code,
+            provider_code: None,
+            timeout_phase: None,
+            retry_after_ms: None,
+            next_delay_ms: None,
+            started_at_ms: start.at_ms,
+            duration_ms: u64::try_from(start.instant.elapsed().as_millis()).unwrap_or(u64::MAX),
+            first_event_ms: None,
+            provider_request_id: None,
+            model: model.model.clone(),
+            capture: None,
+        },
+    );
 }
 
 const fn native_compaction_error_reason(error: &crate::CompactionError) -> &'static str {
@@ -14031,6 +14472,7 @@ mod tests {
                 | SessionEvent::EditTransactionFinished { .. }
                 | SessionEvent::CompactionCheckpoint { .. }
                 | SessionEvent::ToolResultMasked { .. }
+                | SessionEvent::ProviderAttemptFinished { .. }
                 | SessionEvent::Unknown => None,
             })
             .collect()
@@ -16141,6 +16583,7 @@ mod tests {
                     session_id: "live-reset",
                     attempt_sequence: &mut attempt_sequence,
                     trace: None,
+                    attempts: None,
                 },
             )
             .await;
@@ -16228,6 +16671,7 @@ mod tests {
                 session_id: "live-reset-pretok",
                 attempt_sequence: &mut attempt_sequence,
                 trace: None,
+                attempts: None,
             },
         )
         .await;
@@ -16294,6 +16738,7 @@ mod tests {
                 session_id: "live-reset-closed",
                 attempt_sequence: &mut attempt_sequence,
                 trace: None,
+                attempts: None,
             },
         );
         let close_after_partial = async move {
@@ -16344,6 +16789,7 @@ mod tests {
                 session_id: "retry-cancel",
                 attempt_sequence: &mut attempt_sequence,
                 trace: None,
+                attempts: None,
             },
         );
         let cancel_soon = async move {
@@ -30889,9 +31335,17 @@ manual anchored summary"
 
         assert_eq!(application, Ok(super::CompactionApplication::NotApplied));
         assert_eq!(requester.requests.len(), 1);
-        assert_eq!(log.events, original_events);
+        // The failed summary attempt is evidence and must survive; nothing else may.
+        assert_eq!(without_attempt_events(&log.events), original_events);
+        assert_eq!(attempt_events(&log).len(), 1);
         assert!(pending_events.is_empty());
-        assert_eq!(store.load().test_unwrap().events, original_events);
+        let persisted = store.load().test_unwrap().events;
+        assert_eq!(without_attempt_events(&persisted), original_events);
+        assert_eq!(
+            persisted.len(),
+            original_events.len() + 1,
+            "the attempt event is appended directly to the store"
+        );
         let on_disk = std::fs::read_to_string(store_path).test_unwrap();
         assert!(!on_disk.contains("tool_result_masked"));
     }
@@ -32351,8 +32805,20 @@ manual anchored summary"
             2,
             "summary retry never commits native state"
         );
-        assert_eq!(log.events, original_events);
-        assert!(pending_events.is_empty());
+        assert_eq!(without_attempt_events(&log.events), original_events);
+        assert!(
+            pending_events
+                .iter()
+                .all(|event| matches!(event, SessionEvent::ProviderAttemptFinished { .. })),
+            "only attempt evidence may be pending after a rolled-back compaction"
+        );
+        assert_eq!(
+            attempt_events(&log)
+                .iter()
+                .filter(|attempt| attempt.purpose == crate::ProviderAttemptPurpose::CompactionNative)
+                .count(),
+            1
+        );
         assert_eq!(native_replay, Some(original_replay));
         assert!(
             drain_backend_events(&mut review_rx)
@@ -32759,10 +33225,15 @@ manual anchored summary"
                 )
             })
             .test_unwrap();
-        assert_eq!(
-            active.synced_event_count,
-            second_execution_index + 1,
+        assert!(
+            active.synced_event_count > second_execution_index,
             "the replay cursor lands after both persisted tool executions"
+        );
+        assert!(
+            log.events[second_execution_index + 1..active.synced_event_count]
+                .iter()
+                .all(|event| matches!(event, SessionEvent::ProviderAttemptFinished { .. })),
+            "the cursor may only skip attempt evidence, which carries no provider messages"
         );
     }
 
@@ -34315,5 +34786,895 @@ manual anchored summary"
             super::shell_disposition_for_hold(&crate::HoldReason::SignificantRisk),
             super::ShellHoldDisposition::AskUser(Some(yach_proto::ReviewOrigin::Risk))
         );
+    }
+
+    struct ScriptedAttemptRequester {
+        attempts: VecDeque<Result<ProviderStreamAttempt, ProviderError>>,
+        requests: Vec<ProviderRequest>,
+        begun: Vec<super::AttemptLabel>,
+        diagnostics: VecDeque<super::AttemptDiagnostics>,
+        diagnostics_takes: usize,
+        hang: bool,
+    }
+
+    impl ScriptedAttemptRequester {
+        fn from_attempts(
+            attempts: impl IntoIterator<Item = Result<ProviderStreamAttempt, ProviderError>>,
+        ) -> Self {
+            Self {
+                attempts: attempts.into_iter().collect(),
+                requests: Vec::new(),
+                begun: Vec::new(),
+                diagnostics: VecDeque::new(),
+                diagnostics_takes: 0,
+                hang: false,
+            }
+        }
+    }
+
+    impl ProviderRequester for ScriptedAttemptRequester {
+        fn request(
+            &mut self,
+            _request: ProviderRequest,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>
+        {
+            Box::pin(async { Err(ProviderError::fixture_failure()) })
+        }
+
+        fn request_attempt_streaming(
+            &mut self,
+            request: ProviderRequest,
+            _live: Option<crate::rig_adapter::LiveDeltaSink>,
+        ) -> futures::future::BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>> {
+            self.requests.push(request);
+            if self.hang {
+                return Box::pin(std::future::pending());
+            }
+            let attempt = self
+                .attempts
+                .pop_front()
+                .unwrap_or_else(|| Err(ProviderError::fixture_failure()));
+            Box::pin(async move { attempt })
+        }
+
+        fn begin_attempt(&mut self, label: super::AttemptLabel) {
+            self.begun.push(label);
+        }
+
+        fn take_attempt_diagnostics(&mut self) -> super::AttemptDiagnostics {
+            self.diagnostics_takes = self.diagnostics_takes.saturating_add(1);
+            self.diagnostics.pop_front().unwrap_or_default()
+        }
+    }
+
+    fn attempt_fixture_request(turn_id: &str) -> ProviderRequest {
+        ProviderRequest {
+            turn_id: TurnId(String::from(turn_id)),
+            model: ProviderModel {
+                provider: String::from("anthropic"),
+                model: String::from("claude-fixture"),
+            },
+            messages: vec![ProviderMessage::text(Role::User, String::from("attempt"))],
+            extensions: Vec::new(),
+            native_request: None,
+            approved_tool_advertising: None,
+        }
+    }
+
+    fn attempt_started(turn_id: &TurnId) -> ProviderStreamEvent {
+        ProviderStreamEvent::Started {
+            turn_id: turn_id.clone(),
+            model: ProviderModel {
+                provider: String::from("anthropic"),
+                model: String::from("claude-fixture"),
+            },
+        }
+    }
+
+    fn attempt_completed(turn_id: &TurnId) -> ProviderStreamEvent {
+        ProviderStreamEvent::Completed {
+            turn_id: turn_id.clone(),
+            finish_reason: Some(ProviderFinishReason::Stop),
+            usage: None,
+            provider_response_id: None,
+        }
+    }
+
+    fn attempt_error(kind: ProviderErrorKind, message: &str) -> ProviderError {
+        ProviderError {
+            kind,
+            message: String::from(message),
+            redacted_debug: None,
+            metadata: crate::ProviderErrorMetadata::default(),
+        }
+    }
+
+    fn without_attempt_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
+        events
+            .iter()
+            .filter(|event| !matches!(event, SessionEvent::ProviderAttemptFinished { .. }))
+            .cloned()
+            .collect()
+    }
+
+    fn attempt_events(log: &SessionLog) -> Vec<crate::ProviderAttemptSummary> {
+        log.events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ProviderAttemptFinished { attempt, .. } => Some(attempt.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn record_provider_attempts(
+        requester: &mut ScriptedAttemptRequester,
+        request: &ProviderRequest,
+        attempt_sequence: &mut u64,
+        cancellation: &CancellationToken,
+        store: Option<&JsonlSessionStore>,
+    ) -> (
+        Result<Vec<ProviderStreamEvent>, ProviderError>,
+        SessionLog,
+        Vec<SessionEvent>,
+    ) {
+        let session_id = SessionId(String::from("attempt-session"));
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let result = provider_request_with_retry_context(
+            requester,
+            request,
+            ProviderRetryContext {
+                review_tx: &review_tx,
+                live: None,
+                cancellation,
+                reset_negotiated: false,
+                session_id: "attempt-session",
+                attempt_sequence,
+                trace: None,
+                attempts: Some(super::AttemptSink {
+                    session_id: &session_id,
+                    purpose: crate::ProviderAttemptPurpose::Turn,
+                    log: &mut log,
+                    pending_events: &mut pending_events,
+                    store,
+                }),
+            },
+        )
+        .await;
+        (result, log, pending_events)
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_complete_records_one_succeeded_event() {
+        let request = attempt_fixture_request("turn-1");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                ProviderStreamEvent::TextDelta {
+                    turn_id: request.turn_id.clone(),
+                    delta: String::from("secret-delta-complete"),
+                },
+                attempt_completed(&request.turn_id),
+            ]))]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, pending) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_ok());
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].outcome,
+            crate::ProviderAttemptOutcome::Succeeded
+        );
+        assert_eq!(attempts[0].retry_index, 0);
+        assert_eq!(attempts[0].attempt_sequence, 1);
+        assert_eq!(attempts[0].purpose, crate::ProviderAttemptPurpose::Turn);
+        assert_eq!(attempts[0].model, "claude-fixture");
+        assert!(attempts[0].error_kind.is_none());
+        assert!(attempts[0].classification_source.is_none());
+        assert!(attempts[0].error_variant.is_none());
+        assert!(attempts[0].status_code.is_none());
+        assert!(attempts[0].next_delay_ms.is_none());
+        assert!(attempts[0].started_at_ms > 0);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(requester.begun.len(), 1);
+        assert_eq!(requester.begun[0].attempt_sequence, 1);
+        assert_eq!(requester.diagnostics_takes, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_network_partial_then_complete_records_failed_then_succeeded() {
+        let request = attempt_fixture_request("turn-2");
+        let mut requester = ScriptedAttemptRequester::from_attempts([
+            Ok(ProviderStreamAttempt::Partial {
+                tool_round_complete: false,
+                events: vec![attempt_started(&request.turn_id)],
+                error: attempt_error(ProviderErrorKind::Network, "blip"),
+            }),
+            Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                attempt_completed(&request.turn_id),
+            ])),
+        ]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_ok());
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(attempts[0].error_kind, Some(ProviderErrorKind::Network));
+        assert_eq!(
+            attempts[0].classification_source,
+            Some(crate::ClassificationSource::Variant)
+        );
+        assert_eq!(attempts[0].next_delay_ms, Some(1_000));
+        assert_eq!(attempts[0].retry_index, 0);
+        assert_eq!(attempts[0].attempt_sequence, 1);
+        assert_eq!(
+            attempts[1].outcome,
+            crate::ProviderAttemptOutcome::Succeeded
+        );
+        assert_eq!(attempts[1].retry_index, 1);
+        assert_eq!(attempts[1].attempt_sequence, 2);
+        assert!(attempts[1].error_kind.is_none());
+        assert!(attempts[1].next_delay_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_three_internal_failures_record_failed_without_final_delay() {
+        let request = attempt_fixture_request("turn-3");
+        let failure = || {
+            Err(ProviderError {
+                kind: ProviderErrorKind::ProviderInternal,
+                message: String::from("down"),
+                redacted_debug: None,
+                metadata: crate::ProviderErrorMetadata {
+                    classification_source: crate::ClassificationSource::Status,
+                    error_variant: Some("provider"),
+                    status_code: Some(500),
+                    ..crate::ProviderErrorMetadata::default()
+                },
+            })
+        };
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([failure(), failure(), failure()]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_err());
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 3);
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| attempt.outcome == crate::ProviderAttemptOutcome::Failed)
+        );
+        assert_eq!(
+            attempts[2].error_kind,
+            Some(ProviderErrorKind::ProviderInternal)
+        );
+        assert_eq!(
+            attempts[2].classification_source,
+            Some(crate::ClassificationSource::Status)
+        );
+        assert_eq!(attempts[2].error_variant.as_deref(), Some("provider"));
+        assert_eq!(attempts[2].status_code, Some(500));
+        assert_eq!(attempts[0].next_delay_ms, Some(1_000));
+        assert_eq!(attempts[1].next_delay_ms, Some(2_000));
+        assert!(attempts[2].next_delay_ms.is_none());
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.attempt_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_complete_with_failed_event_records_failed() {
+        let request = attempt_fixture_request("turn-4");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                ProviderStreamEvent::Failed {
+                    turn_id: request.turn_id.clone(),
+                    error: attempt_error(ProviderErrorKind::RateLimited, "slow down"),
+                },
+            ]))]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_ok());
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(attempts[0].error_kind, Some(ProviderErrorKind::RateLimited));
+        assert_ne!(
+            attempts[0].outcome,
+            crate::ProviderAttemptOutcome::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_complete_without_completed_event_is_malformed() {
+        let request = attempt_fixture_request("turn-5");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                ProviderStreamEvent::TextDelta {
+                    turn_id: request.turn_id.clone(),
+                    delta: String::from("secret-delta-malformed"),
+                },
+            ]))]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_ok());
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(
+            attempts[0].error_kind,
+            Some(ProviderErrorKind::MalformedStream)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_used_complete_tool_round_records_partial() {
+        let request = attempt_fixture_request("turn-5a");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Partial {
+                tool_round_complete: true,
+                events: vec![
+                    attempt_started(&request.turn_id),
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: request.turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-prefix"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path":"note.txt"}),
+                        },
+                    },
+                ],
+                error: attempt_error(ProviderErrorKind::Network, "after tool round"),
+            })]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_ok());
+        let Ok(events) = result else {
+            return;
+        };
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Completed {
+                finish_reason: Some(ProviderFinishReason::ToolCalls),
+                ..
+            })
+        ));
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Partial);
+        assert_eq!(attempts[0].error_kind, Some(ProviderErrorKind::Network));
+        assert_eq!(
+            attempts[0].classification_source,
+            Some(crate::ClassificationSource::Variant)
+        );
+        assert!(attempts[0].next_delay_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_direct_error_records_failed_before_returning() {
+        let request = attempt_fixture_request("turn-6");
+        let mut requester = ScriptedAttemptRequester::from_attempts([Err(attempt_error(
+            ProviderErrorKind::Authentication,
+            "no key",
+        ))]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let started = Instant::now();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(
+            result,
+            Err(error) if error.kind == ProviderErrorKind::Authentication
+        ));
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(
+            attempts[0].error_kind,
+            Some(ProviderErrorKind::Authentication)
+        );
+        assert!(attempts[0].next_delay_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_cancellation_during_attempt_records_cancelled() {
+        let request = attempt_fixture_request("turn-7");
+        let mut requester = ScriptedAttemptRequester::from_attempts([]);
+        requester.hang = true;
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let retry =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None);
+        let cancel_soon = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+        };
+        let ((result, log, _), ()) = tokio::join!(retry, cancel_soon);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.kind == ProviderErrorKind::Cancelled
+        ));
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].outcome,
+            crate::ProviderAttemptOutcome::Cancelled
+        );
+        assert!(attempts[0].error_kind.is_none());
+        assert_eq!(requester.requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_cancellation_during_retry_delay_records_only_started_attempt() {
+        let request = attempt_fixture_request("turn-8");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Partial {
+                tool_round_complete: false,
+                events: Vec::new(),
+                error: attempt_error(ProviderErrorKind::Network, "interrupted"),
+            })]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let retry =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None);
+        let cancel_soon = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        };
+        let ((result, log, _), ()) = tokio::join!(retry, cancel_soon);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.kind == ProviderErrorKind::Cancelled
+        ));
+        assert_eq!(requester.requests.len(), 1);
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(attempts[0].error_kind, Some(ProviderErrorKind::Network));
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_sequences_increase_across_shared_counter_calls() {
+        let request = attempt_fixture_request("turn-9");
+        let complete = || {
+            Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                attempt_completed(&request.turn_id),
+            ]))
+        };
+        let mut requester = ScriptedAttemptRequester::from_attempts([complete(), complete()]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (first, first_log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+        let (second, second_log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        let first_sequence = attempt_events(&first_log)[0].attempt_sequence;
+        let second_sequence = attempt_events(&second_log)[0].attempt_sequence;
+        assert!(second_sequence > first_sequence);
+        assert_eq!(first_sequence, 1);
+        assert_eq!(second_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_events_omit_scripted_text() {
+        let request = attempt_fixture_request("turn-10");
+        let secret = "secret-delta-must-not-leak";
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                ProviderStreamEvent::TextDelta {
+                    turn_id: request.turn_id.clone(),
+                    delta: String::from(secret),
+                },
+                attempt_completed(&request.turn_id),
+            ]))]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (_, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        let recorded = log
+            .events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ProviderAttemptFinished { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the completed attempt must be recorded before its text can be checked"
+        );
+        let encoded = serde_json::to_string(recorded[0]).test_unwrap();
+        assert!(
+            !encoded.contains(secret),
+            "attempt evidence must not carry stream text"
+        );
+    }
+    #[tokio::test]
+    async fn provider_attempt_completed_then_stream_error_records_partial() {
+        let request = attempt_fixture_request("turn-12");
+        let trailing = attempt_error(ProviderErrorKind::Network, "stream stalled after final");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Partial {
+                events: vec![
+                    attempt_started(&request.turn_id),
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: request.turn_id.clone(),
+                        delta: String::from("accepted response"),
+                    },
+                    attempt_completed(&request.turn_id),
+                ],
+                error: trailing,
+                tool_round_complete: false,
+            })]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(
+            result.is_ok(),
+            "a completed response is accepted despite the trailing stream error"
+        );
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Partial);
+        assert_eq!(
+            attempts[0].error_kind,
+            Some(ProviderErrorKind::Network),
+            "the accepted result keeps the trailing error instead of settling as succeeded"
+        );
+        assert!(attempts[0].classification_source.is_some());
+        assert_eq!(attempts[0].retry_index, 0);
+        assert_eq!(attempts[0].attempt_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_store_persists_failure_without_flushing_pending() {
+        let request = attempt_fixture_request("turn-11");
+        let mut requester = ScriptedAttemptRequester::from_attempts([Err(attempt_error(
+            ProviderErrorKind::Authentication,
+            "down",
+        ))]);
+        let path = std::env::temp_dir().join(format!(
+            "yach-provider-attempt-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = JsonlSessionStore::new(path.clone());
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, pending) = record_provider_attempts(
+            &mut requester,
+            &request,
+            &mut sequence,
+            &cancellation,
+            Some(&store),
+        )
+        .await;
+        let loaded = SessionLog::load_from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err());
+        assert!(pending.is_empty());
+        assert_eq!(attempt_events(&log).len(), 1);
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else {
+            return;
+        };
+        assert_eq!(loaded.events, log.events);
+        assert!(matches!(
+            loaded.events.as_slice(),
+            [SessionEvent::ProviderAttemptFinished {
+                attempt: crate::ProviderAttemptSummary {
+                    outcome: crate::ProviderAttemptOutcome::Failed,
+                    ..
+                },
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_portable_summary_records_compaction_summary() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let mut log = masking_fixture_log("old body");
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("portable summary"))]);
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                provider: &provider_test_config(),
+                native_request: None,
+                native_replay: &mut native_replay,
+                config: &masking_fixture_config("summary"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 51_000,
+                usable_tokens: 10_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Summary));
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].purpose,
+            crate::ProviderAttemptPurpose::CompactionSummary
+        );
+        assert_eq!(
+            attempts[0].outcome,
+            crate::ProviderAttemptOutcome::Succeeded
+        );
+        assert_eq!(attempts[0].attempt_sequence, 1);
+        assert_eq!(attempts[0].model, "fixture-model");
+    }
+
+    struct HangingCompactor {
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::Compactor for HangingCompactor {
+        fn compact(&self, _preparation: crate::CompactionPreparation) -> crate::CompactionFuture {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    async fn run_native_attempt_compaction(
+        cancellation: CancellationToken,
+        compactor: &dyn crate::Compactor,
+    ) -> (
+        Result<super::CompactionApplication, ProviderRoundError>,
+        SessionLog,
+    ) {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let mut log = masking_fixture_log("native body");
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("portable summary"))]);
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation,
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &model,
+                provider: &provider,
+                native_request: Some(native_compaction_fixture_request()),
+                native_replay: &mut native_replay,
+                config: &masking_fixture_config("openai-responses"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 51_000,
+                usable_tokens: 10_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            compactor,
+        )
+        .await;
+        (application, log)
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_native_success_records_compaction_native() {
+        let (application, log) = run_native_attempt_compaction(
+            CancellationToken::new(),
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Native));
+        let native: Vec<_> = attempt_events(&log)
+            .into_iter()
+            .filter(|attempt| attempt.purpose == crate::ProviderAttemptPurpose::CompactionNative)
+            .collect();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].outcome, crate::ProviderAttemptOutcome::Succeeded);
+        assert!(native[0].error_kind.is_none());
+        assert!(native[0].status_code.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_native_http_status_records_failed_with_status() {
+        let (application, log) = run_native_attempt_compaction(
+            CancellationToken::new(),
+            &FixtureCompactor::new(Err(crate::CompactionError::HttpStatus { status: 503 })),
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Summary));
+        let native: Vec<_> = attempt_events(&log)
+            .into_iter()
+            .filter(|attempt| attempt.purpose == crate::ProviderAttemptPurpose::CompactionNative)
+            .collect();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(native[0].status_code, Some(503));
+        assert_eq!(
+            native[0].error_kind,
+            Some(ProviderErrorKind::ProviderInternal)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_native_cancellation_records_cancelled() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let compactor = HangingCompactor {
+            started: Arc::clone(&started),
+        };
+        let run = run_native_attempt_compaction(cancellation, &compactor);
+        let cancel_soon = async move {
+            while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel.cancel();
+        };
+        let ((application, log), ()) = tokio::join!(run, cancel_soon);
+
+        assert!(matches!(application, Err(ProviderRoundError::Cancelled(_))));
+        let native: Vec<_> = attempt_events(&log)
+            .into_iter()
+            .filter(|attempt| attempt.purpose == crate::ProviderAttemptPurpose::CompactionNative)
+            .collect();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].outcome, crate::ProviderAttemptOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_failed_summary_persists_and_advances_turn_index() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-9"));
+        let mut log = masking_fixture_log("old body");
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester = FakeProviderRequester::with_responses([Err(attempt_error(
+            ProviderErrorKind::ProviderInternal,
+            "summarizer down",
+        ))]);
+        let path = std::env::temp_dir().join(format!(
+            "yach-compaction-attempt-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = JsonlSessionStore::new(path.clone());
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                provider: &provider_test_config(),
+                native_request: None,
+                native_replay: &mut native_replay,
+                config: &masking_fixture_config("summary"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 51_000,
+                usable_tokens: 10_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: Some(&store),
+                review_tx: &review_tx,
+            },
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        )
+        .await;
+        let loaded = SessionLog::load_from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(application, Ok(super::CompactionApplication::NotApplied));
+        assert!(
+            !pending_events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ProviderAttemptFinished { .. }))
+        );
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else {
+            return;
+        };
+        assert!(loaded.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ProviderAttemptFinished {
+                attempt: crate::ProviderAttemptSummary {
+                    purpose: crate::ProviderAttemptPurpose::CompactionSummary,
+                    outcome: crate::ProviderAttemptOutcome::Failed,
+                    ..
+                },
+                ..
+            }
+        )));
+        assert!(loaded.next_turn_index() > 9);
     }
 }

@@ -89,6 +89,7 @@ pub(super) fn send_native_session_messages_from_log(
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::CompactionCheckpoint { .. }
             | SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::ProviderAttemptFinished { .. }
             | SessionEvent::Unknown => {}
         }
     }
@@ -274,6 +275,7 @@ pub(super) fn send_native_session_messages_from_log(
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
             | SessionEvent::SessionModelChanged { .. }
+            | SessionEvent::ProviderAttemptFinished { .. }
             | SessionEvent::Unknown => None,
         })
         .collect();
@@ -364,6 +366,7 @@ pub(super) fn send_native_session_stats_with_estimate(
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::CompactionCheckpoint { .. }
             | SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::ProviderAttemptFinished { .. }
             | SessionEvent::Unknown => None,
         })
         .collect::<Vec<_>>();
@@ -586,6 +589,7 @@ fn session_first_message(path: &Path) -> Option<String> {
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::CompactionCheckpoint { .. }
             | SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::ProviderAttemptFinished { .. }
             | SessionEvent::Unknown => None,
         })
 }

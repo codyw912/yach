@@ -314,6 +314,62 @@ pub enum EditEvidenceOutcome {
     Failed,
 }
 
+/// Why a provider attempt was issued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAttemptPurpose {
+    Turn,
+    CompactionSummary,
+    CompactionNative,
+}
+
+/// How a started provider attempt settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAttemptOutcome {
+    Succeeded,
+    Partial,
+    Failed,
+    Cancelled,
+}
+
+/// Secret-free record of one started provider attempt.
+///
+/// Flattened into `SessionEvent::ProviderAttemptFinished` so JSONL keeps
+/// `purpose` and `attempt_sequence` at the top level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAttemptSummary {
+    pub purpose: ProviderAttemptPurpose,
+    pub attempt_sequence: u64,
+    pub retry_index: u8,
+    pub outcome: ProviderAttemptOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<crate::ProviderErrorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification_source: Option<crate::ClassificationSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_phase: Option<crate::TimeoutPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_delay_ms: Option<u64>,
+    pub started_at_ms: u64,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_event_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+}
+
 /// Append-only native session event record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -482,6 +538,14 @@ pub enum SessionEvent {
         grant_id: BoundedReviewText,
         action_fingerprint: BoundedReviewText,
         expires: GrantExpiry,
+    },
+    /// One started provider attempt settled. Flattened so identity fields
+    /// stay top-level in the JSONL line.
+    ProviderAttemptFinished {
+        session_id: SessionId,
+        turn_id: TurnId,
+        #[serde(flatten)]
+        attempt: ProviderAttemptSummary,
     },
     /// A line whose `type` this build does not know. Loaded, never written.
     #[serde(other)]
@@ -653,6 +717,7 @@ impl SessionLog {
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::CompactionCheckpoint { .. }
             | SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::ProviderAttemptFinished { .. }
             | SessionEvent::Unknown => None,
         })
     }
@@ -708,6 +773,7 @@ impl SessionLog {
                 | SessionEvent::EditTransactionFinished { .. }
                 | SessionEvent::CompactionCheckpoint { .. }
                 | SessionEvent::ToolResultMasked { .. }
+                | SessionEvent::ProviderAttemptFinished { .. }
                 | SessionEvent::Unknown => None,
             })
             .collect()
@@ -897,7 +963,8 @@ fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
         | SessionEvent::EditTransactionPrepared { turn_id, .. }
         | SessionEvent::EditTransactionFinished { turn_id, .. }
         | SessionEvent::CompactionCheckpoint { turn_id, .. }
-        | SessionEvent::ToolResultMasked { turn_id, .. } => Some(turn_id),
+        | SessionEvent::ToolResultMasked { turn_id, .. }
+        | SessionEvent::ProviderAttemptFinished { turn_id, .. } => Some(turn_id),
         SessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
         SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::ApprovalModeChanged { .. }
@@ -1288,5 +1355,86 @@ mod tests {
         assert!(values.iter().all(|value| {
             value.get("type").and_then(serde_json::Value::as_str) != Some("unknown")
         }));
+    }
+
+    #[test]
+    fn provider_attempt_finished_round_trips_flattened_and_keeps_turn_id() {
+        let event = SessionEvent::ProviderAttemptFinished {
+            session_id: SessionId(String::from("s")),
+            turn_id: TurnId(String::from("turn-4")),
+            attempt: ProviderAttemptSummary {
+                purpose: ProviderAttemptPurpose::CompactionSummary,
+                attempt_sequence: 7,
+                retry_index: 1,
+                outcome: ProviderAttemptOutcome::Failed,
+                error_kind: Some(crate::ProviderErrorKind::Network),
+                classification_source: Some(crate::ClassificationSource::Variant),
+                error_variant: Some(String::from("http")),
+                status_code: None,
+                provider_code: None,
+                timeout_phase: None,
+                retry_after_ms: None,
+                next_delay_ms: Some(1_000),
+                started_at_ms: 1_700_000_000_000,
+                duration_ms: 42,
+                first_event_ms: None,
+                provider_request_id: None,
+                model: String::from("gpt-fixture"),
+                capture: None,
+            },
+        };
+
+        let line = serde_json::to_string(&event);
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        let value = serde_json::from_str::<serde_json::Value>(&line);
+        assert!(value.is_ok());
+        let Ok(value) = value else {
+            return;
+        };
+        assert_eq!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("provider_attempt_finished")
+        );
+        assert_eq!(
+            value
+                .get("attempt_sequence")
+                .and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            value.get("purpose").and_then(serde_json::Value::as_str),
+            Some("compaction_summary")
+        );
+        assert!(value.get("attempt").is_none());
+        assert_eq!(
+            value
+                .get("classification_source")
+                .and_then(serde_json::Value::as_str),
+            Some("variant")
+        );
+
+        let parsed = serde_json::from_str::<SessionEvent>(&line);
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
+        assert_eq!(parsed, event);
+        assert_eq!(event_turn_id(&event), Some(&TurnId(String::from("turn-4"))));
+
+        let path = test_jsonl_path("provider-attempt");
+        let mut log = SessionLog::default();
+        log.push(event);
+        assert!(log.write_to_file(&path).is_ok());
+        let loaded = SessionLog::load_from_file(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else {
+            return;
+        };
+        assert_eq!(loaded.events, log.events);
+        assert_eq!(loaded.next_turn_index(), 5);
     }
 }

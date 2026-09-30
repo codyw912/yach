@@ -346,6 +346,7 @@ pub fn estimate_event_tokens(event: &SessionEvent) -> u64 {
         | SessionEvent::EditTransactionPrepared { .. }
         | SessionEvent::EditTransactionFinished { .. }
         | SessionEvent::ToolResultMasked { .. }
+        | SessionEvent::ProviderAttemptFinished { .. }
         | SessionEvent::Unknown => 0,
     }
 }
@@ -696,6 +697,7 @@ pub fn serialize_events_for_summary_with_masks<S: std::hash::BuildHasher>(
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::CompactionCheckpoint { .. }
+            | SessionEvent::ProviderAttemptFinished { .. }
             | SessionEvent::Unknown => {}
         }
     }

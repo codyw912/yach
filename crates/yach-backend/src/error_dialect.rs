@@ -168,6 +168,7 @@ pub fn classify_completion_error(
             retry_after_ms,
             timeout_phase: None,
             classification_source: source,
+            error_variant: Some(variant),
         },
     }
 }
@@ -281,7 +282,7 @@ fn retryable_status_kind(status: Option<u16>) -> Option<ProviderErrorKind> {
     }
 }
 
-fn generic_status_kind(status: Option<u16>) -> Option<ProviderErrorKind> {
+pub(crate) fn generic_status_kind(status: Option<u16>) -> Option<ProviderErrorKind> {
     match status {
         Some(401 | 403) => Some(ProviderErrorKind::Authentication),
         Some(429) => Some(ProviderErrorKind::RateLimited),
