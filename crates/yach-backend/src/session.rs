@@ -354,6 +354,13 @@ pub enum SessionEvent {
         /// session tool payload persistence design.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result_content: Option<String>,
+        /// Wall-clock start of the dispatched execution. Absent when the tool
+        /// never started, including logs written before timing was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_ms: Option<u64>,
+        /// Monotonic execution duration. Absent when the tool never started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     TurnFinished {
         session_id: SessionId,
@@ -491,6 +498,58 @@ pub struct SessionLog {
 pub struct SessionLoadResult {
     pub log: SessionLog,
     pub warnings: Vec<SessionLoadWarning>,
+}
+
+/// Source-measured tool execution timing persisted on `ToolExecutionFinished`.
+/// Both fields are `None` when the tool never started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ToolTiming {
+    pub started_at_ms: Option<u64>,
+    pub duration_ms: Option<u64>,
+}
+
+/// Wall-clock start plus a monotonic clock, taken immediately before dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolTimer {
+    started_at_ms: Option<u64>,
+    started: std::time::Instant,
+}
+
+impl ToolTiming {
+    /// Keep this execution's start and add a later phase's duration.
+    /// A review wait between the phases is not included.
+    #[must_use]
+    pub fn including(self, later: Self) -> Self {
+        let duration_ms = match (self.duration_ms, later.duration_ms) {
+            (Some(earlier), Some(later)) => Some(earlier.saturating_add(later)),
+            (Some(duration), None) | (None, Some(duration)) => Some(duration),
+            (None, None) => None,
+        };
+        Self {
+            started_at_ms: self.started_at_ms.or(later.started_at_ms),
+            duration_ms,
+        }
+    }
+}
+
+impl ToolTimer {
+    #[must_use]
+    pub fn start() -> Self {
+        Self {
+            started_at_ms: unix_ms_now(),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    #[must_use]
+    pub fn stop(&self) -> ToolTiming {
+        ToolTiming {
+            started_at_ms: self.started_at_ms,
+            duration_ms: Some(
+                u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            ),
+        }
+    }
 }
 
 /// Wall-clock Unix milliseconds; `None` if the clock is before the epoch.

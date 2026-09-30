@@ -270,6 +270,7 @@ pub fn prepare_agent_edit_tool_request(
             Some(reason),
             Some(result_summary(&result)),
             Some(result.content.clone()),
+            crate::ToolTiming::default(),
         ));
         append_events(sink, &prepare_log.events)?;
         return Ok(AgentEditToolPrepared::Failed { trace_id, result });
@@ -342,6 +343,7 @@ pub fn prepare_agent_edit_tool_request(
                         Some(String::from("permission_denied")),
                         Some(result_summary(&result)),
                         Some(result.content.clone()),
+                        crate::ToolTiming::default(),
                     ));
                     append_events(sink, &prepare_log.events)?;
                     return Ok(AgentEditToolPrepared::Denied { trace_id, result });
@@ -362,6 +364,7 @@ pub fn prepare_agent_edit_tool_request(
                     Some(agent_edit_tool_error_label(&error)),
                     None,
                     None,
+                    crate::ToolTiming::default(),
                 ));
                 append_events(sink, &prepare_log.events)?;
                 return Err(ToolContinuationError::Validation(error));
@@ -460,6 +463,7 @@ pub fn prepare_agent_edit_tool_request(
                     Some(reason),
                     Some(result_summary(&result)),
                     Some(result.content.clone()),
+                    crate::ToolTiming::default(),
                 ));
                 append_events(sink, &prepare_log.events)?;
                 return Ok(AgentEditToolPrepared::Denied { trace_id, result });
@@ -524,6 +528,7 @@ pub fn prepare_agent_edit_tool_request(
                     Some(reason),
                     Some(result_summary(&result)),
                     Some(result.content.clone()),
+                    crate::ToolTiming::default(),
                 ));
                 append_events(sink, &prepare_log.events)?;
                 return Ok(AgentEditToolPrepared::Failed { trace_id, result });
@@ -546,7 +551,13 @@ pub fn prepare_agent_edit_tool_request(
                 path: normalized.path,
                 operation: normalized.operation,
             };
-            let result = apply_agent_edit_tool_review(edit_access, sink, pending, None)?;
+            let result = apply_agent_edit_tool_review(
+                edit_access,
+                sink,
+                pending,
+                None,
+                crate::ToolTiming::default(),
+            )?;
             Ok(AgentEditToolPrepared::Completed { trace_id, result })
         }
         EditAccessReviewState::NeedsUserApproval
@@ -568,6 +579,7 @@ pub fn prepare_extension_edit_proposal(
     context: AgentEditToolContext,
     request: PendingToolRequest,
     proposal: ExtensionEditProposal,
+    prior_timing: crate::ToolTiming,
 ) -> Result<AgentEditToolPrepared, ToolContinuationError> {
     let trace_id = next_agent_edit_trace_id();
     let Some(provider_call_id) = request
@@ -643,6 +655,7 @@ pub fn prepare_extension_edit_proposal(
                     Some(reason),
                     Some(result_summary(&result)),
                     Some(result.content.clone()),
+                    prior_timing,
                 ));
                 append_events(sink, &prepare_log.events)?;
                 return Ok(AgentEditToolPrepared::Denied { trace_id, result });
@@ -668,6 +681,7 @@ pub fn prepare_extension_edit_proposal(
                     Some(reason),
                     Some(result_summary(&result)),
                     Some(result.content.clone()),
+                    prior_timing,
                 ));
                 append_events(sink, &prepare_log.events)?;
                 return Ok(AgentEditToolPrepared::Failed { trace_id, result });
@@ -689,7 +703,8 @@ pub fn prepare_extension_edit_proposal(
                 path,
                 operation,
             };
-            let result = apply_agent_edit_tool_review(edit_access, sink, pending, None)?;
+            let result =
+                apply_agent_edit_tool_review(edit_access, sink, pending, None, prior_timing)?;
             Ok(AgentEditToolPrepared::Completed { trace_id, result })
         }
         EditAccessReviewState::NeedsUserApproval
@@ -728,21 +743,58 @@ pub fn apply_agent_edit_tool_review(
     sink: &impl SessionEventSink,
     pending: PendingAgentEditToolReview,
     freshness: Option<crate::ReviewFreshness>,
+    prior_timing: crate::ToolTiming,
 ) -> Result<ProviderToolResult, ToolContinuationError> {
     let apply_started = Instant::now();
-    let (apply_result, completed_evidence_persisted) = edit_access
-        .apply_with_evidence_sink_and_freshness(
-            &pending.preview_id,
-            &pending.permission_decision_id,
-            sink,
-            freshness,
-        )
-        .map_err(|error| match error {
-            crate::EditAccessError::StaleAuthorization => {
-                ToolContinuationError::Execution(ToolExecutionError::StaleAuthorization)
-            }
-            _ => ToolContinuationError::Execution(ToolExecutionError::MalformedResult),
-        })?;
+    let timer = crate::ToolTimer::start();
+    let applied = edit_access.apply_with_evidence_sink_and_freshness(
+        &pending.preview_id,
+        &pending.permission_decision_id,
+        sink,
+        freshness,
+    );
+    let timing = prior_timing.including(timer.stop());
+    let (apply_result, completed_evidence_persisted) = applied.map_err(|error| {
+        let (outcome_error, reason) = match &error {
+            crate::EditAccessError::StaleAuthorization => (
+                ToolContinuationError::Execution(ToolExecutionError::StaleAuthorization),
+                String::from("stale_authorization"),
+            ),
+            crate::EditAccessError::Apply(edit_error) => (
+                ToolContinuationError::Execution(ToolExecutionError::MalformedResult),
+                crate::edit_error_label(edit_error).to_owned(),
+            ),
+            _ => (
+                ToolContinuationError::Execution(ToolExecutionError::MalformedResult),
+                String::from("malformed_result"),
+            ),
+        };
+        let result = provider_result(
+            &pending.request_id,
+            Some(pending.provider_call_id.clone()),
+            ToolOutcome::Failed,
+            failed_content(
+                &pending.request_id,
+                &pending.operation,
+                &reason,
+                agent_edit_failure_guidance(&reason),
+            ),
+            Some(reason.clone()),
+        );
+        let event = SessionEvent::ToolExecutionFinished {
+            session_id: pending.session_id.clone(),
+            turn_id: pending.turn_id.clone(),
+            tool_request_id: ToolRequestId(pending.request_id.clone()),
+            outcome: ToolOutcome::Failed,
+            reason: Some(reason),
+            result_summary: Some(result_summary(&result)),
+            result_content: Some(result.content.clone()),
+            started_at_ms: timing.started_at_ms,
+            duration_ms: timing.duration_ms,
+        };
+        let _ = append_event(sink, &event);
+        outcome_error
+    })?;
     let mut result = provider_result(
         &pending.request_id,
         Some(pending.provider_call_id.clone()),
@@ -794,6 +846,8 @@ pub fn apply_agent_edit_tool_review(
         reason,
         result_summary: Some(result_summary(&result)),
         result_content: Some(result.content.clone()),
+        started_at_ms: timing.started_at_ms,
+        duration_ms: timing.duration_ms,
     };
     if append_event(sink, &final_event).is_err() {
         result.reason = Some(String::from("tool_evidence_persist_failed"));
@@ -806,6 +860,7 @@ pub fn reject_agent_edit_tool_review(
     edit_access: &mut EditAccess,
     sink: &impl SessionEventSink,
     pending: PendingAgentEditToolReview,
+    prior_timing: crate::ToolTiming,
 ) -> Result<ProviderToolResult, ToolContinuationError> {
     let mut log = SessionLog::default();
     let reject_started = Instant::now();
@@ -855,6 +910,8 @@ pub fn reject_agent_edit_tool_review(
         reason: Some(String::from("user_rejected")),
         result_summary: Some(result_summary(&result)),
         result_content: Some(result.content.clone()),
+        started_at_ms: prior_timing.started_at_ms,
+        duration_ms: prior_timing.duration_ms,
     });
     append_events(sink, &log.events)?;
     Ok(result)
@@ -867,6 +924,7 @@ pub fn reject_agent_edit_tool_review_for_human_performs(
     edit_access: &mut EditAccess,
     sink: &impl SessionEventSink,
     pending: PendingAgentEditToolReview,
+    prior_timing: crate::ToolTiming,
 ) -> Result<ProviderToolResult, ToolContinuationError> {
     let mut log = SessionLog::default();
     let reject_started = Instant::now();
@@ -923,6 +981,8 @@ Describe the exact change so the user can make it, then continue.",
         reason: Some(reason),
         result_summary: Some(result_summary(&result)),
         result_content: Some(result.content.clone()),
+        started_at_ms: prior_timing.started_at_ms,
+        duration_ms: prior_timing.duration_ms,
     });
     append_events(sink, &log.events)?;
     Ok(result)
@@ -1154,6 +1214,7 @@ fn finished_event(
     reason: Option<String>,
     result_summary: Option<ToolPayloadSummary>,
     result_content: Option<String>,
+    timing: crate::ToolTiming,
 ) -> SessionEvent {
     SessionEvent::ToolExecutionFinished {
         session_id: context.session_id.clone(),
@@ -1163,6 +1224,8 @@ fn finished_event(
         reason,
         result_summary,
         result_content,
+        started_at_ms: timing.started_at_ms,
+        duration_ms: timing.duration_ms,
     }
 }
 
@@ -1192,6 +1255,7 @@ fn append_validation_failure(
         Some(reason),
         None,
         None,
+        crate::ToolTiming::default(),
     ));
     append_events(sink, &log.events)
 }

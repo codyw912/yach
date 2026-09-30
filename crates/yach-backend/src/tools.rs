@@ -1286,7 +1286,10 @@ where
                 self.permission_policy,
             )
             .map_err(ToolContinuationError::Validation)?;
-            let execution = match self.executor.execute(self.registry, &request, &validation) {
+            let timer = crate::ToolTimer::start();
+            let raw_execution = self.executor.execute(self.registry, &request, &validation);
+            let timing = timer.stop();
+            let execution = match raw_execution {
                 Ok(execution) => execution,
                 Err(error) => {
                     log.push(SessionEvent::ToolExecutionFinished {
@@ -1297,6 +1300,8 @@ where
                         reason: Some(tool_execution_error_label(&error).to_string()),
                         result_summary: None,
                         result_content: None,
+                        started_at_ms: timing.started_at_ms,
+                        duration_ms: timing.duration_ms,
                     });
                     return Err(ToolContinuationError::Execution(error));
                 }
@@ -1310,6 +1315,8 @@ where
                     reason: Some(String::from("result_too_large")),
                     result_summary: None,
                     result_content: None,
+                    started_at_ms: timing.started_at_ms,
+                    duration_ms: timing.duration_ms,
                 });
                 return Err(ToolContinuationError::ResultTooLarge {
                     tool_call_id: request
@@ -1330,6 +1337,8 @@ where
                 reason: None,
                 result_summary: Some(result_summary),
                 result_content: Some(execution.summary.clone()),
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.duration_ms,
             });
             results.push(ProviderToolResult {
                 tool_request_id: request.request_id,
@@ -2586,6 +2595,8 @@ fn record_tool_validation_result(
             reason: Some(tool_error_label(error)),
             result_summary: None,
             result_content: None,
+            started_at_ms: None,
+            duration_ms: None,
         });
     }
     validation

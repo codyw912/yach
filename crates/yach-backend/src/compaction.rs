@@ -1094,6 +1094,8 @@ mod tests {
                 reason: None,
                 result_summary: None,
                 result_content: Some(String::from(result)),
+                started_at_ms: None,
+                duration_ms: None,
             },
         ]
     }

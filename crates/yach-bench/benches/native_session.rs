@@ -91,6 +91,8 @@ fn turn_events(index: usize) -> [SessionEvent; 5] {
                 truncated: false,
             }),
             result_content: Some(result_content),
+            started_at_ms: None,
+            duration_ms: None,
         },
         SessionEvent::EntryAppended {
             session_id: session_id.clone(),
