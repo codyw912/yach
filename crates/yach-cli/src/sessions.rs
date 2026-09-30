@@ -35,6 +35,7 @@ pub(crate) struct SessionListing {
     pub turns: usize,
     pub last_outcome: Option<String>,
     pub model: Option<String>,
+    pub warnings: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -273,6 +274,7 @@ fn summarize_session(file: &SessionFile) -> Result<SessionListing, String> {
         turns: turns.len(),
         last_outcome,
         model,
+        warnings: loaded.warnings.len(),
     })
 }
 
@@ -572,8 +574,8 @@ fn render_listing(listing: &SessionListing) -> String {
     let outcome = listing.last_outcome.as_deref().unwrap_or("-");
     let model = listing.model.as_deref().unwrap_or("-");
     format!(
-        "session {}  started={}  turns={}  last_outcome={}  model={}",
-        listing.id, started, listing.turns, outcome, model
+        "session {}  started={}  turns={}  last_outcome={}  model={}  warnings={}",
+        listing.id, started, listing.turns, outcome, model, listing.warnings
     )
 }
 
@@ -606,9 +608,10 @@ fn render_item(item: &TimelineItem) -> String {
     match item {
         TimelineItem::ProviderAttempt { offset_ms, attempt } => {
             format!(
-                "  {}attempt {} {} {}{}",
+                "  {}attempt {}{} {} {}{}",
                 offset_label(*offset_ms),
                 attempt.attempt_sequence,
+                retry_label(attempt.retry_index),
                 purpose_label(attempt.purpose),
                 snake_label(attempt.outcome),
                 attempt_details(attempt)
@@ -655,6 +658,14 @@ fn render_item(item: &TimelineItem) -> String {
             "  {}compaction {reason} tokens_before={tokens_before} tokens_after={tokens_after_estimate}",
             offset_label(*offset_ms)
         ),
+    }
+}
+
+fn retry_label(retry_index: u8) -> String {
+    if retry_index == 0 {
+        String::new()
+    } else {
+        format!(" retry {retry_index}")
     }
 }
 

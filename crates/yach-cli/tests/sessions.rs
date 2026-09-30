@@ -249,7 +249,12 @@ fn sessions_show_text_includes_tool_attempt_request_and_outcome() {
     );
     let text = stdout_text(&output);
     assert!(text.contains("read_file"), "{text}");
-    assert!(text.contains("attempt 1"), "{text}");
+    assert!(text.contains("attempt 1 turn failed"), "{text}");
+    assert!(
+        !text.contains("retry 0"),
+        "a first try must stay terse: {text}"
+    );
+    assert!(text.contains("attempt 2 retry 1 turn succeeded"), "{text}");
     assert!(text.contains("gw-2"), "{text}");
     assert!(text.contains("completed"), "{text}");
 }
@@ -433,4 +438,42 @@ fn sub_millisecond_mtime_orders_list_and_latest() {
     let show_text = stdout_text(&shown);
     let show_value: serde_json::Value = serde_json::from_str(show_text.trim()).test_unwrap();
     assert_eq!(show_value["id"], "s-later", "{show_text}");
+}
+
+#[test]
+fn sessions_list_reports_malformed_line_warning_and_exits_zero() {
+    let fixture = Fixture::new();
+    let body = [
+        r#"{"at_ms":1600000000000,"type":"turn_finished","session_id":"s-warn","turn_id":"turn-0","outcome":"completed","reason":null}"#,
+        "{not-json",
+    ]
+    .join("\n");
+    write_session(
+        fixture.sessions.path(),
+        "s-warn",
+        &body,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000),
+    );
+    let listed = fixture.run(&["sessions", "list", "--json"]);
+    assert!(
+        listed.status.success(),
+        "malformed list must still exit 0: {}",
+        stdout_text(&listed)
+    );
+    let list_text = stdout_text(&listed);
+    let value: serde_json::Value = serde_json::from_str(list_text.trim()).test_unwrap();
+    let sessions = value.as_array().test_unwrap();
+    assert_eq!(sessions[0]["id"], "s-warn");
+    assert_eq!(sessions[0]["warnings"], 1, "{list_text}");
+    assert_eq!(
+        sessions[0]["turns"], 1,
+        "valid lines still count: {list_text}"
+    );
+    let text = fixture.run(&["sessions", "list"]);
+    assert!(text.status.success(), "{}", stdout_text(&text));
+    let rendered = stdout_text(&text);
+    assert!(
+        rendered.contains("warnings=1"),
+        "text list must show the warning count: {rendered}"
+    );
 }

@@ -8330,6 +8330,12 @@ async fn finish_prepared_edit_tool_request(
                         });
                         tokio::select! {
                             () = batch.cancellation.cancelled() => {
+                                record_interrupted_prepared_edit(
+                                    batch,
+                                    &request_id,
+                                    "native provider prompt cancelled",
+                                    prior_timing,
+                                );
                                 return Err(ProviderRoundError::Cancelled(String::from(
                                     "native provider prompt cancelled",
                                 )));
@@ -8433,6 +8439,12 @@ async fn finish_prepared_edit_tool_request(
                 }
             }
             if !batch.structured_review_rows {
+                record_interrupted_prepared_edit(
+                    batch,
+                    &request_id,
+                    "structured_review_rows_not_negotiated",
+                    prior_timing,
+                );
                 return Err(ProviderRoundError::ToolContinuation(String::from(
                     "structured_review_rows_not_negotiated",
                 )));
@@ -8483,10 +8495,16 @@ async fn finish_prepared_edit_tool_request(
                     SessionEvent::ToolReviewInterrupted {
                         session_id: batch.session_id.clone(),
                         turn_id: batch.turn_id.clone(),
-                        tool_request_id: ToolRequestId(request_id),
+                        tool_request_id: ToolRequestId(request_id.clone()),
                         reason: String::from("ui_receiver_dropped"),
                     },
                 )?;
+                record_interrupted_prepared_edit(
+                    batch,
+                    &request_id,
+                    "ui_receiver_dropped",
+                    prior_timing,
+                );
                 return Err(ProviderRoundError::Cancelled(String::from(
                     "ui receiver dropped during tool review",
                 )));
@@ -8546,15 +8564,22 @@ async fn finish_prepared_edit_tool_request(
                     decision
                 }
                 Err(error) => {
+                    let reason = provider_round_error_label(&error);
                     persist_tool_review_event(
                         batch,
                         SessionEvent::ToolReviewInterrupted {
                             session_id: batch.session_id.clone(),
                             turn_id: batch.turn_id.clone(),
                             tool_request_id: ToolRequestId(pending.request_id.clone()),
-                            reason: provider_round_error_label(&error),
+                            reason: reason.clone(),
                         },
                     )?;
+                    record_interrupted_prepared_edit(
+                        batch,
+                        &pending.request_id,
+                        &reason,
+                        prior_timing,
+                    );
                     return Err(error);
                 }
             };
@@ -8620,6 +8645,29 @@ fn failed_tool_result(
 /// `"unknown"` when the process was killed before it could report a code.
 fn exit_code_label(code: Option<i32>) -> String {
     code.map_or_else(|| String::from("unknown"), |code| code.to_string())
+}
+
+fn record_interrupted_prepared_edit(
+    batch: &mut ProviderAgentToolBatch<'_>,
+    request_id: &str,
+    reason: &str,
+    timing: crate::ToolTiming,
+) {
+    push_native_session_event(
+        batch.log,
+        batch.pending_events,
+        SessionEvent::ToolExecutionFinished {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: ToolRequestId(request_id.to_owned()),
+            outcome: ToolOutcome::Cancelled,
+            reason: Some(reason.to_owned()),
+            result_summary: None,
+            result_content: None,
+            started_at_ms: timing.started_at_ms,
+            duration_ms: timing.duration_ms,
+        },
+    );
 }
 
 fn record_native_bash_finished_event(
@@ -12331,6 +12379,129 @@ mod tests {
         );
         assert!(
             duration_ms < u64::try_from(approval_delay.as_millis()).unwrap_or(u64::MAX),
+            "review wait counted as tool time: {duration_ms}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_extension_proposal_review_keeps_extension_timing() {
+        let root = TempProject::new("extension-proposal-review-cancel-timing");
+        root.write("notes.txt", "alpha\n");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let (registry, permission_policy, resolved_catalog) = proposal_edit_registry();
+        let extension_executor = crate::ExtensionToolExecutorRouter::from_handlers([(
+            "proposal_edit",
+            crate::ExtensionToolHandler::host_metadata(
+                "example.edit-tools",
+                SlowProposalInvoker {
+                    delay: Duration::from_millis(80),
+                    proposal: crate::ExtensionEditProposal {
+                        summary: String::from("update notes"),
+                        operations: vec![crate::ExtensionEditProposalOperation::ModifyTextFile {
+                            path: String::from("notes.txt"),
+                            expected_sha256: crate::edit::sha256_hex_for_test("alpha\n"),
+                            after_text: String::from("beta\n"),
+                        }],
+                    },
+                },
+                Duration::from_secs(2),
+            ),
+        )]);
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        let canceller_task = tokio::spawn(async move {
+            loop {
+                match review_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::ToolReviewRequested { .. })) => {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        canceller.cancel();
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        });
+        let outcome = execute_native_provider_agent_tool_batch(
+            ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
+                shell_session_grants: super::ShellSessionGrants::default(),
+                cancellation,
+                structured_review_rows: true,
+                session_id: SessionId(String::from("default")),
+                shell_policy: crate::ShellPolicy::default(),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: Some(&extension_executor),
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: None,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+            },
+            vec![ProviderToolCall {
+                call_id: String::from("call-proposal-1"),
+                name: String::from("proposal_edit"),
+                arguments_json: serde_json::json!({"input": "patch"}),
+            }],
+        )
+        .await;
+        assert!(canceller_task.await.is_ok());
+        let Ok(outcome) = outcome else {
+            unreachable!("cancelled review must still return a terminal batch outcome");
+        };
+        assert!(matches!(
+            outcome.terminal_error,
+            Some(ProviderRoundError::Cancelled(_))
+        ));
+        assert_eq!(outcome.results[0].status, ToolOutcome::Cancelled);
+        assert_eq!(
+            std::fs::read_to_string(root.root().join("notes.txt"))
+                .ok()
+                .as_deref(),
+            Some("alpha\n"),
+            "a cancelled review must not apply the proposal"
+        );
+        let finished = log.events.iter().find_map(|event| match event {
+            SessionEvent::ToolExecutionFinished {
+                outcome: ToolOutcome::Cancelled,
+                started_at_ms,
+                duration_ms,
+                ..
+            } => Some((*started_at_ms, *duration_ms)),
+            _ => None,
+        });
+        let Some((Some(_), Some(duration_ms))) = finished else {
+            unreachable!("cancelled proposal finish dropped extension timing: {finished:?}");
+        };
+        assert!(
+            duration_ms >= 80,
+            "cancelled proposal dropped extension duration: {duration_ms}"
+        );
+        assert!(
+            duration_ms < 400,
             "review wait counted as tool time: {duration_ms}"
         );
     }

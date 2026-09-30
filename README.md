@@ -166,7 +166,7 @@ Environment:
 | `YACH_RIG_PROVIDER_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
 | `YACH_THEME` | auto-discovered | Explicit path to a TUI theme JSON file. |
 | `YACH_SESSION_DIR` | project-keyed directory under `~/.yach/sessions/` | Absolute override for session storage and lookup. |
-| `YACH_CAPTURE_REQUESTS` | off | Absolute directory. Writes each provider request body, one private file per attempt. Captures contain prompts and code; keep them off unless diagnosing a request. |
+| `YACH_CAPTURE_REQUESTS` | off | Absolute directory. Writes each OpenAI, OpenAI-compatible, ChatGPT-subscription, and native-compaction request body, one private file per attempt. Anthropic requests are not captured. Authentication headers are never written; bodies are the exact request bodies, so they contain whatever the prompt and files contain. Keep capture off unless diagnosing a request. |
 
 Launching without credentials still opens the TUI and explains what is
 missing; prompts fail with the setup error until the environment is fixed.
@@ -292,10 +292,14 @@ when they started and how long they ran. Every provider attempt records one
 bounded event: its outcome, error class, HTTP status, retry delay, duration,
 time to first event, and the provider's request ID from the response headers.
 Request bodies, headers, and credentials are never written to the session
-log. With `YACH_CAPTURE_REQUESTS` set, request bodies go to separate `0600`
-files under `<dir>/<session-id>/`, one per attempt and never overwritten, and
-the attempt event names its capture file. Capture files never contain
-credentials. `yach sessions show` reads only the session log.
+log. With `YACH_CAPTURE_REQUESTS` set, OpenAI, OpenAI-compatible,
+ChatGPT-subscription, and native-compaction request bodies go to separate
+`0600` files under `<dir>/<session-id>/`, one per attempt and never
+overwritten, and the attempt event names its capture file. Anthropic
+requests are not captured. Authentication headers are never written to
+capture files; bodies are the exact request bodies, so they contain whatever
+the prompt and files contain. `yach sessions show` reads only the session
+log.
 
 ## Workspace layout
 
