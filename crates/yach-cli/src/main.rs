@@ -2344,6 +2344,7 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
             adapter: std::sync::Arc::new(adapter_config.clone()),
         }),
         native_request: None,
+        recorder: None,
     };
     let Ok(runtime) = tokio::runtime::Runtime::new() else {
         lines.push(String::from("failed to create tokio runtime"));

@@ -3821,6 +3821,7 @@ dependencies = [
 name = "yach-backend"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "fs2",
  "futures",
  "globset",

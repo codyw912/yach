@@ -8,7 +8,7 @@ use rig::completion::{
     CompletionError, CompletionModel, CompletionRequestBuilder, GetTokenUsage, Message,
     ToolDefinition,
 };
-use rig::providers::openai::responses_api::{InputItem, ResponsesCompletionModel};
+use rig::providers::openai::responses_api::InputItem;
 use rig::providers::{anthropic, chatgpt, openai};
 use rig::streaming::{
     RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent,
@@ -18,12 +18,13 @@ use yach_connections::ProviderSecret;
 use yach_proto::ThinkingLevel;
 
 use crate::{
-    ClassificationSource, DialectSelection, PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY,
-    ProviderContinuationSubmission, ProviderContinuationToolResult, ProviderError,
-    ProviderErrorKind, ProviderErrorMetadata, ProviderExtension, ProviderFinishReason,
-    ProviderIdentity, ProviderMessage, ProviderRequest, ProviderStreamEvent,
-    ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResultBlock, Role, TimeoutPhase,
-    TurnId, classify_completion_error, parse_provider_tool_advertising_extensions,
+    AttemptRecorder, ClassificationSource, DialectSelection,
+    PROVIDER_TOOL_ADVERTISING_EXTENSION_KEY, ProviderContinuationSubmission,
+    ProviderContinuationToolResult, ProviderError, ProviderErrorKind, ProviderErrorMetadata,
+    ProviderExtension, ProviderFinishReason, ProviderIdentity, ProviderMessage, ProviderRequest,
+    ProviderStreamEvent, ProviderToolAdvertisingError, ProviderToolCall, ProviderToolResultBlock,
+    Role, TimeoutPhase, TurnId, classify_completion_error,
+    parse_provider_tool_advertising_extensions,
     tools::parse_provider_tool_advertising_extensions_with_approved_contracts,
 };
 
@@ -391,6 +392,7 @@ pub async fn run_provider_request_with_approved_tools(
         approved_tools,
         None,
         None,
+        None,
     )
     .await?
     {
@@ -405,6 +407,7 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
     approved_tools: impl IntoIterator<Item = impl AsRef<str>>,
     live: Option<LiveDeltaSink>,
     trace: Option<yach_trace::TraceSink>,
+    recorder: Option<AttemptRecorder>,
 ) -> Result<ProviderStreamAttempt, ProviderError> {
     if request.native_request.is_some()
         && !matches!(config.provider, RigProviderConfig::OpenAi { .. })
@@ -441,6 +444,7 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
         thinking_level,
         identity,
         trace,
+        recorder: recorder.unwrap_or_default(),
     };
     match &config.provider {
         RigProviderConfig::Anthropic { api_key, base_url } => {
@@ -463,6 +467,9 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
                 builder = builder.base_url(base_url);
             }
             let client = builder
+                .http_client(crate::recording_http::RecordingHttpClient::new(
+                    attempt.recorder.clone(),
+                ))
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
@@ -472,6 +479,9 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
             let client = api_key
                 .with_exposed(|key| openai::Client::builder().api_key(key))
                 .base_url(base_url)
+                .http_client(crate::recording_http::RecordingHttpClient::new(
+                    attempt.recorder.clone(),
+                ))
                 .build()
                 .map_err(|error| provider_internal_error(&error))?
                 .completions_api();
@@ -484,6 +494,9 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
                 .oauth()
                 .allow_device_flow(false)
                 .auth_file(auth_file)
+                .http_client(crate::recording_http::RecordingHttpClient::new(
+                    attempt.recorder.clone(),
+                ))
                 .build()
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
@@ -510,6 +523,7 @@ struct PreparedCompletion {
     thinking_level: Option<ThinkingLevel>,
     identity: ProviderIdentity,
     trace: Option<yach_trace::TraceSink>,
+    recorder: AttemptRecorder,
 }
 
 impl PreparedCompletion {
@@ -563,14 +577,21 @@ impl PreparedCompletion {
             self.live.as_ref(),
             &self.identity,
             self.trace.as_ref(),
+            &self.recorder,
         )
         .await)
     }
 
-    async fn run_openai(
+    async fn run_openai<H>(
         self,
-        model: ResponsesCompletionModel,
-    ) -> Result<ProviderStreamAttempt, ProviderError> {
+        model: rig::providers::openai::responses_api::GenericResponsesCompletionModel<
+            rig::providers::openai::OpenAIResponsesExt,
+            H,
+        >,
+    ) -> Result<ProviderStreamAttempt, ProviderError>
+    where
+        H: rig::http_client::HttpClientExt + Clone + Default + std::fmt::Debug + 'static,
+    {
         let completion = build_completion_request(
             &model,
             self.prompt,
@@ -626,6 +647,7 @@ impl PreparedCompletion {
             self.live.as_ref(),
             &self.identity,
             self.trace.as_ref(),
+            &self.recorder,
         )
         .await)
     }
@@ -1197,6 +1219,7 @@ pub(crate) async fn collect_rig_completion_stream<R, FinalPayload>(
     live: Option<&LiveDeltaSink>,
     identity: &ProviderIdentity,
     trace: Option<&yach_trace::TraceSink>,
+    recorder: &AttemptRecorder,
 ) -> ProviderStreamAttempt
 where
     R: Clone + Unpin + GetTokenUsage,
@@ -1226,6 +1249,7 @@ where
         };
         if !marked_first_event {
             mark_adapter_turn(trace, &collection.turn_id, "provider_first_event");
+            recorder.mark_first_event();
             marked_first_event = true;
         }
         let item = match item {
@@ -1809,6 +1833,10 @@ mod tests {
     type LocalSseFixture = (String, Arc<Mutex<Option<Vec<u8>>>>, thread::JoinHandle<()>);
 
     fn local_sse_fixture() -> LocalSseFixture {
+        local_sse_fixture_with_request_id(None)
+    }
+
+    fn local_sse_fixture_with_request_id(request_id: Option<String>) -> LocalSseFixture {
         let listener = TcpListener::bind("127.0.0.1:0");
         assert!(listener.is_ok());
         let Ok(listener) = listener else {
@@ -1861,8 +1889,14 @@ mod tests {
             if let Ok(mut recorded) = recorded.lock() {
                 *recorded = Some(request);
             }
-            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 14\r\nConnection: close\r\n\r\ndata: [DONE]\n\n";
-            assert!(socket.write_all(response).is_ok());
+            let request_id_header = request_id
+                .as_deref()
+                .map(|id| format!("x-request-id: {id}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{request_id_header}Content-Length: 14\r\nConnection: close\r\n\r\ndata: [DONE]\n\n"
+            );
+            assert!(socket.write_all(response.as_bytes()).is_ok());
         });
         (format!("http://{address}"), captured, server)
     }
@@ -2954,6 +2988,7 @@ mod tests {
             None,
             &smoke_identity(),
             None,
+            &crate::AttemptRecorder::default(),
         )
         .await;
         assert!(matches!(
@@ -3000,6 +3035,7 @@ mod tests {
             None,
             &smoke_identity(),
             None,
+            &crate::AttemptRecorder::default(),
         )
         .await;
 
@@ -3039,6 +3075,7 @@ mod tests {
             None,
             &smoke_identity(),
             None,
+            &crate::AttemptRecorder::default(),
         )
         .await;
 
@@ -3252,6 +3289,41 @@ mod tests {
         assert!(body.get("input").is_none());
         assert!(body.get("instructions").is_none());
         assert!(body.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_attempt_records_request_id_and_first_event_time() {
+        let (base_url, _captured, server) =
+            local_sse_fixture_with_request_id(Some(String::from("gw-adapter")));
+        let adapter = RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAiCompatible {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url,
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 1,
+            context_window: 1,
+            max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
+        };
+        let recorder = crate::AttemptRecorder::new(None);
+        let result = super::run_provider_request_attempt_with_approved_tools(
+            &adapter,
+            provider_request(vec![ProviderMessage::text(Role::User, "legacy")]),
+            ["project_path_info"],
+            None,
+            None,
+            Some(recorder.clone()),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(server.join().is_ok());
+        let diagnostics = recorder.diagnostics();
+        assert_eq!(
+            diagnostics.provider_request_id.as_deref(),
+            Some("gw-adapter")
+        );
+        assert!(diagnostics.first_event_ms.is_some());
     }
 
     #[tokio::test]

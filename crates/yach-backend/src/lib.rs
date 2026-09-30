@@ -46,6 +46,8 @@ mod tools;
 mod user_config;
 
 pub mod model_discovery;
+mod recording_http;
+pub use recording_http::AttemptRecorder;
 pub mod rig_adapter;
 pub mod rig_diagnostics;
 

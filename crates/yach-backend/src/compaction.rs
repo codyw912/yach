@@ -805,6 +805,9 @@ pub struct CompactionPreparation {
     pub provider: Arc<CompactionProviderContext>,
     /// Exact Responses envelope of the request that triggered compaction.
     pub native_request: Option<NativeRequestEnvelope>,
+    /// Per-attempt recorder for request id, first-event time, and capture.
+    /// `None` for callers that do not record a native compaction attempt.
+    pub recorder: Option<crate::AttemptRecorder>,
 }
 
 /// Versioned provider-native replacement window returned by `/responses/compact`.
@@ -895,6 +898,7 @@ impl Compactor for OpenAiResponsesCompactor {
             let CompactionPreparation {
                 provider,
                 native_request,
+                recorder,
                 ..
             } = preparation;
             if provider.provider != "openai"
@@ -923,16 +927,29 @@ impl Compactor for OpenAiResponsesCompactor {
                 "input": native_request.input,
                 "instructions": native_request.instructions,
             });
+            let bytes = serde_json::to_vec(&body).map_err(|_| CompactionError::Transport)?;
+            if let Some(recorder) = recorder.as_ref() {
+                recorder.capture_body(&bytes);
+            }
             let client = reqwest::Client::builder()
                 .timeout(provider.adapter.timeout)
                 .build()
                 .map_err(|_| CompactionError::Transport)?;
-            let request =
-                api_key.with_exposed(|key| client.post(&url).bearer_auth(key).json(&body));
+            let request = api_key.with_exposed(|key| {
+                client
+                    .post(&url)
+                    .bearer_auth(key)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(bytes)
+            });
             let response = request
                 .send()
                 .await
                 .map_err(|error| compaction_transport_error(&error))?;
+            if let Some(recorder) = recorder.as_ref() {
+                recorder.record_response_headers(response.headers());
+                recorder.mark_first_event();
+            }
             if !response.status().is_success() {
                 return Err(CompactionError::HttpStatus {
                     status: response.status().as_u16(),
@@ -1487,6 +1504,7 @@ mod tests {
                 }),
             }),
             native_request: None,
+            recorder: None,
         };
         let prompt = build_summary_prompt(&preparation, None);
         assert!(prompt.contains("verbatim"));
@@ -1527,6 +1545,7 @@ mod tests {
                 }),
             }),
             native_request: None,
+            recorder: None,
         }
     }
 
@@ -1672,6 +1691,58 @@ mod tests {
             assert!(file.compaction.masking);
             assert_eq!(file.compaction.compactor_kind(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn native_compactor_records_request_id_and_captures_body_on_error() {
+        let fixture = native_compaction_fixture(
+            "HTTP/1.1 503 Service Unavailable\r\nx-request-id: gw-compact",
+            r#"{"error":"unavailable"}"#,
+        );
+        assert!(fixture.is_some(), "fixture listener should initialize");
+        let Some((base_url, _received)) = fixture else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "yach-compact-capture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let capture = dir.join("session").join("turn-1-compaction_native-1.json");
+        let recorder = crate::AttemptRecorder::with_policy(
+            Some(capture.clone()),
+            crate::recording_http::CapturePolicy::isolated(),
+        );
+        let mut preparation = native_preparation(base_url, "native-compactor-fixture-secret");
+        preparation.recorder = Some(recorder.clone());
+
+        let error = OpenAiResponsesCompactor.compact(preparation).await;
+
+        assert_eq!(error, Err(CompactionError::HttpStatus { status: 503 }));
+        let diagnostics = recorder.diagnostics();
+        assert_eq!(
+            diagnostics.provider_request_id.as_deref(),
+            Some("gw-compact")
+        );
+        assert_eq!(
+            diagnostics.capture.as_deref(),
+            Some("turn-1-compaction_native-1.json")
+        );
+        let written = std::fs::read(&capture);
+        assert!(written.is_ok());
+        let Ok(written) = written else {
+            return;
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&written);
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
+        assert_eq!(parsed["model"], "gpt-fixture");
+        assert_eq!(parsed["instructions"], "exact-instructions");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1949,6 +2020,7 @@ mod tests {
                 })],
                 instructions: String::from("exact-instructions"),
             }),
+            recorder: None,
         }
     }
 

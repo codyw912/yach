@@ -992,6 +992,8 @@ pub async fn run_native_loop(
             approved_tools: provider_approved_tools(components),
             prompt_attempt_reset: false,
             trace: trace.clone(),
+            capture_dir: crate::recording_http::capture_dir_from_env(),
+            recorder: crate::AttemptRecorder::default(),
         },
     )
     .await;
@@ -1024,6 +1026,8 @@ pub async fn run_native_loop_with_negotiated_capabilities(
             approved_tools: provider_approved_tools(components),
             prompt_attempt_reset,
             trace: trace.clone(),
+            capture_dir: crate::recording_http::capture_dir_from_env(),
+            recorder: crate::AttemptRecorder::default(),
         },
     )
     .await;
@@ -4073,6 +4077,8 @@ struct RigProviderRequester {
     approved_tools: Vec<String>,
     prompt_attempt_reset: bool,
     trace: Option<yach_trace::TraceSink>,
+    capture_dir: Option<PathBuf>,
+    recorder: crate::AttemptRecorder,
 }
 
 impl ProviderRequester for RigProviderRequester {
@@ -4102,6 +4108,7 @@ impl ProviderRequester for RigProviderRequester {
         let adapter = self.adapter.clone();
         let approved_tools = self.approved_tools.clone();
         let trace = self.trace.clone();
+        let recorder = self.recorder.clone();
         Box::pin(async move {
             run_provider_request_attempt_with_approved_tools(
                 &adapter,
@@ -4109,9 +4116,24 @@ impl ProviderRequester for RigProviderRequester {
                 approved_tools,
                 live,
                 trace,
+                Some(recorder),
             )
             .await
         })
+    }
+
+    fn begin_attempt(&mut self, label: AttemptLabel) {
+        self.recorder = crate::AttemptRecorder::new(
+            self.capture_dir
+                .as_deref()
+                .map(|dir| crate::recording_http::capture_path(dir, &label)),
+        );
+    }
+
+    fn take_attempt_diagnostics(&mut self) -> AttemptDiagnostics {
+        let diagnostics = self.recorder.diagnostics();
+        self.recorder = crate::AttemptRecorder::default();
+        diagnostics
     }
 
     fn supports_prefix_resume(&self, _: &ProviderRequest) -> bool {
@@ -6757,10 +6779,24 @@ where
             run.native_request.clone(),
             run.focus_instructions.as_deref(),
         ),
+        recorder: native_selected.then(|| {
+            crate::AttemptRecorder::new(crate::recording_http::capture_dir_from_env().map(|dir| {
+                crate::recording_http::capture_path(
+                    &dir,
+                    &AttemptLabel {
+                        session_id: run.session_id.clone(),
+                        turn_id: run.turn_id.clone(),
+                        purpose: crate::ProviderAttemptPurpose::CompactionNative,
+                        attempt_sequence: attempt_sequence.saturating_add(1).max(1),
+                    },
+                )
+            }))
+        }),
     };
     if native_selected {
         *attempt_sequence = attempt_sequence.saturating_add(1).max(1);
     }
+    let native_recorder = preparation.recorder.clone();
     let native = if native_selected {
         let native_start = AttemptStart {
             instant: Instant::now(),
@@ -6781,6 +6817,10 @@ where
                     *attempt_sequence,
                     native_start,
                     NativeAttemptSettle::Cancelled,
+                    native_recorder
+                        .as_ref()
+                        .map(crate::AttemptRecorder::diagnostics)
+                        .unwrap_or_default(),
                 );
                 return Err(ProviderRoundError::Cancelled(String::from(
                     "native provider prompt cancelled",
@@ -6809,6 +6849,10 @@ where
                 *attempt_sequence,
                 native_start,
                 settle,
+                native_recorder
+                    .as_ref()
+                    .map(crate::AttemptRecorder::diagnostics)
+                    .unwrap_or_default(),
             );
         }
         match native_outcome {
@@ -7453,6 +7497,7 @@ fn record_native_compaction_attempt(
     attempt_sequence: u64,
     start: AttemptStart,
     settle: NativeAttemptSettle,
+    diagnostics: AttemptDiagnostics,
 ) {
     let (outcome, error_kind, status_code) = match settle {
         NativeAttemptSettle::Succeeded => (crate::ProviderAttemptOutcome::Succeeded, None, None),
@@ -7493,10 +7538,10 @@ fn record_native_compaction_attempt(
             next_delay_ms: None,
             started_at_ms: start.at_ms,
             duration_ms: u64::try_from(start.instant.elapsed().as_millis()).unwrap_or(u64::MAX),
-            first_event_ms: None,
-            provider_request_id: None,
+            first_event_ms: diagnostics.first_event_ms,
+            provider_request_id: diagnostics.provider_request_id,
             model: model.model.clone(),
-            capture: None,
+            capture: diagnostics.capture,
         },
     );
 }
@@ -14856,7 +14901,7 @@ mod tests {
                     }
                 };
                 let response_header = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\nx-request-id: gw-native\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     response.len() + usize::from(truncated)
                 );
                 let _ = stream.write_all(response_header.as_bytes());
@@ -14953,6 +14998,7 @@ mod tests {
                     instructions: native_request.instructions.clone(),
                     input: output,
                 }),
+                recorder: None,
             })
             .await;
         assert!(outcome.is_ok());
@@ -15131,6 +15177,81 @@ mod tests {
                     "encrypted_content":"opaque-window"
                 }])
         )));
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_compaction_attempt_records_fixture_request_id() {
+        let root = TempProject::new("responses-native-request-id");
+        let session_path = root.root().join("session.jsonl");
+        seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(10_000));
+        let (base_url, _captured) = responses_native_compaction_fixture(vec![
+            ResponsesNativeFixtureOutcome::HttpStatus(503),
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+        ]);
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                components: crate::ComponentSet::full(),
+                session_path: session_path.clone(),
+                project_root: None,
+                provider: Some(provider),
+                startup_model_override: None,
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        assert!(
+            client_tx
+                .send(ClientEvent::CompactionRequested {
+                    session_id: String::from("default"),
+                    instructions: None,
+                })
+                .is_ok()
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("continue after native fallback"),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        let log = JsonlSessionStore::new(session_path).load().test_unwrap();
+        let native: Vec<_> = attempt_events(&log)
+            .into_iter()
+            .filter(|attempt| attempt.purpose == crate::ProviderAttemptPurpose::CompactionNative)
+            .collect();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].provider_request_id.as_deref(), Some("gw-native"));
+        assert!(native[0].first_event_ms.is_some());
         drop(client_tx);
         assert!(handle.await.is_ok());
     }
@@ -15367,6 +15488,7 @@ mod tests {
                     serde_json::json!({"type":"message","role":"user","content":"fixture"}),
                 ],
             }),
+            recorder: None,
         }
     }
     #[tokio::test]
