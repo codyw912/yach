@@ -3901,7 +3901,8 @@ pub(crate) fn provider_messages_from_event_slice(
         | SessionEvent::EditTransactionPrepared { .. }
         | SessionEvent::EditTransactionFinished { .. }
         | SessionEvent::CompactionCheckpoint { .. }
-        | SessionEvent::ToolResultMasked { .. } => Vec::new(),
+        | SessionEvent::ToolResultMasked { .. }
+        | SessionEvent::Unknown => Vec::new(),
     }));
     messages
 }
@@ -13422,7 +13423,8 @@ mod tests {
                 | SessionEvent::EditTransactionPrepared { .. }
                 | SessionEvent::EditTransactionFinished { .. }
                 | SessionEvent::CompactionCheckpoint { .. }
-                | SessionEvent::ToolResultMasked { .. } => None,
+                | SessionEvent::ToolResultMasked { .. }
+                | SessionEvent::Unknown => None,
             })
             .collect()
     }

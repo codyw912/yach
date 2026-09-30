@@ -345,7 +345,8 @@ pub fn estimate_event_tokens(event: &SessionEvent) -> u64 {
         | SessionEvent::EditTraceRecorded { .. }
         | SessionEvent::EditTransactionPrepared { .. }
         | SessionEvent::EditTransactionFinished { .. }
-        | SessionEvent::ToolResultMasked { .. } => 0,
+        | SessionEvent::ToolResultMasked { .. }
+        | SessionEvent::Unknown => 0,
     }
 }
 
@@ -694,7 +695,8 @@ pub fn serialize_events_for_summary_with_masks<S: std::hash::BuildHasher>(
             | SessionEvent::EditTraceRecorded { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
-            | SessionEvent::CompactionCheckpoint { .. } => {}
+            | SessionEvent::CompactionCheckpoint { .. }
+            | SessionEvent::Unknown => {}
         }
     }
     lines.join("\n")

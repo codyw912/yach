@@ -476,6 +476,9 @@ pub enum SessionEvent {
         action_fingerprint: BoundedReviewText,
         expires: GrantExpiry,
     },
+    /// A line whose `type` this build does not know. Loaded, never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// In-memory view reconstructed from a native append-only event log.
@@ -487,6 +490,31 @@ pub struct SessionLog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLoadResult {
     pub log: SessionLog,
+    pub warnings: Vec<SessionLoadWarning>,
+}
+
+/// Wall-clock Unix milliseconds; `None` if the clock is before the epoch.
+#[must_use]
+pub fn unix_ms_now() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+}
+
+/// One session JSONL line as written by the store: the event plus the wall
+/// clock at write time. Pre-stamp logs load with `at_ms = None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StampedSessionEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
+    #[serde(flatten)]
+    pub event: SessionEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StampedLoadResult {
+    pub events: Vec<StampedSessionEvent>,
     pub warnings: Vec<SessionLoadWarning>,
 }
 
@@ -565,7 +593,8 @@ impl SessionLog {
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::CompactionCheckpoint { .. }
-            | SessionEvent::ToolResultMasked { .. } => None,
+            | SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::Unknown => None,
         })
     }
 
@@ -619,7 +648,8 @@ impl SessionLog {
                 | SessionEvent::EditTransactionPrepared { .. }
                 | SessionEvent::EditTransactionFinished { .. }
                 | SessionEvent::CompactionCheckpoint { .. }
-                | SessionEvent::ToolResultMasked { .. } => None,
+                | SessionEvent::ToolResultMasked { .. }
+                | SessionEvent::Unknown => None,
             })
             .collect()
     }
@@ -694,11 +724,9 @@ impl SessionLog {
         options.create(true).write(true).truncate(true);
         configure_session_file_create_options(&mut options);
         let mut file = options.open(path)?;
-        for event in &self.events {
-            let line = serde_json::to_string(event).map_err(io::Error::other)?;
-            file.write_all(line.as_bytes())?;
-            file.write_all(b"\n")?;
-        }
+        let mut buffer = Vec::new();
+        encode_stamped_lines(&mut buffer, &self.events)?;
+        file.write_all(&buffer)?;
         file.flush()?;
         file.sync_data()
     }
@@ -718,7 +746,8 @@ impl SessionLog {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str(&line) {
+            match serde_json::from_str::<SessionEvent>(&line) {
+                Ok(SessionEvent::Unknown) => {}
                 Ok(event) => events.push(event),
                 Err(error) => warnings.push(SessionLoadWarning::InvalidJson {
                     line_number: line_index.saturating_add(1),
@@ -732,6 +761,33 @@ impl SessionLog {
             warnings,
         })
     }
+
+    pub fn load_stamped_from_file(path: &Path) -> io::Result<StampedLoadResult> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let reader = BufReader::new(file);
+        let mut events = Vec::new();
+        let mut warnings = Vec::new();
+
+        for (line_index, line) in reader.lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<StampedSessionEvent>(&line) {
+                Ok(StampedSessionEvent {
+                    event: SessionEvent::Unknown,
+                    ..
+                }) => {}
+                Ok(event) => events.push(event),
+                Err(error) => warnings.push(SessionLoadWarning::InvalidJson {
+                    line_number: line_index.saturating_add(1),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        Ok(StampedLoadResult { events, warnings })
+    }
 }
 
 fn configure_session_file_create_options(options: &mut OpenOptions) {
@@ -740,6 +796,32 @@ fn configure_session_file_create_options(options: &mut OpenOptions) {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+}
+
+#[derive(Serialize)]
+struct StampedEventRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at_ms: Option<u64>,
+    #[serde(flatten)]
+    event: &'a SessionEvent,
+}
+
+/// Appends one stamped JSONL line per event; skips `Unknown`. One clock read
+/// per call, so events written together share `at_ms`.
+pub(crate) fn encode_stamped_lines<'a>(
+    buffer: &mut Vec<u8>,
+    events: impl IntoIterator<Item = &'a SessionEvent>,
+) -> io::Result<()> {
+    let at_ms = unix_ms_now();
+    for event in events {
+        if matches!(event, SessionEvent::Unknown) {
+            continue;
+        }
+        serde_json::to_writer(&mut *buffer, &StampedEventRef { at_ms, event })
+            .map_err(io::Error::other)?;
+        buffer.push(b'\n');
+    }
+    Ok(())
 }
 
 fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
@@ -765,7 +847,8 @@ fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
         | SessionEvent::ReviewPolicyChanged { .. }
         | SessionEvent::ReviewRequestRecorded { .. }
         | SessionEvent::ReviewAssessmentRecorded { .. }
-        | SessionEvent::ExactActionGrantRecorded { .. } => None,
+        | SessionEvent::ExactActionGrantRecorded { .. }
+        | SessionEvent::Unknown => None,
     }
 }
 
@@ -1012,5 +1095,139 @@ mod tests {
             _ => None,
         });
         assert_eq!(target.map(str::len), Some(crate::REVIEW_TEXT_MAX_BYTES));
+    }
+
+    fn test_jsonl_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "yach-{label}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ))
+    }
+
+    #[test]
+    fn store_stamps_each_line_and_plain_loader_still_reads_it() {
+        let path = test_jsonl_path("stamp");
+        let store = crate::JsonlSessionStore::new(path.clone());
+        let event = SessionEvent::TurnFinished {
+            session_id: SessionId(String::from("s")),
+            turn_id: TurnId(String::from("turn-0")),
+            outcome: TurnOutcome::Completed,
+            reason: None,
+        };
+        assert!(
+            store
+                .append_events_without_sync(std::slice::from_ref(&event))
+                .is_ok()
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let value: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
+        assert!(
+            value
+                .get("at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        );
+        assert_eq!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("turn_finished")
+        );
+
+        let plain = SessionLog::load_from_file_with_warnings(&path);
+        assert!(plain.is_ok());
+        let Ok(plain) = plain else {
+            return;
+        };
+        assert!(plain.warnings.is_empty());
+        assert_eq!(plain.log.events, vec![event.clone()]);
+
+        let stamped = SessionLog::load_stamped_from_file(&path);
+        assert!(stamped.is_ok());
+        let Ok(stamped) = stamped else {
+            return;
+        };
+        assert_eq!(stamped.events.len(), 1);
+        assert!(stamped.events[0].at_ms.is_some());
+        assert_eq!(stamped.events[0].event, event);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_event_type_loads_silently_but_malformed_line_warns() {
+        let path = test_jsonl_path("unknown");
+        let lines = concat!(
+            "{\"type\":\"some_future_event\",\"session_id\":\"s\",\"x\":1}\n",
+            "{not json\n",
+            "{\"type\":\"turn_finished\",\"session_id\":\"s\",\"turn_id\":\"turn-0\",\"outcome\":\"completed\",\"reason\":null}\n",
+        );
+        assert!(std::fs::write(&path, lines).is_ok());
+        let loaded = SessionLog::load_from_file_with_warnings(&path);
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else {
+            return;
+        };
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(matches!(
+            loaded.log.events.as_slice(),
+            [SessionEvent::TurnFinished { .. }]
+        ));
+
+        let stamped = SessionLog::load_stamped_from_file(&path);
+        assert!(stamped.is_ok());
+        let Ok(stamped) = stamped else {
+            return;
+        };
+        assert_eq!(stamped.warnings.len(), 1);
+        assert_eq!(stamped.events.len(), 1);
+        assert_eq!(stamped.events[0].at_ms, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_to_file_stamps_every_line_and_skips_unknown() {
+        let path = test_jsonl_path("write-stamp");
+        let finished = SessionEvent::TurnFinished {
+            session_id: SessionId(String::from("s")),
+            turn_id: TurnId(String::from("turn-0")),
+            outcome: TurnOutcome::Completed,
+            reason: None,
+        };
+        let mut log = SessionLog::default();
+        log.push(finished);
+        log.push(SessionEvent::Unknown);
+        log.push(SessionEvent::ApprovalModeChanged {
+            session_id: SessionId(String::from("s")),
+            mode: yach_proto::ApprovalMode::Review,
+        });
+
+        assert!(log.write_to_file(&path).is_ok());
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        let values: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap_or_default())
+            .collect();
+        assert!(values.iter().all(|value| {
+            value
+                .get("at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        }));
+        assert_eq!(
+            values[0].get("type").and_then(serde_json::Value::as_str),
+            Some("turn_finished")
+        );
+        assert_eq!(
+            values[1].get("type").and_then(serde_json::Value::as_str),
+            Some("approval_mode_changed")
+        );
+        assert!(values.iter().all(|value| {
+            value.get("type").and_then(serde_json::Value::as_str) != Some("unknown")
+        }));
     }
 }

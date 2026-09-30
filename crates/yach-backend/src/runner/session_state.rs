@@ -88,7 +88,8 @@ pub(super) fn send_native_session_messages_from_log(
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::CompactionCheckpoint { .. }
-            | SessionEvent::ToolResultMasked { .. } => {}
+            | SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::Unknown => {}
         }
     }
 
@@ -272,7 +273,8 @@ pub(super) fn send_native_session_messages_from_log(
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::ApprovalModeChanged { .. }
             | SessionEvent::ThinkingLevelChanged { .. }
-            | SessionEvent::SessionModelChanged { .. } => None,
+            | SessionEvent::SessionModelChanged { .. }
+            | SessionEvent::Unknown => None,
         })
         .collect();
     let _ = tx.send(BackendEvent::Server(ServerEvent::SessionMessagesUpdated {
@@ -361,7 +363,8 @@ pub(super) fn send_native_session_stats_with_estimate(
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::CompactionCheckpoint { .. }
-            | SessionEvent::ToolResultMasked { .. } => None,
+            | SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::Unknown => None,
         })
         .collect::<Vec<_>>();
     let message_count = u64::try_from(messages.len()).ok();
@@ -582,7 +585,8 @@ fn session_first_message(path: &Path) -> Option<String> {
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::CompactionCheckpoint { .. }
-            | SessionEvent::ToolResultMasked { .. } => None,
+            | SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::Unknown => None,
         })
 }
 
