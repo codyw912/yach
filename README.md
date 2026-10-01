@@ -327,7 +327,16 @@ activated environment, use the existing `just` commands normally. For optional
 automatic activation, install direnv, review `.envrc`, and run `direnv allow`.
 After environment changes, reload it with `direnv reload`.
 
-The shell retains Rust **1.94.0**, the project's tools and custom Cargo hooks.
+The default development profile keeps line tables for useful backtraces while
+avoiding the full-debug artifact cost. For full debug information when needed,
+use:
+
+```sh
+just dev cargo build --profile debug-full
+just dev cargo test --profile debug-full
+```
+
+The shell reads the Rust version from `rust-toolchain.toml` and provides the project's tools and custom Cargo hooks.
 Shell entry does not initialize a Cargo project. Keep personal changes in ignored
 `devenv.local.nix` or `devenv.local.yaml`; required contributor settings belong in
 the shared configuration. Update inputs deliberately with `devenv update <name>`.

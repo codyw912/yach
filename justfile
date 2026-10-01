@@ -7,14 +7,14 @@ default:
   just --list
 
 @dev +args:
-  if [[ -n "${DEVENV_PROFILE:-}" ]]; then \
-    {{args}}; \
+  if [[ -n "${DEVENV_PROFILE:-}" && "${DEVENV_ROOT:-}" -ef {{quote(justfile_directory())}} ]]; then \
+    "$@"; \
   else \
-    devenv shell -- {{args}}; \
+    devenv shell -- "$@"; \
   fi
 
 @dev-shell command:
-  if [[ -n "${DEVENV_PROFILE:-}" ]]; then \
+  if [[ -n "${DEVENV_PROFILE:-}" && "${DEVENV_ROOT:-}" -ef {{quote(justfile_directory())}} ]]; then \
     bash -c {{quote(command)}}; \
   else \
     devenv shell -- bash -c {{quote(command)}}; \
@@ -152,11 +152,7 @@ perf *args:
   printf 'perf ab extra argv:' >&2
   printf ' %q' "$@" >&2
   printf '\n' >&2
-  if [[ -n "${DEVENV_PROFILE:-}" ]]; then
-    cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
-  else
-    devenv shell -- cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
-  fi
+  just --justfile "{{justfile()}}" dev cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
 
 # Record @ only (trend evidence, never a gate input).
 perf-record:
@@ -180,7 +176,7 @@ perf-profile id samples="1000":
   justfile="{{justfile()}}"
   mkdir -p .perf
   CARGO_PROFILE_RELEASE_DEBUG=1 just --justfile "$justfile" dev cargo build --release --locked -p yach-bench -p yach
-  target_dir="$(just --justfile "$justfile" dev-shell 'printf %s "${CARGO_TARGET_DIR:-.devenv/state/target}"')"
+  target_dir="$(just --justfile "$justfile" dev-shell 'set -o pipefail; cargo metadata --locked --offline --no-deps --format-version 1 | jq -er .target_directory')"
   bin="$target_dir/release/yach-bench"
   yach_bin="$target_dir/release/yach"
   if [[ ! -x "$bin" ]]; then
