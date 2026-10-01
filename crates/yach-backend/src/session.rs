@@ -314,6 +314,62 @@ pub enum EditEvidenceOutcome {
     Failed,
 }
 
+/// Why a provider attempt was issued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAttemptPurpose {
+    Turn,
+    CompactionSummary,
+    CompactionNative,
+}
+
+/// How a started provider attempt settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAttemptOutcome {
+    Succeeded,
+    Partial,
+    Failed,
+    Cancelled,
+}
+
+/// Secret-free record of one started provider attempt.
+///
+/// Flattened into `SessionEvent::ProviderAttemptFinished` so JSONL keeps
+/// `purpose` and `attempt_sequence` at the top level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAttemptSummary {
+    pub purpose: ProviderAttemptPurpose,
+    pub attempt_sequence: u64,
+    pub retry_index: u8,
+    pub outcome: ProviderAttemptOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<crate::ProviderErrorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification_source: Option<crate::ClassificationSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_phase: Option<crate::TimeoutPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_delay_ms: Option<u64>,
+    pub started_at_ms: u64,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_event_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+}
+
 /// Append-only native session event record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -354,6 +410,13 @@ pub enum SessionEvent {
         /// session tool payload persistence design.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result_content: Option<String>,
+        /// Wall-clock start of the dispatched execution. Absent when the tool
+        /// never started, including logs written before timing was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_ms: Option<u64>,
+        /// Monotonic execution duration. Absent when the tool never started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     TurnFinished {
         session_id: SessionId,
@@ -476,6 +539,17 @@ pub enum SessionEvent {
         action_fingerprint: BoundedReviewText,
         expires: GrantExpiry,
     },
+    /// One started provider attempt settled. Flattened so identity fields
+    /// stay top-level in the JSONL line.
+    ProviderAttemptFinished {
+        session_id: SessionId,
+        turn_id: TurnId,
+        #[serde(flatten)]
+        attempt: ProviderAttemptSummary,
+    },
+    /// A line whose `type` this build does not know. Loaded, never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// In-memory view reconstructed from a native append-only event log.
@@ -487,6 +561,83 @@ pub struct SessionLog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLoadResult {
     pub log: SessionLog,
+    pub warnings: Vec<SessionLoadWarning>,
+}
+
+/// Source-measured tool execution timing persisted on `ToolExecutionFinished`.
+/// Both fields are `None` when the tool never started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ToolTiming {
+    pub started_at_ms: Option<u64>,
+    pub duration_ms: Option<u64>,
+}
+
+/// Wall-clock start plus a monotonic clock, taken immediately before dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolTimer {
+    started_at_ms: Option<u64>,
+    started: std::time::Instant,
+}
+
+impl ToolTiming {
+    /// Keep this execution's start and add a later phase's duration.
+    /// A review wait between the phases is not included.
+    #[must_use]
+    pub fn including(self, later: Self) -> Self {
+        let duration_ms = match (self.duration_ms, later.duration_ms) {
+            (Some(earlier), Some(later)) => Some(earlier.saturating_add(later)),
+            (Some(duration), None) | (None, Some(duration)) => Some(duration),
+            (None, None) => None,
+        };
+        Self {
+            started_at_ms: self.started_at_ms.or(later.started_at_ms),
+            duration_ms,
+        }
+    }
+}
+
+impl ToolTimer {
+    #[must_use]
+    pub fn start() -> Self {
+        Self {
+            started_at_ms: unix_ms_now(),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    #[must_use]
+    pub fn stop(&self) -> ToolTiming {
+        ToolTiming {
+            started_at_ms: self.started_at_ms,
+            duration_ms: Some(
+                u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            ),
+        }
+    }
+}
+
+/// Wall-clock Unix milliseconds; `None` if the clock is before the epoch.
+#[must_use]
+pub fn unix_ms_now() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+}
+
+/// One session JSONL line as written by the store: the event plus the wall
+/// clock at write time. Pre-stamp logs load with `at_ms = None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StampedSessionEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
+    #[serde(flatten)]
+    pub event: SessionEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StampedLoadResult {
+    pub events: Vec<StampedSessionEvent>,
     pub warnings: Vec<SessionLoadWarning>,
 }
 
@@ -565,7 +716,9 @@ impl SessionLog {
             | SessionEvent::EditTransactionPrepared { .. }
             | SessionEvent::EditTransactionFinished { .. }
             | SessionEvent::CompactionCheckpoint { .. }
-            | SessionEvent::ToolResultMasked { .. } => None,
+            | SessionEvent::ToolResultMasked { .. }
+            | SessionEvent::ProviderAttemptFinished { .. }
+            | SessionEvent::Unknown => None,
         })
     }
 
@@ -619,7 +772,9 @@ impl SessionLog {
                 | SessionEvent::EditTransactionPrepared { .. }
                 | SessionEvent::EditTransactionFinished { .. }
                 | SessionEvent::CompactionCheckpoint { .. }
-                | SessionEvent::ToolResultMasked { .. } => None,
+                | SessionEvent::ToolResultMasked { .. }
+                | SessionEvent::ProviderAttemptFinished { .. }
+                | SessionEvent::Unknown => None,
             })
             .collect()
     }
@@ -694,11 +849,9 @@ impl SessionLog {
         options.create(true).write(true).truncate(true);
         configure_session_file_create_options(&mut options);
         let mut file = options.open(path)?;
-        for event in &self.events {
-            let line = serde_json::to_string(event).map_err(io::Error::other)?;
-            file.write_all(line.as_bytes())?;
-            file.write_all(b"\n")?;
-        }
+        let mut buffer = Vec::new();
+        encode_stamped_lines(&mut buffer, &self.events)?;
+        file.write_all(&buffer)?;
         file.flush()?;
         file.sync_data()
     }
@@ -718,7 +871,8 @@ impl SessionLog {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str(&line) {
+            match serde_json::from_str::<SessionEvent>(&line) {
+                Ok(SessionEvent::Unknown) => {}
                 Ok(event) => events.push(event),
                 Err(error) => warnings.push(SessionLoadWarning::InvalidJson {
                     line_number: line_index.saturating_add(1),
@@ -732,6 +886,33 @@ impl SessionLog {
             warnings,
         })
     }
+
+    pub fn load_stamped_from_file(path: &Path) -> io::Result<StampedLoadResult> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let reader = BufReader::new(file);
+        let mut events = Vec::new();
+        let mut warnings = Vec::new();
+
+        for (line_index, line) in reader.lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<StampedSessionEvent>(&line) {
+                Ok(StampedSessionEvent {
+                    event: SessionEvent::Unknown,
+                    ..
+                }) => {}
+                Ok(event) => events.push(event),
+                Err(error) => warnings.push(SessionLoadWarning::InvalidJson {
+                    line_number: line_index.saturating_add(1),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        Ok(StampedLoadResult { events, warnings })
+    }
 }
 
 fn configure_session_file_create_options(options: &mut OpenOptions) {
@@ -740,6 +921,32 @@ fn configure_session_file_create_options(options: &mut OpenOptions) {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+}
+
+#[derive(Serialize)]
+struct StampedEventRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at_ms: Option<u64>,
+    #[serde(flatten)]
+    event: &'a SessionEvent,
+}
+
+/// Appends one stamped JSONL line per event; skips `Unknown`. One clock read
+/// per call, so events written together share `at_ms`.
+pub(crate) fn encode_stamped_lines<'a>(
+    buffer: &mut Vec<u8>,
+    events: impl IntoIterator<Item = &'a SessionEvent>,
+) -> io::Result<()> {
+    let at_ms = unix_ms_now();
+    for event in events {
+        if matches!(event, SessionEvent::Unknown) {
+            continue;
+        }
+        serde_json::to_writer(&mut *buffer, &StampedEventRef { at_ms, event })
+            .map_err(io::Error::other)?;
+        buffer.push(b'\n');
+    }
+    Ok(())
 }
 
 fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
@@ -756,7 +963,8 @@ fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
         | SessionEvent::EditTransactionPrepared { turn_id, .. }
         | SessionEvent::EditTransactionFinished { turn_id, .. }
         | SessionEvent::CompactionCheckpoint { turn_id, .. }
-        | SessionEvent::ToolResultMasked { turn_id, .. } => Some(turn_id),
+        | SessionEvent::ToolResultMasked { turn_id, .. }
+        | SessionEvent::ProviderAttemptFinished { turn_id, .. } => Some(turn_id),
         SessionEvent::MetricRecorded { turn_id, .. } => turn_id.as_ref(),
         SessionEvent::StaticContextIncluded { .. }
         | SessionEvent::ApprovalModeChanged { .. }
@@ -765,7 +973,8 @@ fn event_turn_id(event: &SessionEvent) -> Option<&TurnId> {
         | SessionEvent::ReviewPolicyChanged { .. }
         | SessionEvent::ReviewRequestRecorded { .. }
         | SessionEvent::ReviewAssessmentRecorded { .. }
-        | SessionEvent::ExactActionGrantRecorded { .. } => None,
+        | SessionEvent::ExactActionGrantRecorded { .. }
+        | SessionEvent::Unknown => None,
     }
 }
 
@@ -1012,5 +1221,220 @@ mod tests {
             _ => None,
         });
         assert_eq!(target.map(str::len), Some(crate::REVIEW_TEXT_MAX_BYTES));
+    }
+
+    fn test_jsonl_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "yach-{label}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ))
+    }
+
+    #[test]
+    fn store_stamps_each_line_and_plain_loader_still_reads_it() {
+        let path = test_jsonl_path("stamp");
+        let store = crate::JsonlSessionStore::new(path.clone());
+        let event = SessionEvent::TurnFinished {
+            session_id: SessionId(String::from("s")),
+            turn_id: TurnId(String::from("turn-0")),
+            outcome: TurnOutcome::Completed,
+            reason: None,
+        };
+        assert!(
+            store
+                .append_events_without_sync(std::slice::from_ref(&event))
+                .is_ok()
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let value: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
+        assert!(
+            value
+                .get("at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        );
+        assert_eq!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("turn_finished")
+        );
+
+        let plain = SessionLog::load_from_file_with_warnings(&path);
+        assert!(plain.is_ok());
+        let Ok(plain) = plain else {
+            return;
+        };
+        assert!(plain.warnings.is_empty());
+        assert_eq!(plain.log.events, vec![event.clone()]);
+
+        let stamped = SessionLog::load_stamped_from_file(&path);
+        assert!(stamped.is_ok());
+        let Ok(stamped) = stamped else {
+            return;
+        };
+        assert_eq!(stamped.events.len(), 1);
+        assert!(stamped.events[0].at_ms.is_some());
+        assert_eq!(stamped.events[0].event, event);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_event_type_loads_silently_but_malformed_line_warns() {
+        let path = test_jsonl_path("unknown");
+        let lines = concat!(
+            "{\"type\":\"some_future_event\",\"session_id\":\"s\",\"x\":1}\n",
+            "{not json\n",
+            "{\"type\":\"turn_finished\",\"session_id\":\"s\",\"turn_id\":\"turn-0\",\"outcome\":\"completed\",\"reason\":null}\n",
+        );
+        assert!(std::fs::write(&path, lines).is_ok());
+        let loaded = SessionLog::load_from_file_with_warnings(&path);
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else {
+            return;
+        };
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(matches!(
+            loaded.log.events.as_slice(),
+            [SessionEvent::TurnFinished { .. }]
+        ));
+
+        let stamped = SessionLog::load_stamped_from_file(&path);
+        assert!(stamped.is_ok());
+        let Ok(stamped) = stamped else {
+            return;
+        };
+        assert_eq!(stamped.warnings.len(), 1);
+        assert_eq!(stamped.events.len(), 1);
+        assert_eq!(stamped.events[0].at_ms, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_to_file_stamps_every_line_and_skips_unknown() {
+        let path = test_jsonl_path("write-stamp");
+        let finished = SessionEvent::TurnFinished {
+            session_id: SessionId(String::from("s")),
+            turn_id: TurnId(String::from("turn-0")),
+            outcome: TurnOutcome::Completed,
+            reason: None,
+        };
+        let mut log = SessionLog::default();
+        log.push(finished);
+        log.push(SessionEvent::Unknown);
+        log.push(SessionEvent::ApprovalModeChanged {
+            session_id: SessionId(String::from("s")),
+            mode: yach_proto::ApprovalMode::Review,
+        });
+
+        assert!(log.write_to_file(&path).is_ok());
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        let values: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap_or_default())
+            .collect();
+        assert!(values.iter().all(|value| {
+            value
+                .get("at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        }));
+        assert_eq!(
+            values[0].get("type").and_then(serde_json::Value::as_str),
+            Some("turn_finished")
+        );
+        assert_eq!(
+            values[1].get("type").and_then(serde_json::Value::as_str),
+            Some("approval_mode_changed")
+        );
+        assert!(values.iter().all(|value| {
+            value.get("type").and_then(serde_json::Value::as_str) != Some("unknown")
+        }));
+    }
+
+    #[test]
+    fn provider_attempt_finished_round_trips_flattened_and_keeps_turn_id() {
+        let event = SessionEvent::ProviderAttemptFinished {
+            session_id: SessionId(String::from("s")),
+            turn_id: TurnId(String::from("turn-4")),
+            attempt: ProviderAttemptSummary {
+                purpose: ProviderAttemptPurpose::CompactionSummary,
+                attempt_sequence: 7,
+                retry_index: 1,
+                outcome: ProviderAttemptOutcome::Failed,
+                error_kind: Some(crate::ProviderErrorKind::Network),
+                classification_source: Some(crate::ClassificationSource::Variant),
+                error_variant: Some(String::from("http")),
+                status_code: None,
+                provider_code: None,
+                timeout_phase: None,
+                retry_after_ms: None,
+                next_delay_ms: Some(1_000),
+                started_at_ms: 1_700_000_000_000,
+                duration_ms: 42,
+                first_event_ms: None,
+                provider_request_id: None,
+                model: String::from("gpt-fixture"),
+                capture: None,
+            },
+        };
+
+        let line = serde_json::to_string(&event);
+        assert!(line.is_ok());
+        let Ok(line) = line else {
+            return;
+        };
+        let value = serde_json::from_str::<serde_json::Value>(&line);
+        assert!(value.is_ok());
+        let Ok(value) = value else {
+            return;
+        };
+        assert_eq!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("provider_attempt_finished")
+        );
+        assert_eq!(
+            value
+                .get("attempt_sequence")
+                .and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            value.get("purpose").and_then(serde_json::Value::as_str),
+            Some("compaction_summary")
+        );
+        assert!(value.get("attempt").is_none());
+        assert_eq!(
+            value
+                .get("classification_source")
+                .and_then(serde_json::Value::as_str),
+            Some("variant")
+        );
+
+        let parsed = serde_json::from_str::<SessionEvent>(&line);
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
+        assert_eq!(parsed, event);
+        assert_eq!(event_turn_id(&event), Some(&TurnId(String::from("turn-4"))));
+
+        let path = test_jsonl_path("provider-attempt");
+        let mut log = SessionLog::default();
+        log.push(event);
+        assert!(log.write_to_file(&path).is_ok());
+        let loaded = SessionLog::load_from_file(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else {
+            return;
+        };
+        assert_eq!(loaded.events, log.events);
+        assert_eq!(loaded.next_turn_index(), 5);
     }
 }

@@ -46,6 +46,8 @@ mod tools;
 mod user_config;
 
 pub mod model_discovery;
+mod recording_http;
+pub use recording_http::AttemptRecorder;
 pub mod rig_adapter;
 pub mod rig_diagnostics;
 
@@ -1817,6 +1819,15 @@ mod tests {
                 ..
             })
         ));
+        let finished = log.events.iter().find_map(|event| match event {
+            SessionEvent::ToolExecutionFinished {
+                started_at_ms,
+                duration_ms,
+                ..
+            } => Some((*started_at_ms, *duration_ms)),
+            _ => None,
+        });
+        assert!(matches!(finished, Some((Some(_), Some(_)))));
     }
 
     #[test]
@@ -3192,6 +3203,15 @@ mod tests {
                 ..
             })
         ));
+        let finished = log.events.iter().find_map(|event| match event {
+            SessionEvent::ToolExecutionFinished {
+                started_at_ms,
+                duration_ms,
+                ..
+            } => Some((*started_at_ms, *duration_ms)),
+            _ => None,
+        });
+        assert!(matches!(finished, Some((None, None))));
     }
 
     #[test]
@@ -3700,6 +3720,7 @@ mod tests {
             },
             request,
             proposal,
+            crate::ToolTiming::default(),
         );
         let Ok(AgentEditToolPrepared::NeedsUserReview {
             trace_id,
@@ -3742,6 +3763,7 @@ mod tests {
                 operation,
             },
             None,
+            crate::ToolTiming::default(),
         );
 
         assert!(result.is_ok());
@@ -3875,6 +3897,7 @@ mod tests {
                 path,
                 operation,
             },
+            crate::ToolTiming::default(),
         );
 
         assert!(result.is_ok());
@@ -3889,6 +3912,102 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root_guard.root().join("notes.txt")).ok(),
             Some(String::from("alpha\n"))
+        );
+    }
+
+    #[test]
+    fn failed_edit_apply_records_execution_timing() {
+        let root_guard = temp_native_edit_root("agent-edit-apply-fail-timing");
+        root_guard.write("notes.txt", "alpha\n");
+        let root = ResourceRoot::project(root_guard.root());
+        assert!(root.is_ok());
+        let Ok(root) = root else {
+            unreachable!("asserted root creation succeeds");
+        };
+        let store_path = root_guard.root().join("session.jsonl");
+        let store = JsonlSessionStore::new(store_path);
+        let registry = ToolRegistry::with_agent_edit_tools();
+        let mut access = EditAccess::default();
+        let prepared = prepare_agent_edit_tool_request(
+            &registry,
+            &root,
+            &mut access,
+            &store,
+            AgentEditToolContext {
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                permission_policy: PermissionPolicy::default_local_edit(),
+                edit_policy: EditPolicy::test(),
+                review_policy: crate::ReviewPolicy::empty(),
+                authorization_revision: 0,
+            },
+            PendingToolRequest {
+                request_id: String::from("tool-request-2"),
+                turn_id: TurnId(String::from("turn-1")),
+                tool_name: String::from("edit_text_file"),
+                provider_call_id: Some(String::from("call-edit-2")),
+                arguments: serde_json::json!({
+                    "path": "notes.txt",
+                    "find": "alpha",
+                    "replace": "beta"
+                }),
+            },
+        );
+        let Ok(AgentEditToolPrepared::NeedsUserReview {
+            trace_id,
+            request_id,
+            provider_call_id,
+            preview,
+            path,
+            operation,
+        }) = prepared
+        else {
+            unreachable!("review-mode edit should wait for approval");
+        };
+        assert!(
+            std::fs::write(
+                root_guard.root().join("notes.txt"),
+                "changed after preview\n",
+            )
+            .is_ok()
+        );
+        let applied = apply_agent_edit_tool_review(
+            &mut access,
+            &store,
+            PendingAgentEditToolReview {
+                trace_id,
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                request_id,
+                provider_call_id,
+                preview_id: preview.preview_id,
+                permission_decision_id: preview.permission_decision_id,
+                path,
+                operation,
+            },
+            None,
+            crate::ToolTiming::default(),
+        );
+        assert!(applied.is_err(), "stale file should fail apply");
+        let log = store.load();
+        assert!(log.is_ok());
+        let Ok(log) = log else {
+            return;
+        };
+        let finished = log.events.iter().find_map(|event| match event {
+            SessionEvent::ToolExecutionFinished {
+                tool_request_id,
+                started_at_ms,
+                duration_ms,
+                ..
+            } if tool_request_id == &ToolRequestId(String::from("tool-request-2")) => {
+                Some((*started_at_ms, *duration_ms))
+            }
+            _ => None,
+        });
+        assert!(
+            matches!(finished, Some((Some(_), Some(_)))),
+            "failed apply dropped timing: {finished:?}"
         );
     }
 
@@ -4243,6 +4362,7 @@ mod tests {
                 path,
                 operation,
             },
+            crate::ToolTiming::default(),
         );
 
         assert!(result.is_ok());
@@ -5376,6 +5496,8 @@ mod tests {
             reason: None,
             result_summary: Some(result_summary),
             result_content: None,
+            started_at_ms: None,
+            duration_ms: None,
         });
         let path = temp_log_path("native-session-tool-records");
 
@@ -5408,6 +5530,8 @@ mod tests {
                 &finished,
                 Ok(SessionEvent::ToolExecutionFinished {
                     result_content: None,
+                    started_at_ms: None,
+                    duration_ms: None,
                     ..
                 })
             ),
@@ -5449,6 +5573,8 @@ mod tests {
             result_content: Some(String::from(
                 r#"{"path":"notes.txt","text":"alpha\n","truncated":false}"#,
             )),
+            started_at_ms: None,
+            duration_ms: None,
         });
         let path = temp_log_path("native-session-tool-content-records");
 
@@ -7013,6 +7139,8 @@ fn session_resume_projection_derives_next_ids_and_transcript() {
         reason: None,
         result_summary: None,
         result_content: None,
+        started_at_ms: None,
+        duration_ms: None,
     });
     log.push(SessionEvent::TurnFinished {
         session_id: session_id.clone(),

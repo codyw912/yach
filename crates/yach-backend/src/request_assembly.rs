@@ -62,6 +62,8 @@ fn build_fixture_log(turns: usize, tool_calls_per_turn: usize) -> SessionLog {
                     truncated: false,
                 }),
                 result_content: Some(String::from("fn example() {}")),
+                started_at_ms: None,
+                duration_ms: None,
             });
         }
     }

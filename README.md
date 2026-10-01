@@ -147,6 +147,11 @@ session. Multi-turn scripts via `--script turns.jsonl`; the outcome
 document lands on stdout, streaming progress on stderr, exit codes
 0/1/2/3/4 for completed/failed/setup/approval-required/timeout.
 
+Inspect a session afterwards with `yach sessions list` (newest first) and
+`yach sessions show latest` (or a session id). `show` prints a per-turn
+timeline of prompts, tool calls, and provider attempts with their timings;
+add `--json` to either command for one machine-readable line.
+
 Environment:
 
 | Variable | Default | Purpose |
@@ -161,6 +166,7 @@ Environment:
 | `YACH_RIG_PROVIDER_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
 | `YACH_THEME` | auto-discovered | Explicit path to a TUI theme JSON file. |
 | `YACH_SESSION_DIR` | project-keyed directory under `~/.yach/sessions/` | Absolute override for session storage and lookup. |
+| `YACH_CAPTURE_REQUESTS` | off | Absolute directory. Writes each OpenAI, OpenAI-compatible, ChatGPT-subscription, and native-compaction request body, one private file per attempt. Anthropic requests are not captured. Authentication headers are never written; bodies are the exact request bodies, so they contain whatever the prompt and files contain. Keep capture off unless diagnosing a request. |
 
 Launching without credentials still opens the TUI and explains what is
 missing; prompts fail with the setup error until the environment is fixed.
@@ -280,6 +286,20 @@ JSONL files there, then remove the old directory. Session logs record the full
 model-visible transcript — including tool arguments and results — so resume is
 lossless. The sensitive-file deny list keeps secrets out of both the model's
 context and these logs. Logs never leave your machine.
+
+Each session line carries a wall-clock `at_ms` timestamp. Tool results record
+when they started and how long they ran. Every provider attempt records one
+bounded event: its outcome, error class, HTTP status, retry delay, duration,
+time to first event, and the provider's request ID from the response headers.
+Request bodies, headers, and credentials are never written to the session
+log. With `YACH_CAPTURE_REQUESTS` set, OpenAI, OpenAI-compatible,
+ChatGPT-subscription, and native-compaction request bodies go to separate
+`0600` files under `<dir>/<session-id>/`, one per attempt and never
+overwritten, and the attempt event names its capture file. Anthropic
+requests are not captured. Authentication headers are never written to
+capture files; bodies are the exact request bodies, so they contain whatever
+the prompt and files contain. `yach sessions show` reads only the session
+log.
 
 ## Workspace layout
 

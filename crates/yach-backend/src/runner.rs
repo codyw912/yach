@@ -992,6 +992,8 @@ pub async fn run_native_loop(
             approved_tools: provider_approved_tools(components),
             prompt_attempt_reset: false,
             trace: trace.clone(),
+            capture_dir: crate::recording_http::capture_dir_from_env(),
+            recorder: crate::AttemptRecorder::default(),
         },
     )
     .await;
@@ -1024,6 +1026,8 @@ pub async fn run_native_loop_with_negotiated_capabilities(
             approved_tools: provider_approved_tools(components),
             prompt_attempt_reset,
             trace: trace.clone(),
+            capture_dir: crate::recording_http::capture_dir_from_env(),
+            recorder: crate::AttemptRecorder::default(),
         },
     )
     .await;
@@ -3901,7 +3905,9 @@ pub(crate) fn provider_messages_from_event_slice(
         | SessionEvent::EditTransactionPrepared { .. }
         | SessionEvent::EditTransactionFinished { .. }
         | SessionEvent::CompactionCheckpoint { .. }
-        | SessionEvent::ToolResultMasked { .. } => Vec::new(),
+        | SessionEvent::ToolResultMasked { .. }
+        | SessionEvent::ProviderAttemptFinished { .. }
+        | SessionEvent::Unknown => Vec::new(),
     }));
     messages
 }
@@ -4053,6 +4059,17 @@ pub(crate) trait ProviderRequester: Send {
         let _ = live;
         self.request_attempt(request)
     }
+
+    /// Labels the attempt about to start. Default is a no-op so existing
+    /// requesters keep compiling.
+    fn begin_attempt(&mut self, label: AttemptLabel) {
+        let _ = label;
+    }
+
+    /// Diagnostics captured for the attempt that just settled. Called once.
+    fn take_attempt_diagnostics(&mut self) -> AttemptDiagnostics {
+        AttemptDiagnostics::default()
+    }
 }
 
 struct RigProviderRequester {
@@ -4060,6 +4077,8 @@ struct RigProviderRequester {
     approved_tools: Vec<String>,
     prompt_attempt_reset: bool,
     trace: Option<yach_trace::TraceSink>,
+    capture_dir: Option<PathBuf>,
+    recorder: crate::AttemptRecorder,
 }
 
 impl ProviderRequester for RigProviderRequester {
@@ -4089,6 +4108,7 @@ impl ProviderRequester for RigProviderRequester {
         let adapter = self.adapter.clone();
         let approved_tools = self.approved_tools.clone();
         let trace = self.trace.clone();
+        let recorder = self.recorder.clone();
         Box::pin(async move {
             run_provider_request_attempt_with_approved_tools(
                 &adapter,
@@ -4096,9 +4116,24 @@ impl ProviderRequester for RigProviderRequester {
                 approved_tools,
                 live,
                 trace,
+                Some(recorder),
             )
             .await
         })
+    }
+
+    fn begin_attempt(&mut self, label: AttemptLabel) {
+        self.recorder = crate::AttemptRecorder::new(
+            self.capture_dir
+                .as_deref()
+                .map(|dir| crate::recording_http::capture_path(dir, &label)),
+        );
+    }
+
+    fn take_attempt_diagnostics(&mut self) -> AttemptDiagnostics {
+        let diagnostics = self.recorder.diagnostics();
+        self.recorder = crate::AttemptRecorder::default();
+        diagnostics
     }
 
     fn supports_prefix_resume(&self, _: &ProviderRequest) -> bool {
@@ -5253,6 +5288,13 @@ narrow the request or start a fresh session",
                 session_id: session_id.0.as_str(),
                 attempt_sequence: &mut attempt_sequence,
                 trace,
+                attempts: Some(AttemptSink {
+                    session_id,
+                    purpose: crate::ProviderAttemptPurpose::Turn,
+                    log: &mut *log,
+                    pending_events: &mut *pending_events,
+                    store: tool_event_store,
+                }),
             },
         )
         .await;
@@ -5826,6 +5868,64 @@ fn build_native_provider_tool_continuation_request(
 
 const PROVIDER_RETRY_DELAYS_MS: [u64; 2] = [1_000, 2_000];
 const PROVIDER_RETRY_DELAY_BUDGET_MS: u64 = 30_000;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AttemptDiagnostics {
+    pub provider_request_id: Option<String>,
+    pub first_event_ms: Option<u64>,
+    pub capture: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttemptLabel {
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub purpose: crate::ProviderAttemptPurpose,
+    pub attempt_sequence: u64,
+}
+
+/// Where settled attempts go. With a store, each event is appended directly
+/// (never through the pending batch, so failure exits cannot drop it);
+/// without one it joins log + pending like any other event.
+pub(crate) struct AttemptSink<'a> {
+    pub session_id: &'a SessionId,
+    pub purpose: crate::ProviderAttemptPurpose,
+    pub log: &'a mut SessionLog,
+    pub pending_events: &'a mut Vec<SessionEvent>,
+    pub store: Option<&'a JsonlSessionStore>,
+}
+
+impl AttemptSink<'_> {
+    pub(crate) fn record(&mut self, turn_id: TurnId, attempt: crate::ProviderAttemptSummary) {
+        let event = SessionEvent::ProviderAttemptFinished {
+            session_id: self.session_id.clone(),
+            turn_id,
+            attempt,
+        };
+        if let Some(store) = self.store {
+            let _ = store.append_event(&event);
+        } else {
+            self.pending_events.push(event.clone());
+        }
+        self.log.push(event);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AttemptStart {
+    instant: Instant,
+    at_ms: u64,
+}
+
+enum AttemptSettle<'a> {
+    Stream {
+        events: &'a [ProviderStreamEvent],
+        partial_error: Option<&'a ProviderError>,
+        tool_round_used: bool,
+    },
+    Error(&'a ProviderError),
+    Cancelled,
+}
+
 struct ProviderRetryContext<'a> {
     review_tx: &'a mpsc::UnboundedSender<BackendEvent>,
     live: Option<&'a crate::rig_adapter::LiveDeltaSink>,
@@ -5834,6 +5934,7 @@ struct ProviderRetryContext<'a> {
     session_id: &'a str,
     trace: Option<&'a yach_trace::TraceSink>,
     attempt_sequence: &'a mut u64,
+    attempts: Option<AttemptSink<'a>>,
 }
 
 fn provider_retry_delay_ms(
@@ -5938,12 +6039,132 @@ fn finish_provider_retry_events(
     std::mem::take(completed_prefix)
 }
 
+#[derive(Default)]
+struct AttemptErrorFields {
+    kind: Option<ProviderErrorKind>,
+    classification_source: Option<crate::ClassificationSource>,
+    variant: Option<String>,
+    status_code: Option<u16>,
+    provider_code: Option<String>,
+    timeout_phase: Option<crate::TimeoutPhase>,
+    retry_after_ms: Option<u64>,
+}
+
+fn attempt_error_fields(error: Option<&ProviderError>) -> AttemptErrorFields {
+    let Some(error) = error else {
+        return AttemptErrorFields::default();
+    };
+    AttemptErrorFields {
+        kind: Some(error.kind),
+        classification_source: Some(error.metadata.classification_source),
+        variant: error.metadata.error_variant.map(str::to_owned),
+        status_code: error.metadata.status_code,
+        provider_code: error.metadata.provider_code.clone(),
+        timeout_phase: error.metadata.timeout_phase,
+        retry_after_ms: error.metadata.retry_after_ms,
+    }
+}
+
+fn stream_attempt_settle<'a>(
+    events: &'a [ProviderStreamEvent],
+    partial_error: Option<&'a ProviderError>,
+    tool_round_used: bool,
+) -> (crate::ProviderAttemptOutcome, Option<&'a ProviderError>) {
+    if events
+        .iter()
+        .any(|event| matches!(event, ProviderStreamEvent::Cancelled { .. }))
+    {
+        return (crate::ProviderAttemptOutcome::Cancelled, None);
+    }
+    if let Some(error) = events.iter().find_map(|event| match event {
+        ProviderStreamEvent::Failed { error, .. } => Some(error),
+        _ => None,
+    }) {
+        return (crate::ProviderAttemptOutcome::Failed, Some(error));
+    }
+    if events
+        .iter()
+        .any(|event| matches!(event, ProviderStreamEvent::Completed { .. }))
+    {
+        return match partial_error {
+            Some(error) => (crate::ProviderAttemptOutcome::Partial, Some(error)),
+            None => (crate::ProviderAttemptOutcome::Succeeded, None),
+        };
+    }
+    if tool_round_used {
+        return (crate::ProviderAttemptOutcome::Partial, partial_error);
+    }
+    (crate::ProviderAttemptOutcome::Failed, partial_error)
+}
+
+fn settle_attempt(
+    context: &mut ProviderRetryContext<'_>,
+    requester: &mut impl ProviderRequester,
+    request: &ProviderRequest,
+    start: AttemptStart,
+    settle: &AttemptSettle<'_>,
+    retry_index: usize,
+    next_delay_ms: Option<u64>,
+) {
+    let Some(sink) = context.attempts.as_mut() else {
+        return;
+    };
+    let diagnostics = requester.take_attempt_diagnostics();
+    let purpose = sink.purpose;
+    let (outcome, error, malformed) = match settle {
+        AttemptSettle::Cancelled => (crate::ProviderAttemptOutcome::Cancelled, None, false),
+        AttemptSettle::Error(error) => (crate::ProviderAttemptOutcome::Failed, Some(*error), false),
+        AttemptSettle::Stream {
+            events,
+            partial_error,
+            tool_round_used,
+        } => {
+            let (outcome, error) = stream_attempt_settle(events, *partial_error, *tool_round_used);
+            let malformed =
+                matches!(outcome, crate::ProviderAttemptOutcome::Failed) && error.is_none();
+            (outcome, error, malformed)
+        }
+    };
+    let mut fields = attempt_error_fields(error);
+    if malformed {
+        fields.kind = Some(ProviderErrorKind::MalformedStream);
+        fields.classification_source = Some(crate::ClassificationSource::Variant);
+    }
+    if matches!(outcome, crate::ProviderAttemptOutcome::Cancelled) {
+        fields.kind = None;
+        fields.classification_source = None;
+    }
+    sink.record(
+        request.turn_id.clone(),
+        crate::ProviderAttemptSummary {
+            purpose,
+            attempt_sequence: *context.attempt_sequence,
+            retry_index: u8::try_from(retry_index).unwrap_or(u8::MAX),
+            outcome,
+            error_kind: fields.kind,
+            classification_source: fields.classification_source,
+            error_variant: fields.variant,
+            status_code: fields.status_code,
+            provider_code: fields.provider_code,
+            timeout_phase: fields.timeout_phase,
+            retry_after_ms: fields.retry_after_ms,
+            next_delay_ms,
+            started_at_ms: start.at_ms,
+            duration_ms: u64::try_from(start.instant.elapsed().as_millis()).unwrap_or(u64::MAX),
+            first_event_ms: diagnostics.first_event_ms,
+            provider_request_id: diagnostics.provider_request_id,
+            model: request.model.model.clone(),
+            capture: diagnostics.capture,
+        },
+    );
+}
+
 /// Issue a provider request, retrying transient failures with backoff and
 /// a visible status per attempt. Non-transient errors return immediately.
 async fn provider_request_with_retry_context<Requester>(
     requester: &mut Requester,
     initial_request: &ProviderRequest,
-    context: ProviderRetryContext<'_>,
+    mut context: ProviderRetryContext<'_>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError>
 where
     Requester: ProviderRequester,
@@ -5951,8 +6172,8 @@ where
     let mut request = initial_request.clone();
     let mut completed_prefix = Vec::new();
     let mut completed_output = Vec::new();
-    let mut retry_index = 0;
-    let mut delay_spent_ms = 0;
+    let mut retry_index = 0_usize;
+    let mut delay_spent_ms = 0_u64;
     let mut pending_reset = None;
     let mut prefix_resume_active = false;
     *context.attempt_sequence = context.attempt_sequence.saturating_add(1).max(1);
@@ -5969,12 +6190,13 @@ where
         let live_bytes_baseline = context
             .live
             .map_or(0, crate::rig_adapter::LiveDeltaSink::byte_count);
+        let mut start: Option<AttemptStart> = None;
         let attempt = tokio::select! {
             biased;
             () = context.cancellation.cancelled() => {
-                return Err(ProviderError::cancelled(
+                Err(ProviderError::cancelled(
                     "native provider prompt cancelled during attempt"
-                ));
+                ))
             }
             result = async {
                 if let Some((attempt_sequence, discarded_utf8_bytes)) = pending_reset.take()
@@ -5991,15 +6213,56 @@ where
                         "native provider prompt reset delivery failed",
                     ));
                 }
+                start = Some(AttemptStart {
+                    instant: Instant::now(),
+                    at_ms: crate::unix_ms_now().unwrap_or(0),
+                });
+                if let Some(sink) = context.attempts.as_ref() {
+                    requester.begin_attempt(AttemptLabel {
+                        session_id: sink.session_id.clone(),
+                        turn_id: request.turn_id.clone(),
+                        purpose: sink.purpose,
+                        attempt_sequence: *context.attempt_sequence,
+                    });
+                }
                 mark_turn(context.trace, &request.turn_id, "provider_request_sent");
                 requester
                     .request_attempt_streaming(request.clone(), context.live.cloned())
                     .await
             } => result,
         };
+        let started = start;
+        let settle = |requester: &mut Requester,
+                      context: &mut ProviderRetryContext<'_>,
+                      request: &ProviderRequest,
+                      settle: &AttemptSettle<'_>,
+                      next_delay_ms: Option<u64>| {
+            if let Some(start) = started {
+                settle_attempt(
+                    context,
+                    requester,
+                    request,
+                    start,
+                    settle,
+                    retry_index,
+                    next_delay_ms,
+                );
+            }
+        };
 
         let (error, retry_request, visible_restart) = match attempt {
             Ok(ProviderStreamAttempt::Complete(events)) => {
+                settle(
+                    requester,
+                    &mut context,
+                    &request,
+                    &AttemptSettle::Stream {
+                        events: &events,
+                        partial_error: None,
+                        tool_round_used: false,
+                    },
+                    None,
+                );
                 return Ok(finish_provider_retry_events(
                     &mut completed_prefix,
                     &mut completed_output,
@@ -6015,6 +6278,17 @@ where
                     .iter()
                     .any(|event| matches!(event, ProviderStreamEvent::Completed { .. }))
                 {
+                    settle(
+                        requester,
+                        &mut context,
+                        &request,
+                        &AttemptSettle::Stream {
+                            events: &events,
+                            partial_error: Some(&error),
+                            tool_round_used: true,
+                        },
+                        None,
+                    );
                     return Ok(finish_provider_retry_events(
                         &mut completed_prefix,
                         &mut completed_output,
@@ -6025,23 +6299,36 @@ where
                     ProviderStreamEvent::ToolCallCompleted { turn_id, .. } => Some(turn_id.clone()),
                     _ => None,
                 }) {
-                    if !tool_round_complete
-                        || error.metadata.hard_non_retryable_status()
-                        || !provider_error_is_transient(error.kind)
-                    {
-                        return Err(error);
+                    let used = tool_round_complete
+                        && !error.metadata.hard_non_retryable_status()
+                        && provider_error_is_transient(error.kind);
+                    if used {
+                        events.push(ProviderStreamEvent::Completed {
+                            turn_id,
+                            finish_reason: Some(ProviderFinishReason::ToolCalls),
+                            usage: None,
+                            provider_response_id: None,
+                        });
                     }
-                    events.push(ProviderStreamEvent::Completed {
-                        turn_id,
-                        finish_reason: Some(ProviderFinishReason::ToolCalls),
-                        usage: None,
-                        provider_response_id: None,
-                    });
-                    return Ok(finish_provider_retry_events(
-                        &mut completed_prefix,
-                        &mut completed_output,
-                        events,
-                    ));
+                    settle(
+                        requester,
+                        &mut context,
+                        &request,
+                        &AttemptSettle::Stream {
+                            events: &events,
+                            partial_error: Some(&error),
+                            tool_round_used: used,
+                        },
+                        None,
+                    );
+                    if used {
+                        return Ok(finish_provider_retry_events(
+                            &mut completed_prefix,
+                            &mut completed_output,
+                            events,
+                        ));
+                    }
+                    return Err(error);
                 }
                 let supports_prefix_resume = requester.supports_prefix_resume(&request);
                 let retry_request = provider_retry_request_with_completed_prefix(
@@ -6054,6 +6341,17 @@ where
                         .live
                         .is_some_and(|sink| sink.count() > live_count_baseline);
                 if visible_restart && !context.reset_negotiated {
+                    settle(
+                        requester,
+                        &mut context,
+                        &request,
+                        &AttemptSettle::Stream {
+                            events: &events,
+                            partial_error: Some(&error),
+                            tool_round_used: false,
+                        },
+                        None,
+                    );
                     return Err(error);
                 }
                 if let Some(next_request) = retry_request.as_ref() {
@@ -6076,9 +6374,32 @@ where
                 }
                 (error, retry_request, visible_restart)
             }
-            Err(error) => (error, None, false),
+            Err(error) => {
+                if started.is_none() {
+                    return Err(error);
+                }
+                if error.kind == ProviderErrorKind::Cancelled {
+                    settle(
+                        requester,
+                        &mut context,
+                        &request,
+                        &AttemptSettle::Cancelled,
+                        None,
+                    );
+                    return Err(error);
+                }
+                (error, None, false)
+            }
         };
 
+        let next_delay_ms = provider_retry_delay_ms(&error, retry_index, delay_spent_ms);
+        settle(
+            requester,
+            &mut context,
+            &request,
+            &AttemptSettle::Error(&error),
+            next_delay_ms,
+        );
         wait_for_provider_retry(&error, retry_index, &mut delay_spent_ms, &context).await?;
         retry_index += 1;
         *context.attempt_sequence = context.attempt_sequence.saturating_add(1).max(1);
@@ -6125,6 +6446,7 @@ where
             session_id: "test",
             attempt_sequence: &mut attempt_sequence,
             trace: None,
+            attempts: None,
         },
     )
     .await
@@ -6435,7 +6757,10 @@ where
     let Some(cut) = crate::select_compaction_cut(run.log, run.config.keep_recent_tokens) else {
         return Ok(CompactionApplication::NotApplied);
     };
-    let previous = crate::newest_compaction_checkpoint(run.log);
+    let previous_summary =
+        crate::newest_compaction_checkpoint(run.log).map(|view| view.summary.to_owned());
+    let previous_details =
+        crate::newest_compaction_checkpoint(run.log).map(|view| view.details.clone());
     let mut mask_map = crate::masked_result_map(&run.log.events);
     mask_map.extend(crate::masked_result_map(&staged_masks));
     let preparation = crate::CompactionPreparation {
@@ -6443,8 +6768,8 @@ where
             &run.log.events[cut.fold_range.clone()],
             &mask_map,
         ),
-        previous_summary: previous.as_ref().map(|view| view.summary.to_owned()),
-        previous_details: previous.as_ref().map(|view| view.details.clone()),
+        previous_summary: previous_summary.clone(),
+        previous_details: previous_details.clone(),
         first_kept_entry_id: cut.first_kept_entry_id.clone(),
         tokens_before: pre_mask_estimate,
         reason: run.reason,
@@ -6454,19 +6779,83 @@ where
             run.native_request.clone(),
             run.focus_instructions.as_deref(),
         ),
+        recorder: native_selected.then(|| {
+            crate::AttemptRecorder::new(crate::recording_http::capture_dir_from_env().map(|dir| {
+                crate::recording_http::capture_path(
+                    &dir,
+                    &AttemptLabel {
+                        session_id: run.session_id.clone(),
+                        turn_id: run.turn_id.clone(),
+                        purpose: crate::ProviderAttemptPurpose::CompactionNative,
+                        attempt_sequence: attempt_sequence.saturating_add(1).max(1),
+                    },
+                )
+            }))
+        }),
     };
     if native_selected {
         *attempt_sequence = attempt_sequence.saturating_add(1).max(1);
     }
+    let native_recorder = preparation.recorder.clone();
     let native = if native_selected {
-        match tokio::select! {
+        let native_start = AttemptStart {
+            instant: Instant::now(),
+            at_ms: crate::unix_ms_now().unwrap_or(0),
+        };
+        let native_outcome = tokio::select! {
             () = run.cancellation.cancelled() => {
+                record_native_compaction_attempt(
+                    &mut AttemptSink {
+                        session_id: run.session_id,
+                        purpose: crate::ProviderAttemptPurpose::CompactionNative,
+                        log: &mut *run.log,
+                        pending_events: &mut *run.pending_events,
+                        store: run.tool_event_store,
+                    },
+                    run.turn_id,
+                    run.model,
+                    *attempt_sequence,
+                    native_start,
+                    NativeAttemptSettle::Cancelled,
+                    native_recorder
+                        .as_ref()
+                        .map(crate::AttemptRecorder::diagnostics)
+                        .unwrap_or_default(),
+                );
                 return Err(ProviderRoundError::Cancelled(String::from(
                     "native provider prompt cancelled",
                 )));
             }
             outcome = compactor.compact(preparation.clone()) => outcome,
-        } {
+        };
+        let settle = match &native_outcome {
+            Ok(outcome) if crate::native_window_is_replayable(&outcome.artifact.window) => {
+                NativeAttemptSettle::Succeeded
+            }
+            Ok(_) => NativeAttemptSettle::Malformed,
+            Err(error) => native_attempt_settle(error),
+        };
+        if !matches!(settle, NativeAttemptSettle::NotAttempted) {
+            record_native_compaction_attempt(
+                &mut AttemptSink {
+                    session_id: run.session_id,
+                    purpose: crate::ProviderAttemptPurpose::CompactionNative,
+                    log: &mut *run.log,
+                    pending_events: &mut *run.pending_events,
+                    store: run.tool_event_store,
+                },
+                run.turn_id,
+                run.model,
+                *attempt_sequence,
+                native_start,
+                settle,
+                native_recorder
+                    .as_ref()
+                    .map(crate::AttemptRecorder::diagnostics)
+                    .unwrap_or_default(),
+            );
+        }
+        match native_outcome {
             Ok(outcome) if crate::native_window_is_replayable(&outcome.artifact.window) => {
                 Some(outcome)
             }
@@ -6509,7 +6898,7 @@ where
         None
     };
     let mut details = crate::merge_compaction_file_details(
-        previous.as_ref().map(|view| view.details),
+        previous_details.as_ref(),
         &run.log.events[cut.fold_range.clone()],
     );
     if let Some(object) = details.as_object_mut() {
@@ -6571,6 +6960,13 @@ where
             session_id: "compaction",
             attempt_sequence,
             trace: None,
+            attempts: Some(AttemptSink {
+                session_id: run.session_id,
+                purpose: crate::ProviderAttemptPurpose::CompactionSummary,
+                log: &mut *run.log,
+                pending_events: &mut *run.pending_events,
+                store: run.tool_event_store,
+            }),
         },
     )
     .await
@@ -7059,6 +7455,97 @@ fn commit_native_replay_round(
     state.synced_event_count = synced_event_count;
 }
 
+#[derive(Clone, Copy)]
+enum NativeAttemptSettle {
+    Succeeded,
+    Malformed,
+    Failed {
+        kind: ProviderErrorKind,
+        status_code: Option<u16>,
+    },
+    Cancelled,
+    NotAttempted,
+}
+
+fn native_attempt_settle(error: &crate::CompactionError) -> NativeAttemptSettle {
+    match error {
+        crate::CompactionError::UnsupportedProvider { .. }
+        | crate::CompactionError::MissingNativeRequest => NativeAttemptSettle::NotAttempted,
+        crate::CompactionError::Timeout => NativeAttemptSettle::Failed {
+            kind: ProviderErrorKind::Timeout,
+            status_code: None,
+        },
+        crate::CompactionError::Transport => NativeAttemptSettle::Failed {
+            kind: ProviderErrorKind::Network,
+            status_code: None,
+        },
+        crate::CompactionError::HttpStatus { status } => NativeAttemptSettle::Failed {
+            kind: crate::error_dialect::generic_status_kind(Some(*status))
+                .unwrap_or(ProviderErrorKind::Unknown),
+            status_code: Some(*status),
+        },
+        crate::CompactionError::Decode | crate::CompactionError::InvalidOutput => {
+            NativeAttemptSettle::Malformed
+        }
+    }
+}
+
+fn record_native_compaction_attempt(
+    sink: &mut AttemptSink<'_>,
+    turn_id: &TurnId,
+    model: &ProviderModel,
+    attempt_sequence: u64,
+    start: AttemptStart,
+    settle: NativeAttemptSettle,
+    diagnostics: AttemptDiagnostics,
+) {
+    let (outcome, error_kind, status_code) = match settle {
+        NativeAttemptSettle::Succeeded => (crate::ProviderAttemptOutcome::Succeeded, None, None),
+        NativeAttemptSettle::Malformed => (
+            crate::ProviderAttemptOutcome::Failed,
+            Some(ProviderErrorKind::MalformedStream),
+            None,
+        ),
+        NativeAttemptSettle::Failed { kind, status_code } => (
+            crate::ProviderAttemptOutcome::Failed,
+            Some(kind),
+            status_code,
+        ),
+        NativeAttemptSettle::Cancelled => (crate::ProviderAttemptOutcome::Cancelled, None, None),
+        NativeAttemptSettle::NotAttempted => return,
+    };
+    let classification_source = error_kind.map(|_| {
+        if status_code.is_some() {
+            crate::ClassificationSource::Status
+        } else {
+            crate::ClassificationSource::Variant
+        }
+    });
+    sink.record(
+        turn_id.clone(),
+        crate::ProviderAttemptSummary {
+            purpose: crate::ProviderAttemptPurpose::CompactionNative,
+            attempt_sequence,
+            retry_index: 0,
+            outcome,
+            error_kind,
+            classification_source,
+            error_variant: None,
+            status_code,
+            provider_code: None,
+            timeout_phase: None,
+            retry_after_ms: None,
+            next_delay_ms: None,
+            started_at_ms: start.at_ms,
+            duration_ms: u64::try_from(start.instant.elapsed().as_millis()).unwrap_or(u64::MAX),
+            first_event_ms: diagnostics.first_event_ms,
+            provider_request_id: diagnostics.provider_request_id,
+            model: model.model.clone(),
+            capture: diagnostics.capture,
+        },
+    );
+}
+
 const fn native_compaction_error_reason(error: &crate::CompactionError) -> &'static str {
     match error {
         crate::CompactionError::UnsupportedProvider { .. } => "unsupported provider",
@@ -7258,10 +7745,12 @@ fn execute_native_provider_readonly_tool_request(
             "tool_round_validation_failed",
         )));
     };
-    let execution = match batch
+    let timer = crate::ToolTimer::start();
+    let raw_execution = batch
         .read_only_executor
-        .execute(batch.registry, &request, &validation)
-    {
+        .execute(batch.registry, &request, &validation);
+    let timing = timer.stop();
+    let execution = match raw_execution {
         Ok(execution) => execution,
         Err(crate::ToolExecutionError::ResourcePath {
             error: crate::ResourcePathError::SensitiveDenied,
@@ -7283,6 +7772,8 @@ fn execute_native_provider_readonly_tool_request(
                     truncated: false,
                 }),
                 result_content: Some(result.content.clone()),
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.duration_ms,
             });
             extend_pending_after_tool_events(batch, tool_event_start);
             return Ok(result);
@@ -7306,6 +7797,8 @@ fn execute_native_provider_readonly_tool_request(
                         truncated: false,
                     }),
                     result_content: Some(result.content.clone()),
+                    started_at_ms: timing.started_at_ms,
+                    duration_ms: timing.duration_ms,
                 });
                 extend_pending_after_tool_events(batch, tool_event_start);
                 return Ok(result);
@@ -7318,6 +7811,8 @@ fn execute_native_provider_readonly_tool_request(
                 reason: Some(String::from("tool_round_execution_failed")),
                 result_summary: None,
                 result_content: None,
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.duration_ms,
             });
             extend_pending_after_tool_events(batch, tool_event_start);
             return Err(ProviderRoundError::ToolContinuation(String::from(
@@ -7338,6 +7833,8 @@ fn execute_native_provider_readonly_tool_request(
             reason: Some(reason),
             result_summary: None,
             result_content: None,
+            started_at_ms: timing.started_at_ms,
+            duration_ms: timing.duration_ms,
         });
         extend_pending_after_tool_events(batch, tool_event_start);
         return Err(error);
@@ -7351,6 +7848,8 @@ fn execute_native_provider_readonly_tool_request(
         reason: None,
         result_summary: Some(result_summary),
         result_content: Some(execution.summary.clone()),
+        started_at_ms: timing.started_at_ms,
+        duration_ms: timing.duration_ms,
     });
     extend_pending_after_tool_events(batch, tool_event_start);
     Ok(ProviderToolResult {
@@ -7435,6 +7934,8 @@ async fn execute_native_provider_extension_tool_request(
             reason: Some(String::from("tool_round_execution_failed")),
             result_summary: None,
             result_content: None,
+            started_at_ms: None,
+            duration_ms: None,
         });
         extend_pending_after_tool_events(batch, tool_event_start);
         return Err(ProviderRoundError::ToolContinuation(String::from(
@@ -7462,12 +7963,14 @@ async fn execute_native_provider_extension_tool_request(
             crate::ToolOwner::BuiltIn => None,
         });
     mark_extension_invoke(batch, "extension_invoke_start", extension_id.as_deref());
+    let timer = crate::ToolTimer::start();
     let raw_execution = extension_executor.execute_with_resources(
         batch.registry,
         &implementation_request,
         &validation,
         &resources,
     );
+    let timing = timer.stop();
     mark_extension_invoke(batch, "extension_invoke_end", extension_id.as_deref());
     let execution = raw_execution.map_err(|_| {
         batch.log.push(SessionEvent::ToolExecutionFinished {
@@ -7478,6 +7981,8 @@ async fn execute_native_provider_extension_tool_request(
             reason: Some(String::from("tool_round_execution_failed")),
             result_summary: None,
             result_content: None,
+            started_at_ms: timing.started_at_ms,
+            duration_ms: timing.duration_ms,
         });
         extend_pending_after_tool_events(batch, tool_event_start);
         ProviderRoundError::ToolContinuation(String::from("tool_round_execution_failed"))
@@ -7501,6 +8006,8 @@ async fn execute_native_provider_extension_tool_request(
                     reason: Some(reason),
                     result_summary: None,
                     result_content: None,
+                    started_at_ms: timing.started_at_ms,
+                    duration_ms: timing.duration_ms,
                 });
                 extend_pending_after_tool_events(batch, tool_event_start);
                 return Err(error);
@@ -7519,6 +8026,8 @@ async fn execute_native_provider_extension_tool_request(
                 reason: reason.clone(),
                 result_summary: Some(result_summary),
                 result_content: Some(execution.summary.clone()),
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.duration_ms,
             });
             extend_pending_after_tool_events(batch, tool_event_start);
             Ok(ProviderToolResult {
@@ -7546,6 +8055,8 @@ async fn execute_native_provider_extension_tool_request(
                     reason: Some(String::from("extension_edit_proposal_risk_mismatch")),
                     result_summary: None,
                     result_content: None,
+                    started_at_ms: timing.started_at_ms,
+                    duration_ms: timing.duration_ms,
                 });
                 extend_pending_after_tool_events(batch, tool_event_start);
                 return Err(ProviderRoundError::ToolContinuation(String::from(
@@ -7582,12 +8093,13 @@ async fn execute_native_provider_extension_tool_request(
                 },
                 request,
                 proposal,
+                timing,
             );
             drain_edit_sink_events(batch)?;
             let prepared = prepared.map_err(|error| {
                 ProviderRoundError::ToolContinuation(tool_round_error_label(&error))
             })?;
-            finish_prepared_edit_tool_request(batch, tool_name, prepared).await
+            finish_prepared_edit_tool_request(batch, tool_name, prepared, timing).await
         }
     }
 }
@@ -7692,12 +8204,14 @@ async fn execute_native_provider_edit_tool_request(
     drain_edit_sink_events(batch)?;
     let prepared = prepared
         .map_err(|error| ProviderRoundError::ToolContinuation(tool_round_error_label(&error)))?;
-    finish_prepared_edit_tool_request(batch, tool_name, prepared).await
+    finish_prepared_edit_tool_request(batch, tool_name, prepared, crate::ToolTiming::default())
+        .await
 }
 async fn finish_prepared_edit_tool_request(
     batch: &mut ProviderAgentToolBatch<'_>,
     tool_name: String,
     prepared: AgentEditToolPrepared,
+    prior_timing: crate::ToolTiming,
 ) -> Result<ProviderToolResult, ProviderRoundError> {
     let result = match prepared {
         AgentEditToolPrepared::Completed { trace_id, result }
@@ -7745,6 +8259,7 @@ async fn finish_prepared_edit_tool_request(
                         path,
                         operation,
                     },
+                    prior_timing,
                 );
                 drain_edit_sink_events(batch)?;
                 let result = rejected.map_err(|error| {
@@ -7815,6 +8330,12 @@ async fn finish_prepared_edit_tool_request(
                         });
                         tokio::select! {
                             () = batch.cancellation.cancelled() => {
+                                record_interrupted_prepared_edit(
+                                    batch,
+                                    &request_id,
+                                    "native provider prompt cancelled",
+                                    prior_timing,
+                                );
                                 return Err(ProviderRoundError::Cancelled(String::from(
                                     "native provider prompt cancelled",
                                 )));
@@ -7846,6 +8367,7 @@ async fn finish_prepared_edit_tool_request(
                                 operation,
                             },
                             coordinator.snapshot(),
+                            prior_timing,
                         );
                         drain_edit_sink_events(batch)?;
                         let result = reviewed.map_err(|error| {
@@ -7890,6 +8412,7 @@ async fn finish_prepared_edit_tool_request(
                                 path,
                                 operation,
                             },
+                            prior_timing,
                         );
                         drain_edit_sink_events(batch)?;
                         let result = rejected.map_err(|error| {
@@ -7916,6 +8439,12 @@ async fn finish_prepared_edit_tool_request(
                 }
             }
             if !batch.structured_review_rows {
+                record_interrupted_prepared_edit(
+                    batch,
+                    &request_id,
+                    "structured_review_rows_not_negotiated",
+                    prior_timing,
+                );
                 return Err(ProviderRoundError::ToolContinuation(String::from(
                     "structured_review_rows_not_negotiated",
                 )));
@@ -7966,10 +8495,16 @@ async fn finish_prepared_edit_tool_request(
                     SessionEvent::ToolReviewInterrupted {
                         session_id: batch.session_id.clone(),
                         turn_id: batch.turn_id.clone(),
-                        tool_request_id: ToolRequestId(request_id),
+                        tool_request_id: ToolRequestId(request_id.clone()),
                         reason: String::from("ui_receiver_dropped"),
                     },
                 )?;
+                record_interrupted_prepared_edit(
+                    batch,
+                    &request_id,
+                    "ui_receiver_dropped",
+                    prior_timing,
+                );
                 return Err(ProviderRoundError::Cancelled(String::from(
                     "ui receiver dropped during tool review",
                 )));
@@ -8029,25 +8564,41 @@ async fn finish_prepared_edit_tool_request(
                     decision
                 }
                 Err(error) => {
+                    let reason = provider_round_error_label(&error);
                     persist_tool_review_event(
                         batch,
                         SessionEvent::ToolReviewInterrupted {
                             session_id: batch.session_id.clone(),
                             turn_id: batch.turn_id.clone(),
                             tool_request_id: ToolRequestId(pending.request_id.clone()),
-                            reason: provider_round_error_label(&error),
+                            reason: reason.clone(),
                         },
                     )?;
+                    record_interrupted_prepared_edit(
+                        batch,
+                        &pending.request_id,
+                        &reason,
+                        prior_timing,
+                    );
                     return Err(error);
                 }
             };
             let reviewed = match decision {
                 ToolReviewDecision::Approve | ToolReviewDecision::ApproveForSession => {
-                    apply_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending, None)
+                    apply_agent_edit_tool_review(
+                        batch.edit_access,
+                        batch.edit_sink,
+                        pending,
+                        None,
+                        prior_timing,
+                    )
                 }
-                ToolReviewDecision::Reject => {
-                    reject_agent_edit_tool_review(batch.edit_access, batch.edit_sink, pending)
-                }
+                ToolReviewDecision::Reject => reject_agent_edit_tool_review(
+                    batch.edit_access,
+                    batch.edit_sink,
+                    pending,
+                    prior_timing,
+                ),
             };
             drain_edit_sink_events(batch)?;
             let result = reviewed.map_err(|error| {
@@ -8096,12 +8647,36 @@ fn exit_code_label(code: Option<i32>) -> String {
     code.map_or_else(|| String::from("unknown"), |code| code.to_string())
 }
 
+fn record_interrupted_prepared_edit(
+    batch: &mut ProviderAgentToolBatch<'_>,
+    request_id: &str,
+    reason: &str,
+    timing: crate::ToolTiming,
+) {
+    push_native_session_event(
+        batch.log,
+        batch.pending_events,
+        SessionEvent::ToolExecutionFinished {
+            session_id: batch.session_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_request_id: ToolRequestId(request_id.to_owned()),
+            outcome: ToolOutcome::Cancelled,
+            reason: Some(reason.to_owned()),
+            result_summary: None,
+            result_content: None,
+            started_at_ms: timing.started_at_ms,
+            duration_ms: timing.duration_ms,
+        },
+    );
+}
+
 fn record_native_bash_finished_event(
     batch: &mut ProviderAgentToolBatch<'_>,
     request_id: &str,
     outcome: ToolOutcome,
     reason: Option<String>,
     result: &ProviderToolResult,
+    timing: crate::ToolTiming,
 ) {
     push_native_session_event(
         batch.log,
@@ -8119,6 +8694,8 @@ fn record_native_bash_finished_event(
                 truncated: result.truncated,
             }),
             result_content: Some(result.content.clone()),
+            started_at_ms: timing.started_at_ms,
+            duration_ms: timing.duration_ms,
         },
     );
     mark_tool_result_appended(batch);
@@ -8319,7 +8896,8 @@ async fn execute_native_provider_bash_tool_request(
 
     let finish_failed = |batch: &mut ProviderAgentToolBatch<'_>,
                          reason: &str,
-                         guidance: &str|
+                         guidance: &str,
+                         timing: crate::ToolTiming|
      -> Result<ProviderToolResult, ProviderRoundError> {
         let result = failed_tool_result(&request, reason, guidance);
         record_native_bash_finished_event(
@@ -8328,6 +8906,7 @@ async fn execute_native_provider_bash_tool_request(
             ToolOutcome::Failed,
             Some(reason.to_owned()),
             &result,
+            timing,
         );
 
         Ok(result)
@@ -8355,6 +8934,7 @@ async fn execute_native_provider_bash_tool_request(
             crate::RESTRICTION_HUMAN_PERFORMS_REASON,
             "This action is reserved for the user to perform outside the agent. \
 Describe the exact command so the user can run it, then continue.",
+            crate::ToolTiming::default(),
         )
     };
 
@@ -8377,6 +8957,7 @@ Describe the exact command so the user can run it, then continue.",
                         "workdir_invalid",
                         "workdir must be an existing directory inside the project root. \
 Use list_project_paths to inspect the project layout.",
+                        crate::ToolTiming::default(),
                     );
                 }
             }
@@ -8393,6 +8974,7 @@ Use list_project_paths to inspect the project layout.",
             "unknown_shell_executor",
             "The configured shell.executor is not available in this build; only \"host\" \
 exists today. Ask the user to fix .yach/config.json.",
+            crate::ToolTiming::default(),
         );
     }
 
@@ -8426,6 +9008,7 @@ exists today. Ask the user to fix .yach/config.json.",
                 batch,
                 &reason,
                 "The command was denied by shell permission policy.",
+                crate::ToolTiming::default(),
             );
         }
         PermissionDecision::NeedsUserReview {
@@ -8439,6 +9022,7 @@ exists today. Ask the user to fix .yach/config.json.",
                     "reviewer_unavailable",
                     "Automatic review is selected but no reviewer host is active. \
 Select a reviewer extension or switch to a manual approval mode.",
+                    crate::ToolTiming::default(),
                 );
             };
             let action = crate::ReviewAction::ShellCommand {
@@ -8505,6 +9089,7 @@ Select a reviewer extension or switch to a manual approval mode.",
                             hold_reason,
                             "The reviewer held this command and the client cannot show \
 structured review rows.",
+                            crate::ToolTiming::default(),
                         );
                     }
                     let review_id = next_command_review_id();
@@ -8589,6 +9174,7 @@ structured review rows.",
                             "user_rejected",
                             "The user declined to run this command. Ask the user how to proceed \
 or take a different approach.",
+                            crate::ToolTiming::default(),
                         );
                     }
                     if review_decision == ToolReviewDecision::ApproveForSession {
@@ -8611,6 +9197,7 @@ or take a different approach.",
                             failure_reason,
                             "The reviewer failed and the client cannot show \
 structured review rows.",
+                            crate::ToolTiming::default(),
                         );
                     }
                     let review_id = next_command_review_id();
@@ -8695,6 +9282,7 @@ structured review rows.",
                             "user_rejected",
                             "The user declined to run this command. Ask the user how to proceed \
 or take a different approach.",
+                            crate::ToolTiming::default(),
                         );
                     }
                     if review_decision == ToolReviewDecision::ApproveForSession {
@@ -8713,6 +9301,7 @@ or take a different approach.",
                     "structured_review_rows_not_negotiated",
                     "Reconnect with a client that supports structured review rows before running \
 non-allowlisted commands.",
+                    crate::ToolTiming::default(),
                 );
             }
             let review_id = next_command_review_id();
@@ -8797,6 +9386,7 @@ non-allowlisted commands.",
                     "user_rejected",
                     "The user declined to run this command. Ask the user how to proceed \
 or take a different approach.",
+                    crate::ToolTiming::default(),
                 );
             }
             // Record only after the decision is persisted, so a grant can
@@ -8812,6 +9402,8 @@ or take a different approach.",
     // Live output: executor chunks forward to the UI as ToolCallOutput
     // while the command runs. join! polls both on this task; the forwarder
     // drains until the executor drops its sender at command end.
+    // Timing starts after approval, so a review wait is not tool time.
+    let timer = crate::ToolTimer::start();
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
     let run = crate::CommandExecutor::run(&crate::HostCommandExecutor, prepared, Some(chunk_tx));
     let forward = async {
@@ -8830,6 +9422,22 @@ or take a different approach.",
     };
     let run_result = tokio::select! {
         () = batch.cancellation.cancelled() => {
+            let timing = timer.stop();
+            let result = failed_tool_result(
+                &request,
+                "tool_round_cancelled",
+                "This tool call was cancelled. Retry it if the cancellation condition is resolved.",
+            );
+            let mut result = result;
+            result.status = ToolOutcome::Cancelled;
+            record_native_bash_finished_event(
+                batch,
+                &request.request_id,
+                ToolOutcome::Cancelled,
+                Some(String::from("tool_round_cancelled")),
+                &result,
+                timing,
+            );
             return Err(ProviderRoundError::Cancelled(String::from(
                 "native provider prompt cancelled",
             )));
@@ -8843,6 +9451,7 @@ or take a different approach.",
                 batch,
                 "spawn_failed",
                 &format!("The command could not be started: {error}."),
+                timer.stop(),
             );
         }
     };
@@ -8853,6 +9462,7 @@ or take a different approach.",
             "timeout",
             "The command exceeded its timeout and was killed. Retry with a larger timeout \
 argument, or run a narrower command.",
+            timer.stop(),
         );
     }
 
@@ -8892,6 +9502,7 @@ argument, or run a narrower command.",
         ToolOutcome::Completed,
         None,
         &result,
+        timer.stop(),
     );
 
     if let Some(store) = batch.tool_event_store
@@ -9112,6 +9723,8 @@ fn record_missing_provider_tool_batch_events(
                 truncated: result.truncated,
             }),
             result_content: Some(result.content.clone()),
+            started_at_ms: None,
+            duration_ms: None,
         });
     }
     extend_pending_after_tool_events(batch, event_start);
@@ -11164,6 +11777,16 @@ mod tests {
                 ..
             } if tool_request_id == &ToolRequestId(String::from("tool-request-1-1"))
         )));
+
+        let finished = pending_events.iter().find_map(|event| match event {
+            SessionEvent::ToolExecutionFinished {
+                started_at_ms,
+                duration_ms,
+                ..
+            } => Some((*started_at_ms, *duration_ms)),
+            _ => None,
+        });
+        assert!(matches!(finished, Some((Some(_), Some(_)))));
     }
 
     #[tokio::test]
@@ -11493,6 +12116,635 @@ mod tests {
                 if tool_request_id == &ToolRequestId(String::from("tool-request-1-1"))
         )));
     }
+
+    struct SlowProposalInvoker {
+        proposal: crate::ExtensionEditProposal,
+        delay: Duration,
+    }
+
+    impl crate::ExtensionHostInvoker for SlowProposalInvoker {
+        fn invoke(
+            &mut self,
+            _request_id: &str,
+            _tool_name: &str,
+            _arguments: serde_json::Value,
+            _timeout: Duration,
+            _resources: &dyn crate::ExtensionResourceBroker,
+        ) -> Result<crate::ExtensionHostInvocation, crate::ExtensionHostProtocolError> {
+            std::thread::sleep(self.delay);
+            Ok(crate::ExtensionHostInvocation::EditProposal(
+                self.proposal.clone(),
+            ))
+        }
+    }
+
+    fn proposal_edit_registry() -> (
+        ToolRegistry,
+        crate::ToolPermissionPolicy,
+        crate::ResolvedToolCatalog,
+    ) {
+        let mut registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        assert_eq!(
+            registry.register_extension_tool(crate::ToolDefinition::extension_tool_with_version(
+                "example.edit-tools",
+                None::<String>,
+                "proposal_edit",
+                "Propose a text edit.",
+                crate::ToolInputSchema::string_object(["input"], std::iter::empty::<&str>(), 1024),
+                ToolRisk::MutatesLocalState,
+                crate::ProviderToolVisibility::Visible,
+            )),
+            Ok(())
+        );
+        let permission_policy =
+            crate::ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file"],
+                ["proposal_edit"],
+            );
+        let resolved_catalog =
+            registry.resolve_provider_turn_catalog(&permission_policy, ["proposal_edit"]);
+        (registry, permission_policy, resolved_catalog)
+    }
+
+    #[test]
+    fn extension_proposal_preview_failure_keeps_extension_timing() {
+        let root = TempProject::new("extension-proposal-preview-timing");
+        root.write("notes.txt", "alpha\n");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let (registry, permission_policy, resolved_catalog) = proposal_edit_registry();
+        let extension_executor = crate::ExtensionToolExecutorRouter::from_handlers([(
+            "proposal_edit",
+            crate::ExtensionToolHandler::host_metadata(
+                "example.edit-tools",
+                SlowProposalInvoker {
+                    delay: Duration::from_millis(40),
+                    proposal: crate::ExtensionEditProposal {
+                        summary: String::from("bad hash"),
+                        operations: vec![crate::ExtensionEditProposalOperation::ModifyTextFile {
+                            path: String::from("notes.txt"),
+                            expected_sha256: String::from("not-the-file-hash"),
+                            after_text: String::from("beta\n"),
+                        }],
+                    },
+                },
+                Duration::from_secs(2),
+            ),
+        )]);
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let outcome = futures::executor::block_on(execute_native_provider_agent_tool_batch(
+            ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::FullAccess,
+                shell_session_grants: super::ShellSessionGrants::default(),
+                cancellation: CancellationToken::new(),
+                structured_review_rows: true,
+                session_id: SessionId(String::from("default")),
+                shell_policy: crate::ShellPolicy::default(),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: Some(&extension_executor),
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: None,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+            },
+            vec![ProviderToolCall {
+                call_id: String::from("call-proposal-1"),
+                name: String::from("proposal_edit"),
+                arguments_json: serde_json::json!({"input": "patch"}),
+            }],
+        ));
+        assert!(outcome.is_ok());
+        let finished = log.events.iter().find_map(|event| match event {
+            SessionEvent::ToolExecutionFinished {
+                outcome: ToolOutcome::Failed,
+                reason: Some(reason),
+                started_at_ms,
+                duration_ms,
+                ..
+            } if reason == "hash_mismatch" => Some((*started_at_ms, *duration_ms)),
+            _ => None,
+        });
+        assert!(
+            matches!(finished, Some((Some(_), Some(duration))) if duration >= 40),
+            "preview failure dropped extension timing: {finished:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_extension_proposal_adds_apply_time_and_excludes_review_wait() {
+        let root = TempProject::new("extension-proposal-apply-timing");
+        root.write("notes.txt", "alpha\n");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let (registry, permission_policy, resolved_catalog) = proposal_edit_registry();
+        let extension_executor = crate::ExtensionToolExecutorRouter::from_handlers([(
+            "proposal_edit",
+            crate::ExtensionToolHandler::host_metadata(
+                "example.edit-tools",
+                SlowProposalInvoker {
+                    delay: Duration::from_millis(80),
+                    proposal: crate::ExtensionEditProposal {
+                        summary: String::from("update notes"),
+                        operations: vec![crate::ExtensionEditProposalOperation::ModifyTextFile {
+                            path: String::from("notes.txt"),
+                            expected_sha256: crate::edit::sha256_hex_for_test("alpha\n"),
+                            after_text: String::from("beta\n"),
+                        }],
+                    },
+                },
+                Duration::from_secs(2),
+            ),
+        )]);
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+        let (decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let approval_delay = Duration::from_millis(400);
+        let approver = tokio::spawn(async move {
+            let requested = loop {
+                match review_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                        request_id,
+                        payload: ToolReviewPayload::LocalEdit { preview },
+                        ..
+                    })) => break (request_id, preview),
+                    Some(_) => {}
+                    None => unreachable!("review channel closed before an edit review"),
+                }
+            };
+            tokio::time::sleep(approval_delay).await;
+            let (request_id, preview) = requested;
+            assert!(
+                decision_tx
+                    .send(AgentEditReviewDecision {
+                        request_id,
+                        preview_id: preview.preview_id,
+                        permission_decision_id: preview.permission_decision_id,
+                        decision: ToolReviewDecision::Approve,
+                    })
+                    .is_ok()
+            );
+        });
+        let outcome = execute_native_provider_agent_tool_batch(
+            ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
+                shell_session_grants: super::ShellSessionGrants::default(),
+                cancellation: CancellationToken::new(),
+                structured_review_rows: true,
+                session_id: SessionId(String::from("default")),
+                shell_policy: crate::ShellPolicy::default(),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: Some(&extension_executor),
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: None,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+            },
+            vec![ProviderToolCall {
+                call_id: String::from("call-proposal-1"),
+                name: String::from("proposal_edit"),
+                arguments_json: serde_json::json!({"input": "patch"}),
+            }],
+        )
+        .await;
+        assert!(approver.await.is_ok());
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else {
+            return;
+        };
+        assert_eq!(outcome.results[0].status, ToolOutcome::Completed);
+        assert_eq!(
+            std::fs::read_to_string(root.root().join("notes.txt"))
+                .ok()
+                .as_deref(),
+            Some("beta\n")
+        );
+        let finished = log.events.iter().find_map(|event| match event {
+            SessionEvent::ToolExecutionFinished {
+                outcome: ToolOutcome::Completed,
+                started_at_ms,
+                duration_ms,
+                ..
+            } => Some((*started_at_ms, *duration_ms)),
+            _ => None,
+        });
+        let Some((Some(_), Some(duration_ms))) = finished else {
+            unreachable!("applied proposal finish event missing timing: {finished:?}");
+        };
+        assert!(
+            duration_ms >= 80,
+            "applied proposal dropped extension duration: {duration_ms}"
+        );
+        assert!(
+            duration_ms < u64::try_from(approval_delay.as_millis()).unwrap_or(u64::MAX),
+            "review wait counted as tool time: {duration_ms}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_extension_proposal_review_keeps_extension_timing() {
+        let root = TempProject::new("extension-proposal-review-cancel-timing");
+        root.write("notes.txt", "alpha\n");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let (registry, permission_policy, resolved_catalog) = proposal_edit_registry();
+        let extension_executor = crate::ExtensionToolExecutorRouter::from_handlers([(
+            "proposal_edit",
+            crate::ExtensionToolHandler::host_metadata(
+                "example.edit-tools",
+                SlowProposalInvoker {
+                    delay: Duration::from_millis(80),
+                    proposal: crate::ExtensionEditProposal {
+                        summary: String::from("update notes"),
+                        operations: vec![crate::ExtensionEditProposalOperation::ModifyTextFile {
+                            path: String::from("notes.txt"),
+                            expected_sha256: crate::edit::sha256_hex_for_test("alpha\n"),
+                            after_text: String::from("beta\n"),
+                        }],
+                    },
+                },
+                Duration::from_secs(2),
+            ),
+        )]);
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        let canceller_task = tokio::spawn(async move {
+            loop {
+                match review_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::ToolReviewRequested { .. })) => {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        canceller.cancel();
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        });
+        let outcome = execute_native_provider_agent_tool_batch(
+            ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
+                shell_session_grants: super::ShellSessionGrants::default(),
+                cancellation,
+                structured_review_rows: true,
+                session_id: SessionId(String::from("default")),
+                shell_policy: crate::ShellPolicy::default(),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: Some(&extension_executor),
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                tool_event_store: None,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+            },
+            vec![ProviderToolCall {
+                call_id: String::from("call-proposal-1"),
+                name: String::from("proposal_edit"),
+                arguments_json: serde_json::json!({"input": "patch"}),
+            }],
+        )
+        .await;
+        assert!(canceller_task.await.is_ok());
+        let Ok(outcome) = outcome else {
+            unreachable!("cancelled review must still return a terminal batch outcome");
+        };
+        assert!(matches!(
+            outcome.terminal_error,
+            Some(ProviderRoundError::Cancelled(_))
+        ));
+        assert_eq!(outcome.results[0].status, ToolOutcome::Cancelled);
+        assert_eq!(
+            std::fs::read_to_string(root.root().join("notes.txt"))
+                .ok()
+                .as_deref(),
+            Some("alpha\n"),
+            "a cancelled review must not apply the proposal"
+        );
+        let finished = log.events.iter().find_map(|event| match event {
+            SessionEvent::ToolExecutionFinished {
+                outcome: ToolOutcome::Cancelled,
+                started_at_ms,
+                duration_ms,
+                ..
+            } => Some((*started_at_ms, *duration_ms)),
+            _ => None,
+        });
+        let Some((Some(_), Some(duration_ms))) = finished else {
+            unreachable!("cancelled proposal finish dropped extension timing: {finished:?}");
+        };
+        assert!(
+            duration_ms >= 80,
+            "cancelled proposal dropped extension duration: {duration_ms}"
+        );
+        assert!(
+            duration_ms < 400,
+            "review wait counted as tool time: {duration_ms}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_bash_records_timing_instead_of_a_timingless_fallback() {
+        let root = TempProject::new("native-provider-bash-cancel-timing");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let permission_policy =
+            ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            )
+            .with_process_tools(["bash"]);
+        let resolved_catalog = registry.resolve_provider_turn_catalog(
+            &permission_policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+                "bash",
+            ],
+        );
+        let command = String::from("sleep 5");
+        let shell_policy = crate::ShellPolicy::from_config(crate::ShellConfig {
+            executor: String::from("host"),
+            allow: vec![command.clone()],
+            env_allow: Vec::new(),
+            default_timeout_ms: 30_000,
+            max_timeout_ms: 30_000,
+        });
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let (_decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            canceller.cancel();
+        });
+        let request = super::pending_tool_request_from_provider_call(
+            String::from("tool-request-1-1"),
+            TurnId(String::from("turn-1")),
+            ProviderToolCall {
+                call_id: String::from("call-bash-1"),
+                name: String::from("bash"),
+                arguments_json: serde_json::json!({ "command": command }),
+            },
+        );
+
+        let result = super::execute_native_provider_bash_tool_request(
+            &mut ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::FullAccess,
+                shell_session_grants: super::ShellSessionGrants::default(),
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                shell_policy,
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: None,
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                structured_review_rows: true,
+                tool_event_store: None,
+                cancellation,
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+            },
+            request,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProviderRoundError::Cancelled(_))));
+        let finished = log
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    SessionEvent::ToolExecutionFinished { tool_request_id, .. }
+                        if tool_request_id == &ToolRequestId(String::from("tool-request-1-1"))
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finished.len(), 1);
+        assert!(matches!(
+            finished[0],
+            SessionEvent::ToolExecutionFinished {
+                outcome: ToolOutcome::Cancelled,
+                started_at_ms: Some(_),
+                duration_ms: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn bash_approval_wait_is_excluded_from_tool_duration() {
+        let root = TempProject::new("native-provider-bash-approval-timing");
+        let project_root = ResourceRoot::project(root.root()).test_unwrap();
+        let registry = ToolRegistry::with_project_read_only_and_agent_edit_tools();
+        let permission_policy =
+            ToolPermissionPolicy::allow_project_metadata_content_and_agent_edit_tools(
+                ["project_path_info"],
+                ["read_text_file", "search_project", "list_project_paths"],
+                ["edit_text_file", "create_text_file"],
+            )
+            .with_process_tools(["bash"]);
+        let resolved_catalog = registry.resolve_provider_turn_catalog(
+            &permission_policy,
+            [
+                "project_path_info",
+                "read_text_file",
+                "search_project",
+                "list_project_paths",
+                "edit_text_file",
+                "create_text_file",
+                "bash",
+            ],
+        );
+        let read_only_executor = ProjectReadOnlyToolExecutor::new(project_root.clone());
+        let mut edit_access = EditAccess::default();
+        let edit_sink = ProviderBufferedEventSink::new(None);
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel();
+        let (decision_tx, mut review_decisions) = mpsc::unbounded_channel();
+        let mut budget = ProviderToolLoopBudget::new(ProviderToolLoopPolicy::agent_default());
+        let mut edit_traces = Vec::new();
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let request = super::pending_tool_request_from_provider_call(
+            String::from("tool-request-1-1"),
+            TurnId(String::from("turn-1")),
+            ProviderToolCall {
+                call_id: String::from("call-bash-1"),
+                name: String::from("bash"),
+                arguments_json: serde_json::json!({ "command": "true" }),
+            },
+        );
+        let approval_delay = Duration::from_millis(400);
+        let approver = tokio::spawn(async move {
+            let requested = loop {
+                match review_rx.recv().await {
+                    Some(BackendEvent::Server(ServerEvent::ToolReviewRequested {
+                        request_id,
+                        payload: ToolReviewPayload::Command { command },
+                        ..
+                    })) => break (request_id, command),
+                    Some(_) => {}
+                    None => unreachable!("review channel closed before a bash review"),
+                }
+            };
+            tokio::time::sleep(approval_delay).await;
+            let (request_id, command) = requested;
+            assert!(
+                decision_tx
+                    .send(super::AgentEditReviewDecision {
+                        request_id,
+                        preview_id: command.review_id,
+                        permission_decision_id: command.permission_decision_id,
+                        decision: ToolReviewDecision::Approve,
+                    })
+                    .is_ok()
+            );
+        });
+
+        let result = super::execute_native_provider_bash_tool_request(
+            &mut ProviderAgentToolBatch {
+                approval_mode: yach_proto::ApprovalMode::Review,
+                shell_session_grants: super::ShellSessionGrants::default(),
+                session_id: SessionId(String::from("default")),
+                turn_id: TurnId(String::from("turn-1")),
+                project_root,
+                shell_policy: crate::ShellPolicy::default(),
+                registry: &registry,
+                resolved_catalog: &resolved_catalog,
+                permission_policy: &permission_policy,
+                read_only_executor: &read_only_executor,
+                extension_executor: None,
+                edit_access: &mut edit_access,
+                edit_sink: &edit_sink,
+                review_tx,
+                review_decisions: &mut review_decisions,
+                structured_review_rows: true,
+                tool_event_store: None,
+                cancellation: CancellationToken::new(),
+                budget: &mut budget,
+                tool_round_index: 1,
+                edit_traces: &mut edit_traces,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                trace: None,
+                current_tool_index: 0,
+                review_coordinator: None,
+                review_policy: &Arc::new(Mutex::new(crate::ReviewPolicy::empty())),
+            },
+            request,
+        )
+        .await;
+        assert!(approver.await.is_ok());
+        assert!(result.is_ok());
+        let duration_ms = log.events.iter().find_map(|event| match event {
+            SessionEvent::ToolExecutionFinished {
+                tool_request_id,
+                outcome: ToolOutcome::Completed,
+                duration_ms,
+                ..
+            } if tool_request_id == &ToolRequestId(String::from("tool-request-1-1")) => {
+                *duration_ms
+            }
+            _ => None,
+        });
+        let Some(duration_ms) = duration_ms else {
+            unreachable!("completed bash finish event expected");
+        };
+        assert!(
+            duration_ms < u64::try_from(approval_delay.as_millis()).unwrap_or(u64::MAX),
+            "approval wait counted as tool time: {duration_ms}ms"
+        );
+    }
+
     #[test]
     fn provider_agent_tool_batch_retains_completed_failed_and_cancelled_evidence() {
         let root = TempProject::new("native-provider-agent-tool-batch-partial-failure");
@@ -12517,6 +13769,19 @@ mod tests {
                 && reason == "malformed_patch"
                 && content.contains("malformed hashline patch")
         )));
+
+        let finished = pending_events.iter().find_map(|event| match event {
+            SessionEvent::ToolExecutionFinished {
+                tool_request_id,
+                started_at_ms,
+                duration_ms,
+                ..
+            } if tool_request_id == &ToolRequestId(String::from("tool-request-1-1")) => {
+                Some((*started_at_ms, *duration_ms))
+            }
+            _ => None,
+        });
+        assert!(matches!(finished, Some((Some(_), Some(_)))));
     }
 
     #[test]
@@ -13422,7 +14687,9 @@ mod tests {
                 | SessionEvent::EditTransactionPrepared { .. }
                 | SessionEvent::EditTransactionFinished { .. }
                 | SessionEvent::CompactionCheckpoint { .. }
-                | SessionEvent::ToolResultMasked { .. } => None,
+                | SessionEvent::ToolResultMasked { .. }
+                | SessionEvent::ProviderAttemptFinished { .. }
+                | SessionEvent::Unknown => None,
             })
             .collect()
     }
@@ -13805,7 +15072,7 @@ mod tests {
                     }
                 };
                 let response_header = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\nx-request-id: gw-native\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     response.len() + usize::from(truncated)
                 );
                 let _ = stream.write_all(response_header.as_bytes());
@@ -13902,6 +15169,7 @@ mod tests {
                     instructions: native_request.instructions.clone(),
                     input: output,
                 }),
+                recorder: None,
             })
             .await;
         assert!(outcome.is_ok());
@@ -14080,6 +15348,81 @@ mod tests {
                     "encrypted_content":"opaque-window"
                 }])
         )));
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_compaction_attempt_records_fixture_request_id() {
+        let root = TempProject::new("responses-native-request-id");
+        let session_path = root.root().join("session.jsonl");
+        seed_completed_turn(&session_path, "turn-0", &"prior context ".repeat(10_000));
+        let (base_url, _captured) = responses_native_compaction_fixture(vec![
+            ResponsesNativeFixtureOutcome::HttpStatus(503),
+            ResponsesNativeFixtureOutcome::CompletedText,
+            ResponsesNativeFixtureOutcome::CompletedText,
+        ]);
+        let mut provider = openai_compaction_provider(true);
+        provider.adapter = Arc::new(RigProviderAdapterConfig {
+            provider: RigProviderConfig::OpenAi {
+                api_key: ProviderSecret::new(String::from("fixture-key")),
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 64,
+            context_window: 200_000,
+            max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
+            error_dialect: crate::DialectSelection::Missing,
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            RunnerConfig {
+                components: crate::ComponentSet::full(),
+                session_path: session_path.clone(),
+                project_root: None,
+                provider: Some(provider),
+                startup_model_override: None,
+                provider_setup_error: None,
+                extension_package_roots: Vec::new(),
+                extension_package_root_loader: None,
+                trace: None,
+                catalog_refresh: None,
+                model_discovery: None,
+                provider_connections: None,
+            },
+        ));
+        assert!(
+            client_tx
+                .send(ClientEvent::CompactionRequested {
+                    session_id: String::from("default"),
+                    instructions: None,
+                })
+                .is_ok()
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::PromptSubmitted {
+                    session_id: String::from("default"),
+                    prompt: String::from("continue after native fallback"),
+                })
+                .is_ok()
+        );
+        let (_, _, finished) = collect_prompt_outcome(&mut backend_rx).await;
+        assert_eq!(
+            finished.map(|(outcome, _)| outcome),
+            Some(PromptOutcome::Completed)
+        );
+        let log = JsonlSessionStore::new(session_path).load().test_unwrap();
+        let native: Vec<_> = attempt_events(&log)
+            .into_iter()
+            .filter(|attempt| attempt.purpose == crate::ProviderAttemptPurpose::CompactionNative)
+            .collect();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].provider_request_id.as_deref(), Some("gw-native"));
+        assert!(native[0].first_event_ms.is_some());
         drop(client_tx);
         assert!(handle.await.is_ok());
     }
@@ -14316,6 +15659,7 @@ mod tests {
                     serde_json::json!({"type":"message","role":"user","content":"fixture"}),
                 ],
             }),
+            recorder: None,
         }
     }
     #[tokio::test]
@@ -15532,6 +16876,7 @@ mod tests {
                     session_id: "live-reset",
                     attempt_sequence: &mut attempt_sequence,
                     trace: None,
+                    attempts: None,
                 },
             )
             .await;
@@ -15619,6 +16964,7 @@ mod tests {
                 session_id: "live-reset-pretok",
                 attempt_sequence: &mut attempt_sequence,
                 trace: None,
+                attempts: None,
             },
         )
         .await;
@@ -15685,6 +17031,7 @@ mod tests {
                 session_id: "live-reset-closed",
                 attempt_sequence: &mut attempt_sequence,
                 trace: None,
+                attempts: None,
             },
         );
         let close_after_partial = async move {
@@ -15735,6 +17082,7 @@ mod tests {
                 session_id: "retry-cancel",
                 attempt_sequence: &mut attempt_sequence,
                 trace: None,
+                attempts: None,
             },
         );
         let cancel_soon = async move {
@@ -16885,6 +18233,8 @@ mod tests {
             result_content: Some(String::from(
                 "{\"outcome\":\"list\",\"entries\":[{\"path\":\"src/lib.rs\",\"kind\":\"file\"}],\"truncated\":false}",
             )),
+            started_at_ms: None,
+            duration_ms: None,
         });
         append_native_provider_test_entry(
             &mut log,
@@ -16961,6 +18311,8 @@ mod tests {
             reason: None,
             result_summary: None,
             result_content: Some(String::from("BIG BODY")),
+            started_at_ms: None,
+            duration_ms: None,
         });
         finish_native_provider_test_turn(&mut log, &session_id, "turn-1", TurnOutcome::Completed);
         log.push(SessionEvent::ToolResultMasked {
@@ -17035,6 +18387,8 @@ mod tests {
             reason: None,
             result_summary: None,
             result_content: Some(String::from("BIG BODY")),
+            started_at_ms: None,
+            duration_ms: None,
         });
         finish_native_provider_test_turn(&mut log, &session_id, "turn-1", TurnOutcome::Completed);
         append_native_provider_test_entry(
@@ -17091,6 +18445,8 @@ mod tests {
                         truncated: false,
                     }),
                     result_content: Some(String::from("alpha")),
+                    started_at_ms: None,
+                    duration_ms: None,
                 });
                 finish_native_provider_test_turn(&mut log, &session_id, turn, outcome);
             };
@@ -17119,6 +18475,8 @@ mod tests {
                 truncated: false,
             }),
             result_content: Some(String::from("stale orphan")),
+            started_at_ms: None,
+            duration_ms: None,
         });
         log.push(SessionEvent::ToolRequestRecorded {
             session_id: session_id.clone(),
@@ -17149,6 +18507,8 @@ mod tests {
                 truncated: false,
             }),
             result_content: Some(String::from("orphan")),
+            started_at_ms: None,
+            duration_ms: None,
         });
         append_native_provider_test_entry(
             &mut log,
@@ -17224,6 +18584,8 @@ mod tests {
                 truncated: false,
             }),
             result_content: None,
+            started_at_ms: None,
+            duration_ms: None,
         });
 
         let messages = provider_messages_from_log(&log, &turn_id);
@@ -17254,6 +18616,8 @@ mod tests {
             reason: None,
             result_summary: None,
             result_content: Some(String::from("{\"outcome\":\"list\"}")),
+            started_at_ms: None,
+            duration_ms: None,
         });
         finish_native_provider_test_turn(&mut log, &session_id, "turn-1", TurnOutcome::Failed);
         append_native_provider_test_entry(
@@ -26382,6 +27746,8 @@ manual anchored summary"
                 truncated: false,
             }),
             result_content: Some(String::from("hello\n")),
+            started_at_ms: None,
+            duration_ms: None,
         });
         append_native_provider_test_entry(
             &mut log,
@@ -26459,6 +27825,8 @@ manual anchored summary"
                     truncated: false,
                 }),
                 result_content: Some(String::from("hello\n")),
+                started_at_ms: None,
+                duration_ms: None,
             },
             SessionEvent::EntryAppended {
                 session_id,
@@ -26655,6 +28023,8 @@ manual anchored summary"
             reason: None,
             result_summary: None,
             result_content: Some(String::from("secret")),
+            started_at_ms: None,
+            duration_ms: None,
         });
         log.push(SessionEvent::ToolResultMasked {
             session_id,
@@ -26793,6 +28163,8 @@ manual anchored summary"
                 truncated: false,
             }),
             result_content: Some(list_content.clone()),
+            started_at_ms: None,
+            duration_ms: None,
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
         send_native_session_messages_from_log(&tx, &log);
@@ -26867,6 +28239,8 @@ manual anchored summary"
             reason: None,
             result_summary: None,
             result_content: Some(String::from("ok")),
+            started_at_ms: None,
+            duration_ms: None,
         });
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -26935,6 +28309,8 @@ manual anchored summary"
             reason: None,
             result_summary: None,
             result_content: Some(String::from("ok")),
+            started_at_ms: None,
+            duration_ms: None,
         });
         log.push(SessionEvent::ToolReviewRequested {
             session_id: session_id.clone(),
@@ -27011,6 +28387,8 @@ manual anchored summary"
                 truncated: false,
             }),
             result_content: None,
+            started_at_ms: None,
+            duration_ms: None,
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
         send_native_session_messages_from_log(&tx, &log);
@@ -29728,6 +31106,8 @@ manual anchored summary"
             reason: None,
             result_summary: None,
             result_content: Some(String::from(old_result)),
+            started_at_ms: None,
+            duration_ms: None,
         });
         finish_native_provider_test_turn(&mut log, &session_id, "turn-1", TurnOutcome::Completed);
         append_native_provider_test_entry(
@@ -29762,6 +31142,8 @@ manual anchored summary"
             reason: None,
             result_summary: None,
             result_content: Some(String::from("recent")),
+            started_at_ms: None,
+            duration_ms: None,
         });
         finish_native_provider_test_turn(&mut log, &session_id, "turn-2", TurnOutcome::Completed);
         log
@@ -30246,9 +31628,17 @@ manual anchored summary"
 
         assert_eq!(application, Ok(super::CompactionApplication::NotApplied));
         assert_eq!(requester.requests.len(), 1);
-        assert_eq!(log.events, original_events);
+        // The failed summary attempt is evidence and must survive; nothing else may.
+        assert_eq!(without_attempt_events(&log.events), original_events);
+        assert_eq!(attempt_events(&log).len(), 1);
         assert!(pending_events.is_empty());
-        assert_eq!(store.load().test_unwrap().events, original_events);
+        let persisted = store.load().test_unwrap().events;
+        assert_eq!(without_attempt_events(&persisted), original_events);
+        assert_eq!(
+            persisted.len(),
+            original_events.len() + 1,
+            "the attempt event is appended directly to the store"
+        );
         let on_disk = std::fs::read_to_string(store_path).test_unwrap();
         assert!(!on_disk.contains("tool_result_masked"));
     }
@@ -30295,6 +31685,8 @@ manual anchored summary"
             reason: None,
             result_summary: None,
             result_content: Some("x".repeat(50_000)),
+            started_at_ms: None,
+            duration_ms: None,
         });
         finish_native_provider_test_turn(&mut log, &session_id, "turn-1", TurnOutcome::Completed);
         append_native_provider_test_entry(
@@ -30313,6 +31705,8 @@ manual anchored summary"
             reason: None,
             result_summary: None,
             result_content: Some(String::from("recent")),
+            started_at_ms: None,
+            duration_ms: None,
         });
         finish_native_provider_test_turn(&mut log, &session_id, "turn-2", TurnOutcome::Completed);
 
@@ -31704,8 +33098,20 @@ manual anchored summary"
             2,
             "summary retry never commits native state"
         );
-        assert_eq!(log.events, original_events);
-        assert!(pending_events.is_empty());
+        assert_eq!(without_attempt_events(&log.events), original_events);
+        assert!(
+            pending_events
+                .iter()
+                .all(|event| matches!(event, SessionEvent::ProviderAttemptFinished { .. })),
+            "only attempt evidence may be pending after a rolled-back compaction"
+        );
+        assert_eq!(
+            attempt_events(&log)
+                .iter()
+                .filter(|attempt| attempt.purpose == crate::ProviderAttemptPurpose::CompactionNative)
+                .count(),
+            1
+        );
         assert_eq!(native_replay, Some(original_replay));
         assert!(
             drain_backend_events(&mut review_rx)
@@ -32112,10 +33518,15 @@ manual anchored summary"
                 )
             })
             .test_unwrap();
-        assert_eq!(
-            active.synced_event_count,
-            second_execution_index + 1,
+        assert!(
+            active.synced_event_count > second_execution_index,
             "the replay cursor lands after both persisted tool executions"
+        );
+        assert!(
+            log.events[second_execution_index + 1..active.synced_event_count]
+                .iter()
+                .all(|event| matches!(event, SessionEvent::ProviderAttemptFinished { .. })),
+            "the cursor may only skip attempt evidence, which carries no provider messages"
         );
     }
 
@@ -33668,5 +35079,895 @@ manual anchored summary"
             super::shell_disposition_for_hold(&crate::HoldReason::SignificantRisk),
             super::ShellHoldDisposition::AskUser(Some(yach_proto::ReviewOrigin::Risk))
         );
+    }
+
+    struct ScriptedAttemptRequester {
+        attempts: VecDeque<Result<ProviderStreamAttempt, ProviderError>>,
+        requests: Vec<ProviderRequest>,
+        begun: Vec<super::AttemptLabel>,
+        diagnostics: VecDeque<super::AttemptDiagnostics>,
+        diagnostics_takes: usize,
+        hang: bool,
+    }
+
+    impl ScriptedAttemptRequester {
+        fn from_attempts(
+            attempts: impl IntoIterator<Item = Result<ProviderStreamAttempt, ProviderError>>,
+        ) -> Self {
+            Self {
+                attempts: attempts.into_iter().collect(),
+                requests: Vec::new(),
+                begun: Vec::new(),
+                diagnostics: VecDeque::new(),
+                diagnostics_takes: 0,
+                hang: false,
+            }
+        }
+    }
+
+    impl ProviderRequester for ScriptedAttemptRequester {
+        fn request(
+            &mut self,
+            _request: ProviderRequest,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<ProviderStreamEvent>, ProviderError>>
+        {
+            Box::pin(async { Err(ProviderError::fixture_failure()) })
+        }
+
+        fn request_attempt_streaming(
+            &mut self,
+            request: ProviderRequest,
+            _live: Option<crate::rig_adapter::LiveDeltaSink>,
+        ) -> futures::future::BoxFuture<'_, Result<ProviderStreamAttempt, ProviderError>> {
+            self.requests.push(request);
+            if self.hang {
+                return Box::pin(std::future::pending());
+            }
+            let attempt = self
+                .attempts
+                .pop_front()
+                .unwrap_or_else(|| Err(ProviderError::fixture_failure()));
+            Box::pin(async move { attempt })
+        }
+
+        fn begin_attempt(&mut self, label: super::AttemptLabel) {
+            self.begun.push(label);
+        }
+
+        fn take_attempt_diagnostics(&mut self) -> super::AttemptDiagnostics {
+            self.diagnostics_takes = self.diagnostics_takes.saturating_add(1);
+            self.diagnostics.pop_front().unwrap_or_default()
+        }
+    }
+
+    fn attempt_fixture_request(turn_id: &str) -> ProviderRequest {
+        ProviderRequest {
+            turn_id: TurnId(String::from(turn_id)),
+            model: ProviderModel {
+                provider: String::from("anthropic"),
+                model: String::from("claude-fixture"),
+            },
+            messages: vec![ProviderMessage::text(Role::User, String::from("attempt"))],
+            extensions: Vec::new(),
+            native_request: None,
+            approved_tool_advertising: None,
+        }
+    }
+
+    fn attempt_started(turn_id: &TurnId) -> ProviderStreamEvent {
+        ProviderStreamEvent::Started {
+            turn_id: turn_id.clone(),
+            model: ProviderModel {
+                provider: String::from("anthropic"),
+                model: String::from("claude-fixture"),
+            },
+        }
+    }
+
+    fn attempt_completed(turn_id: &TurnId) -> ProviderStreamEvent {
+        ProviderStreamEvent::Completed {
+            turn_id: turn_id.clone(),
+            finish_reason: Some(ProviderFinishReason::Stop),
+            usage: None,
+            provider_response_id: None,
+        }
+    }
+
+    fn attempt_error(kind: ProviderErrorKind, message: &str) -> ProviderError {
+        ProviderError {
+            kind,
+            message: String::from(message),
+            redacted_debug: None,
+            metadata: crate::ProviderErrorMetadata::default(),
+        }
+    }
+
+    fn without_attempt_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
+        events
+            .iter()
+            .filter(|event| !matches!(event, SessionEvent::ProviderAttemptFinished { .. }))
+            .cloned()
+            .collect()
+    }
+
+    fn attempt_events(log: &SessionLog) -> Vec<crate::ProviderAttemptSummary> {
+        log.events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ProviderAttemptFinished { attempt, .. } => Some(attempt.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn record_provider_attempts(
+        requester: &mut ScriptedAttemptRequester,
+        request: &ProviderRequest,
+        attempt_sequence: &mut u64,
+        cancellation: &CancellationToken,
+        store: Option<&JsonlSessionStore>,
+    ) -> (
+        Result<Vec<ProviderStreamEvent>, ProviderError>,
+        SessionLog,
+        Vec<SessionEvent>,
+    ) {
+        let session_id = SessionId(String::from("attempt-session"));
+        let mut log = SessionLog::default();
+        let mut pending_events = Vec::new();
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let result = provider_request_with_retry_context(
+            requester,
+            request,
+            ProviderRetryContext {
+                review_tx: &review_tx,
+                live: None,
+                cancellation,
+                reset_negotiated: false,
+                session_id: "attempt-session",
+                attempt_sequence,
+                trace: None,
+                attempts: Some(super::AttemptSink {
+                    session_id: &session_id,
+                    purpose: crate::ProviderAttemptPurpose::Turn,
+                    log: &mut log,
+                    pending_events: &mut pending_events,
+                    store,
+                }),
+            },
+        )
+        .await;
+        (result, log, pending_events)
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_complete_records_one_succeeded_event() {
+        let request = attempt_fixture_request("turn-1");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                ProviderStreamEvent::TextDelta {
+                    turn_id: request.turn_id.clone(),
+                    delta: String::from("secret-delta-complete"),
+                },
+                attempt_completed(&request.turn_id),
+            ]))]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, pending) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_ok());
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].outcome,
+            crate::ProviderAttemptOutcome::Succeeded
+        );
+        assert_eq!(attempts[0].retry_index, 0);
+        assert_eq!(attempts[0].attempt_sequence, 1);
+        assert_eq!(attempts[0].purpose, crate::ProviderAttemptPurpose::Turn);
+        assert_eq!(attempts[0].model, "claude-fixture");
+        assert!(attempts[0].error_kind.is_none());
+        assert!(attempts[0].classification_source.is_none());
+        assert!(attempts[0].error_variant.is_none());
+        assert!(attempts[0].status_code.is_none());
+        assert!(attempts[0].next_delay_ms.is_none());
+        assert!(attempts[0].started_at_ms > 0);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(requester.begun.len(), 1);
+        assert_eq!(requester.begun[0].attempt_sequence, 1);
+        assert_eq!(requester.diagnostics_takes, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_network_partial_then_complete_records_failed_then_succeeded() {
+        let request = attempt_fixture_request("turn-2");
+        let mut requester = ScriptedAttemptRequester::from_attempts([
+            Ok(ProviderStreamAttempt::Partial {
+                tool_round_complete: false,
+                events: vec![attempt_started(&request.turn_id)],
+                error: attempt_error(ProviderErrorKind::Network, "blip"),
+            }),
+            Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                attempt_completed(&request.turn_id),
+            ])),
+        ]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_ok());
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(attempts[0].error_kind, Some(ProviderErrorKind::Network));
+        assert_eq!(
+            attempts[0].classification_source,
+            Some(crate::ClassificationSource::Variant)
+        );
+        assert_eq!(attempts[0].next_delay_ms, Some(1_000));
+        assert_eq!(attempts[0].retry_index, 0);
+        assert_eq!(attempts[0].attempt_sequence, 1);
+        assert_eq!(
+            attempts[1].outcome,
+            crate::ProviderAttemptOutcome::Succeeded
+        );
+        assert_eq!(attempts[1].retry_index, 1);
+        assert_eq!(attempts[1].attempt_sequence, 2);
+        assert!(attempts[1].error_kind.is_none());
+        assert!(attempts[1].next_delay_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_three_internal_failures_record_failed_without_final_delay() {
+        let request = attempt_fixture_request("turn-3");
+        let failure = || {
+            Err(ProviderError {
+                kind: ProviderErrorKind::ProviderInternal,
+                message: String::from("down"),
+                redacted_debug: None,
+                metadata: crate::ProviderErrorMetadata {
+                    classification_source: crate::ClassificationSource::Status,
+                    error_variant: Some("provider"),
+                    status_code: Some(500),
+                    ..crate::ProviderErrorMetadata::default()
+                },
+            })
+        };
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([failure(), failure(), failure()]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_err());
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 3);
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| attempt.outcome == crate::ProviderAttemptOutcome::Failed)
+        );
+        assert_eq!(
+            attempts[2].error_kind,
+            Some(ProviderErrorKind::ProviderInternal)
+        );
+        assert_eq!(
+            attempts[2].classification_source,
+            Some(crate::ClassificationSource::Status)
+        );
+        assert_eq!(attempts[2].error_variant.as_deref(), Some("provider"));
+        assert_eq!(attempts[2].status_code, Some(500));
+        assert_eq!(attempts[0].next_delay_ms, Some(1_000));
+        assert_eq!(attempts[1].next_delay_ms, Some(2_000));
+        assert!(attempts[2].next_delay_ms.is_none());
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.attempt_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_complete_with_failed_event_records_failed() {
+        let request = attempt_fixture_request("turn-4");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                ProviderStreamEvent::Failed {
+                    turn_id: request.turn_id.clone(),
+                    error: attempt_error(ProviderErrorKind::RateLimited, "slow down"),
+                },
+            ]))]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_ok());
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(attempts[0].error_kind, Some(ProviderErrorKind::RateLimited));
+        assert_ne!(
+            attempts[0].outcome,
+            crate::ProviderAttemptOutcome::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_complete_without_completed_event_is_malformed() {
+        let request = attempt_fixture_request("turn-5");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                ProviderStreamEvent::TextDelta {
+                    turn_id: request.turn_id.clone(),
+                    delta: String::from("secret-delta-malformed"),
+                },
+            ]))]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_ok());
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(
+            attempts[0].error_kind,
+            Some(ProviderErrorKind::MalformedStream)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_used_complete_tool_round_records_partial() {
+        let request = attempt_fixture_request("turn-5a");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Partial {
+                tool_round_complete: true,
+                events: vec![
+                    attempt_started(&request.turn_id),
+                    ProviderStreamEvent::ToolCallCompleted {
+                        turn_id: request.turn_id.clone(),
+                        tool_call: ProviderToolCall {
+                            call_id: String::from("call-prefix"),
+                            name: String::from("read_text_file"),
+                            arguments_json: serde_json::json!({"path":"note.txt"}),
+                        },
+                    },
+                ],
+                error: attempt_error(ProviderErrorKind::Network, "after tool round"),
+            })]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(result.is_ok());
+        let Ok(events) = result else {
+            return;
+        };
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Completed {
+                finish_reason: Some(ProviderFinishReason::ToolCalls),
+                ..
+            })
+        ));
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Partial);
+        assert_eq!(attempts[0].error_kind, Some(ProviderErrorKind::Network));
+        assert_eq!(
+            attempts[0].classification_source,
+            Some(crate::ClassificationSource::Variant)
+        );
+        assert!(attempts[0].next_delay_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_direct_error_records_failed_before_returning() {
+        let request = attempt_fixture_request("turn-6");
+        let mut requester = ScriptedAttemptRequester::from_attempts([Err(attempt_error(
+            ProviderErrorKind::Authentication,
+            "no key",
+        ))]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let started = Instant::now();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(
+            result,
+            Err(error) if error.kind == ProviderErrorKind::Authentication
+        ));
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(
+            attempts[0].error_kind,
+            Some(ProviderErrorKind::Authentication)
+        );
+        assert!(attempts[0].next_delay_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_cancellation_during_attempt_records_cancelled() {
+        let request = attempt_fixture_request("turn-7");
+        let mut requester = ScriptedAttemptRequester::from_attempts([]);
+        requester.hang = true;
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let retry =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None);
+        let cancel_soon = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+        };
+        let ((result, log, _), ()) = tokio::join!(retry, cancel_soon);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.kind == ProviderErrorKind::Cancelled
+        ));
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].outcome,
+            crate::ProviderAttemptOutcome::Cancelled
+        );
+        assert!(attempts[0].error_kind.is_none());
+        assert_eq!(requester.requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_cancellation_during_retry_delay_records_only_started_attempt() {
+        let request = attempt_fixture_request("turn-8");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Partial {
+                tool_round_complete: false,
+                events: Vec::new(),
+                error: attempt_error(ProviderErrorKind::Network, "interrupted"),
+            })]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let retry =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None);
+        let cancel_soon = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        };
+        let ((result, log, _), ()) = tokio::join!(retry, cancel_soon);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.kind == ProviderErrorKind::Cancelled
+        ));
+        assert_eq!(requester.requests.len(), 1);
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(attempts[0].error_kind, Some(ProviderErrorKind::Network));
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_sequences_increase_across_shared_counter_calls() {
+        let request = attempt_fixture_request("turn-9");
+        let complete = || {
+            Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                attempt_completed(&request.turn_id),
+            ]))
+        };
+        let mut requester = ScriptedAttemptRequester::from_attempts([complete(), complete()]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (first, first_log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+        let (second, second_log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        let first_sequence = attempt_events(&first_log)[0].attempt_sequence;
+        let second_sequence = attempt_events(&second_log)[0].attempt_sequence;
+        assert!(second_sequence > first_sequence);
+        assert_eq!(first_sequence, 1);
+        assert_eq!(second_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_events_omit_scripted_text() {
+        let request = attempt_fixture_request("turn-10");
+        let secret = "secret-delta-must-not-leak";
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Complete(vec![
+                attempt_started(&request.turn_id),
+                ProviderStreamEvent::TextDelta {
+                    turn_id: request.turn_id.clone(),
+                    delta: String::from(secret),
+                },
+                attempt_completed(&request.turn_id),
+            ]))]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (_, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        let recorded = log
+            .events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ProviderAttemptFinished { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the completed attempt must be recorded before its text can be checked"
+        );
+        let encoded = serde_json::to_string(recorded[0]).test_unwrap();
+        assert!(
+            !encoded.contains(secret),
+            "attempt evidence must not carry stream text"
+        );
+    }
+    #[tokio::test]
+    async fn provider_attempt_completed_then_stream_error_records_partial() {
+        let request = attempt_fixture_request("turn-12");
+        let trailing = attempt_error(ProviderErrorKind::Network, "stream stalled after final");
+        let mut requester =
+            ScriptedAttemptRequester::from_attempts([Ok(ProviderStreamAttempt::Partial {
+                events: vec![
+                    attempt_started(&request.turn_id),
+                    ProviderStreamEvent::TextDelta {
+                        turn_id: request.turn_id.clone(),
+                        delta: String::from("accepted response"),
+                    },
+                    attempt_completed(&request.turn_id),
+                ],
+                error: trailing,
+                tool_round_complete: false,
+            })]);
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, _) =
+            record_provider_attempts(&mut requester, &request, &mut sequence, &cancellation, None)
+                .await;
+
+        assert!(
+            result.is_ok(),
+            "a completed response is accepted despite the trailing stream error"
+        );
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, crate::ProviderAttemptOutcome::Partial);
+        assert_eq!(
+            attempts[0].error_kind,
+            Some(ProviderErrorKind::Network),
+            "the accepted result keeps the trailing error instead of settling as succeeded"
+        );
+        assert!(attempts[0].classification_source.is_some());
+        assert_eq!(attempts[0].retry_index, 0);
+        assert_eq!(attempts[0].attempt_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_store_persists_failure_without_flushing_pending() {
+        let request = attempt_fixture_request("turn-11");
+        let mut requester = ScriptedAttemptRequester::from_attempts([Err(attempt_error(
+            ProviderErrorKind::Authentication,
+            "down",
+        ))]);
+        let path = std::env::temp_dir().join(format!(
+            "yach-provider-attempt-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = JsonlSessionStore::new(path.clone());
+        let mut sequence = 0;
+        let cancellation = CancellationToken::new();
+        let (result, log, pending) = record_provider_attempts(
+            &mut requester,
+            &request,
+            &mut sequence,
+            &cancellation,
+            Some(&store),
+        )
+        .await;
+        let loaded = SessionLog::load_from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err());
+        assert!(pending.is_empty());
+        assert_eq!(attempt_events(&log).len(), 1);
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else {
+            return;
+        };
+        assert_eq!(loaded.events, log.events);
+        assert!(matches!(
+            loaded.events.as_slice(),
+            [SessionEvent::ProviderAttemptFinished {
+                attempt: crate::ProviderAttemptSummary {
+                    outcome: crate::ProviderAttemptOutcome::Failed,
+                    ..
+                },
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_portable_summary_records_compaction_summary() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let mut log = masking_fixture_log("old body");
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("portable summary"))]);
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                provider: &provider_test_config(),
+                native_request: None,
+                native_replay: &mut native_replay,
+                config: &masking_fixture_config("summary"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 51_000,
+                usable_tokens: 10_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Summary));
+        let attempts = attempt_events(&log);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].purpose,
+            crate::ProviderAttemptPurpose::CompactionSummary
+        );
+        assert_eq!(
+            attempts[0].outcome,
+            crate::ProviderAttemptOutcome::Succeeded
+        );
+        assert_eq!(attempts[0].attempt_sequence, 1);
+        assert_eq!(attempts[0].model, "fixture-model");
+    }
+
+    struct HangingCompactor {
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::Compactor for HangingCompactor {
+        fn compact(&self, _preparation: crate::CompactionPreparation) -> crate::CompactionFuture {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    async fn run_native_attempt_compaction(
+        cancellation: CancellationToken,
+        compactor: &dyn crate::Compactor,
+    ) -> (
+        Result<super::CompactionApplication, ProviderRoundError>,
+        SessionLog,
+    ) {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-3"));
+        let mut log = masking_fixture_log("native body");
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let provider = openai_compaction_provider(true);
+        let model = ProviderModel {
+            provider: String::from("openai"),
+            model: provider.model.clone(),
+        };
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester =
+            FakeProviderRequester::with_responses([Ok(provider_text_response("portable summary"))]);
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation,
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &model,
+                provider: &provider,
+                native_request: Some(native_compaction_fixture_request()),
+                native_replay: &mut native_replay,
+                config: &masking_fixture_config("openai-responses"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 51_000,
+                usable_tokens: 10_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: None,
+                review_tx: &review_tx,
+            },
+            compactor,
+        )
+        .await;
+        (application, log)
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_native_success_records_compaction_native() {
+        let (application, log) = run_native_attempt_compaction(
+            CancellationToken::new(),
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Native));
+        let native: Vec<_> = attempt_events(&log)
+            .into_iter()
+            .filter(|attempt| attempt.purpose == crate::ProviderAttemptPurpose::CompactionNative)
+            .collect();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].outcome, crate::ProviderAttemptOutcome::Succeeded);
+        assert!(native[0].error_kind.is_none());
+        assert!(native[0].status_code.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_native_http_status_records_failed_with_status() {
+        let (application, log) = run_native_attempt_compaction(
+            CancellationToken::new(),
+            &FixtureCompactor::new(Err(crate::CompactionError::HttpStatus { status: 503 })),
+        )
+        .await;
+
+        assert_eq!(application, Ok(super::CompactionApplication::Summary));
+        let native: Vec<_> = attempt_events(&log)
+            .into_iter()
+            .filter(|attempt| attempt.purpose == crate::ProviderAttemptPurpose::CompactionNative)
+            .collect();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].outcome, crate::ProviderAttemptOutcome::Failed);
+        assert_eq!(native[0].status_code, Some(503));
+        assert_eq!(
+            native[0].error_kind,
+            Some(ProviderErrorKind::ProviderInternal)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_native_cancellation_records_cancelled() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let compactor = HangingCompactor {
+            started: Arc::clone(&started),
+        };
+        let run = run_native_attempt_compaction(cancellation, &compactor);
+        let cancel_soon = async move {
+            while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel.cancel();
+        };
+        let ((application, log), ()) = tokio::join!(run, cancel_soon);
+
+        assert!(matches!(application, Err(ProviderRoundError::Cancelled(_))));
+        let native: Vec<_> = attempt_events(&log)
+            .into_iter()
+            .filter(|attempt| attempt.purpose == crate::ProviderAttemptPurpose::CompactionNative)
+            .collect();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].outcome, crate::ProviderAttemptOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_failed_summary_persists_and_advances_turn_index() {
+        let session_id = SessionId(String::from("default"));
+        let turn_id = TurnId(String::from("turn-9"));
+        let mut log = masking_fixture_log("old body");
+        let mut pending_events = Vec::new();
+        let mut native_replay = None;
+        let (review_tx, _review_rx) = mpsc::unbounded_channel();
+        let mut requester = FakeProviderRequester::with_responses([Err(attempt_error(
+            ProviderErrorKind::ProviderInternal,
+            "summarizer down",
+        ))]);
+        let path = std::env::temp_dir().join(format!(
+            "yach-compaction-attempt-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = JsonlSessionStore::new(path.clone());
+
+        let application = super::run_compaction_with(
+            &mut requester,
+            super::CompactionRun {
+                cancellation: CancellationToken::new(),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                model: &ProviderModel {
+                    provider: String::from("fixture"),
+                    model: String::from("fixture-model"),
+                },
+                provider: &provider_test_config(),
+                native_request: None,
+                native_replay: &mut native_replay,
+                config: &masking_fixture_config("summary"),
+                reason: crate::CompactionReason::Threshold,
+                tokens_before: 51_000,
+                usable_tokens: 10_000,
+                focus_instructions: None,
+                log: &mut log,
+                pending_events: &mut pending_events,
+                tool_event_store: Some(&store),
+                review_tx: &review_tx,
+            },
+            &FixtureCompactor::new(Ok(native_compaction_outcome())),
+        )
+        .await;
+        let loaded = SessionLog::load_from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(application, Ok(super::CompactionApplication::NotApplied));
+        assert!(
+            !pending_events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ProviderAttemptFinished { .. }))
+        );
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else {
+            return;
+        };
+        assert!(loaded.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ProviderAttemptFinished {
+                attempt: crate::ProviderAttemptSummary {
+                    purpose: crate::ProviderAttemptPurpose::CompactionSummary,
+                    outcome: crate::ProviderAttemptOutcome::Failed,
+                    ..
+                },
+                ..
+            }
+        )));
+        assert!(loaded.next_turn_index() > 9);
     }
 }

@@ -54,13 +54,23 @@ count = 0
 
 [[workload]]
 id = "turn/scripted/text_only#alloc_bytes"
-count = 1536
-comment = "intent-aware auto-review (PR #278): measured 331870 -> 333406 (+1536 bytes) against main, alloc_count unchanged (2554). Inferred, not isolated: the turn task now carries the review policy and authorization-revision handles (runner.rs:832-835) into each spawned prompt. Budgeted at the measured 1536 exactly, so any further growth fails. Earlier row: session approval grants measured +128."
+count = 1144
+comment = "session diagnostics (PR #283): measured 333406 -> 334550 (+1144 bytes) against main. Inferred, not isolated: each provider attempt now builds an AttemptLabel and a ProviderAttemptFinished event (owned session, turn, and model strings) and appends it directly to the store as one serialized line. Budgeted at the measured delta exactly, so any further growth fails. Earlier rows: intent-aware auto-review (PR #278) +1536; session approval grants +128."
+
+[[workload]]
+id = "turn/scripted/text_only#alloc_count"
+count = 12
+comment = "session diagnostics (PR #283): measured 2553 -> 2565 (+12) against main, after removing the event clone on the store path (runner.rs AttemptSink::record). Same inferred cause as the alloc_bytes row. Budgeted at the measured delta exactly."
 
 [[workload]]
 id = "turn/scripted/tools_4/builtin#alloc_bytes"
-count = 1536
-comment = "intent-aware auto-review (PR #278): measured 592074 -> 593610 (+1536 bytes) against main, alloc_count unchanged (4587). Same inferred cause as the text_only row; the four tool calls add nothing beyond it. Budgeted at the measured 1536 exactly."
+count = 1552
+comment = "session diagnostics (PR #283): measured 593610 -> 595162 (+1552 bytes) against main. Same inferred cause as the text_only row, for the turn's provider attempts. Budgeted at the measured delta exactly. Earlier row: intent-aware auto-review (PR #278) +1536."
+
+[[workload]]
+id = "turn/scripted/tools_4/builtin#alloc_count"
+count = 23
+comment = "session diagnostics (PR #283): measured 4586 -> 4609 (+23) against main, after removing the event clone on the store path. Same inferred cause as the alloc_bytes row. Budgeted at the measured delta exactly."
 
 [[workload]]
 id = "review/route/*"

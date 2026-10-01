@@ -192,6 +192,10 @@ pub struct ProviderErrorMetadata {
     pub timeout_phase: Option<TimeoutPhase>,
     #[serde(default, skip_serializing_if = "classification_source_is_variant")]
     pub classification_source: ClassificationSource,
+    /// Bounded Rig completion-error variant label. Diagnostic only; skipped
+    /// so protocol output stays unchanged.
+    #[serde(skip)]
+    pub error_variant: Option<&'static str>,
 }
 
 #[expect(
@@ -210,6 +214,7 @@ impl ProviderErrorMetadata {
             && self.retry_after_ms.is_none()
             && self.timeout_phase.is_none()
             && classification_source_is_variant(&self.classification_source)
+            && self.error_variant.is_none()
     }
 
     /// 401/403 and every 4xx except 408 and 429 cannot be retried, regardless

@@ -100,10 +100,7 @@ impl JsonlSessionStore {
 impl JsonlSessionStore {
     fn write_events(&self, events: &[SessionEvent]) -> io::Result<fs::File> {
         let mut buffer = Vec::new();
-        for event in events {
-            serde_json::to_writer(&mut buffer, event).map_err(io::Error::other)?;
-            buffer.write_all(b"\n")?;
-        }
+        crate::encode_stamped_lines(&mut buffer, events)?;
 
         if let Some(parent) = self.path.parent() {
             create_session_dir(parent)?;

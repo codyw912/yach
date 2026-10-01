@@ -51,6 +51,7 @@ mod provider_connections;
 mod catalog_refresh;
 mod headless;
 mod rpc;
+mod sessions;
 
 fn main() -> ExitCode {
     let trace = match yach_trace::TraceSink::from_env("YACH_TRACE") {
@@ -153,6 +154,12 @@ impl CliArgs {
             Some("extension") => extension_command_from_args(&positional[1..]),
             Some("preset") => preset_command_from_args(&positional[1..]),
             Some("component") => component_command_from_args(&positional[1..]),
+            Some("sessions") => match sessions::sessions_command_from_args(&positional[1..]) {
+                Ok(command) => Command::Sessions(command),
+                Err(message) => Command::Unknown {
+                    name: format!("sessions ({message})"),
+                },
+            },
             Some("rpc") => Command::Rpc {
                 args: positional[1..].to_vec(),
             },
@@ -255,6 +262,7 @@ enum Command {
     TuiDialogSmoke,
     TuiBenchReady,
     TuiProviderConnectionSmoke,
+    Sessions(sessions::SessionsCommand),
 }
 
 fn extension_command_from_args(args: &[String]) -> Command {
@@ -494,6 +502,22 @@ impl Command {
             Self::TuiDialogSmoke => run_tui_dialog_smoke_command(),
             Self::TuiProviderConnectionSmoke => run_tui_provider_connection_smoke_command(),
             Self::TuiBenchReady => run_tui_bench_ready_command(),
+            Self::Sessions(command) => match std::env::current_dir() {
+                Ok(project_root) => match sessions::run_sessions(command, &project_root) {
+                    Ok(lines) => CommandResult::Sessions {
+                        lines,
+                        failed: false,
+                    },
+                    Err(message) => CommandResult::Sessions {
+                        lines: vec![format!("error={message}")],
+                        failed: true,
+                    },
+                },
+                Err(error) => CommandResult::Sessions {
+                    lines: vec![format!("error={error}")],
+                    failed: true,
+                },
+            },
         }
     }
 }
@@ -574,6 +598,11 @@ enum CommandResult {
     /// `preset` and `component` commands render caller-supplied lines;
     /// `failed` drives the exit code.
     Preset {
+        lines: Vec<String>,
+        failed: bool,
+    },
+    /// `sessions` renders caller-supplied lines; `failed` drives the exit code.
+    Sessions {
         lines: Vec<String>,
         failed: bool,
     },
@@ -680,7 +709,7 @@ impl CommandResult {
             | Self::Tui { .. }
             | Self::CompactionSmoke { .. }
             | Self::ResponsesCompactionSmoke { .. } => 0,
-            Self::Preset { failed, .. } => *failed as u8,
+            Self::Preset { failed, .. } | Self::Sessions { failed, .. } => *failed as u8,
         }
     }
 
@@ -843,7 +872,7 @@ impl CommandResult {
                 rendered
             }
             Self::HeadlessRun { .. } | Self::Rpc { .. } => Vec::new(),
-            Self::Preset { lines, .. } => lines.clone(),
+            Self::Preset { lines, .. } | Self::Sessions { lines, .. } => lines.clone(),
         }
     }
 }
@@ -960,7 +989,9 @@ fn usage_lines() -> Vec<String> {
         String::from("       yach preset list | show | use <minimal|full> [--reset]"),
         String::from("       yach component list | enable <name> | disable <name>"),
         String::from("       yach extension install --bundled <yach.hashline|yach.jev-reviewer>"),
-        String::from("commands: run, rpc, extension, install, print-capabilities"),
+        String::from("       yach sessions list [--json]"),
+        String::from("       yach sessions show <session-id|latest> [--json]"),
+        String::from("commands: run, rpc, extension, install, print-capabilities, sessions"),
         String::from("options: --resume, --backend fixture, --version, --help"),
         String::from(
             "rpc: protocol server — ClientEvent JSONL on stdin, ServerEvent JSONL on stdout,",
@@ -2344,6 +2375,7 @@ fn run_compaction_smoke(session_path: Option<&str>) -> CommandResult {
             adapter: std::sync::Arc::new(adapter_config.clone()),
         }),
         native_request: None,
+        recorder: None,
     };
     let Ok(runtime) = tokio::runtime::Runtime::new() else {
         lines.push(String::from("failed to create tokio runtime"));
