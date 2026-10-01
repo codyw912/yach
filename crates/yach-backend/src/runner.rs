@@ -5901,12 +5901,12 @@ impl AttemptSink<'_> {
             turn_id,
             attempt,
         };
-        self.log.push(event.clone());
         if let Some(store) = self.store {
             let _ = store.append_event(&event);
         } else {
-            self.pending_events.push(event);
+            self.pending_events.push(event.clone());
         }
+        self.log.push(event);
     }
 }
 
