@@ -166,14 +166,19 @@ ProviderAttemptFinished {
   unsupported-provider and missing-request results never reach HTTP and
   record nothing. Callers that pass no sink (unit tests, benchmarks) record
   nothing.
-- **Persistence.** With a session store, attempt events are appended to the
-  store as soon as they settle, following the existing direct-append pattern
-  (`let _ = store.append_event(&event)`), and pushed to the in-memory log;
-  they are never held in the pending batch. So they survive exits that
-  discard pending events, including a failed or unusable manual compaction
-  and a rolled-back checkpoint write. A failed append is ignored like other
-  direct appends; it never changes the turn. Without a store they join the
-  in-memory log and pending batch like any other event.
+- **Persistence.** With a session store, attempt events are written to the
+  store as soon as they settle and pushed to the in-memory log; they are
+  never held in the pending batch. So they survive exits that discard
+  pending events, including a failed or unusable manual compaction and a
+  rolled-back checkpoint write. The write carries no durability barrier of
+  its own (`append_events_without_sync`), so a provider attempt never adds
+  an fsync: a turn's single `flush_durable` makes it durable, and manual
+  compaction, which runs outside a turn, flushes once after it returns,
+  whether it succeeded or failed. Until that flush, the line is in the file
+  but can be lost only to an OS crash or power loss. A failed write is
+  ignored like other direct appends; it never
+  changes the turn. Without a store they join the in-memory log and pending
+  batch like any other event.
   File order between attempt events and batched events is not guaranteed;
   the inspector orders a turn's items by their timing.
 - **Classification.** Unchanged, as is retry behavior. The event carries the

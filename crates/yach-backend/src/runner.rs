@@ -2028,6 +2028,9 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     &mut manual_attempt_sequence,
                 )
                 .await;
+                // Attempt events and the checkpoint are written without a
+                // barrier; manual compaction has no turn flush to cover them.
+                let _ = store.flush_durable();
                 if result.is_ok() {
                     publish_native_replay(&native_replay, manual_replay.clone());
                 }
@@ -5883,9 +5886,10 @@ pub(crate) struct AttemptLabel {
     pub attempt_sequence: u64,
 }
 
-/// Where settled attempts go. With a store, each event is appended directly
-/// (never through the pending batch, so failure exits cannot drop it);
-/// without one it joins log + pending like any other event.
+/// Where settled attempts go. With a store, each event is written directly
+/// (never through the pending batch, so failure exits cannot drop it) but
+/// without its own durability barrier: the turn's `flush_durable` covers it.
+/// Without a store it joins log + pending like any other event.
 pub(crate) struct AttemptSink<'a> {
     pub session_id: &'a SessionId,
     pub purpose: crate::ProviderAttemptPurpose,
@@ -5902,7 +5906,7 @@ impl AttemptSink<'_> {
             attempt,
         };
         if let Some(store) = self.store {
-            let _ = store.append_event(&event);
+            let _ = store.append_events_without_sync(std::slice::from_ref(&event));
         } else {
             self.pending_events.push(event.clone());
         }
@@ -35701,6 +35705,11 @@ manual anchored summary"
 
         assert!(result.is_err());
         assert!(pending.is_empty());
+        assert_eq!(
+            store.persist_sync_calls(),
+            0,
+            "an attempt event must not issue its own durable sync"
+        );
         assert_eq!(attempt_events(&log).len(), 1);
         assert!(loaded.is_ok());
         let Ok(loaded) = loaded else {
