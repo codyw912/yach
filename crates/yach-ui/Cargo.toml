@@ -9,6 +9,7 @@ description = "Terminal UI primitives for yach"
 [dependencies]
 crossterm = { version = "0.29", features = ["event-stream"] }
 ratatui = "0.30"
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui-textarea = "0.9.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
