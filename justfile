@@ -211,37 +211,42 @@ catalog-snapshot:
   curl -sf https://models.dev/api.json -o /tmp/models-dev-api.json
   cargo run -p yach-catalog --bin snapshot -- /tmp/models-dev-api.json crates/yach-catalog/data/catalog.json "$(date +%F)"
 
-# Refresh the baked Codex subscription catalog from the pinned Codex commit.
-# Default: fetch models.json from openai/codex at crates/yach-catalog/data/codex-models.pin.
-# Local override: set both CODEX_MODELS_JSON (path) and CODEX_MODELS_PIN (commit).
+# Refresh the baked Codex subscription catalog from a stable openai/codex
+# release. Default: the latest stable release. CODEX_MODELS_TAG=rust-vX.Y.Z
+# pins a specific release. Local override: CODEX_MODELS_JSON (path) with
+# CODEX_MODELS_TAG and CODEX_MODELS_PIN (40-hex commit).
 catalog-codex-snapshot:
   #!/usr/bin/env bash
   set -euo pipefail
   pin_file=crates/yach-catalog/data/codex-models.pin
   dest=crates/yach-catalog/data/codex-models.json
+  api=https://api.github.com/repos/openai/codex
+  curl_gh() { curl -fsSL -H 'Accept: application/vnd.github+json' -H 'User-Agent: yach-catalog-snapshot' "$@"; }
+  tag="${CODEX_MODELS_TAG:-}"
+  if [[ -z "$tag" ]]; then
+    tag="$(curl_gh "$api/releases/latest" | jq -er .tag_name)"
+  fi
+  if [[ ! "$tag" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "catalog-codex-snapshot: not a stable release tag: $tag" >&2
+    exit 1
+  fi
   if [[ -n "${CODEX_MODELS_JSON:-}" ]]; then
-    if [[ -z "${CODEX_MODELS_PIN:-}" ]]; then
-      echo "catalog-codex-snapshot: CODEX_MODELS_JSON requires CODEX_MODELS_PIN" >&2
-      exit 1
-    fi
-    if [[ ! -f "$CODEX_MODELS_JSON" ]]; then
-      echo "catalog-codex-snapshot: CODEX_MODELS_JSON is not a file: $CODEX_MODELS_JSON" >&2
-      exit 1
-    fi
-    cp "$CODEX_MODELS_JSON" "$dest"
-    printf '%s\n' "$CODEX_MODELS_PIN" > "$pin_file"
-    echo "wrote $dest from $CODEX_MODELS_JSON (pin $CODEX_MODELS_PIN)"
-    exit 0
+    commit="${CODEX_MODELS_PIN:?catalog-codex-snapshot: CODEX_MODELS_JSON requires CODEX_MODELS_PIN}"
+    [[ -f "$CODEX_MODELS_JSON" ]] || { echo "catalog-codex-snapshot: not a file: $CODEX_MODELS_JSON" >&2; exit 1; }
+    src="$CODEX_MODELS_JSON"
+  else
+    commit="$(curl_gh "$api/commits/$tag" | jq -er .sha)"
+    src="$(mktemp)"
+    trap 'rm -f "$src"' EXIT
+    curl -fsSL "https://raw.githubusercontent.com/openai/codex/${commit}/codex-rs/models-manager/models.json" -o "$src"
   fi
-  pin="${CODEX_MODELS_PIN:-$(cat "$pin_file")}"
-  src="$(mktemp)"
-  trap 'rm -f "$src"' EXIT
-  curl -sfL "https://raw.githubusercontent.com/openai/codex/${pin}/codex-rs/models-manager/models.json" -o "$src"
+  if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "catalog-codex-snapshot: not a full commit SHA: $commit" >&2
+    exit 1
+  fi
   cp "$src" "$dest"
-  if [[ -n "${CODEX_MODELS_PIN:-}" ]]; then
-    printf '%s\n' "$CODEX_MODELS_PIN" > "$pin_file"
-  fi
-  echo "wrote $dest from openai/codex@$pin"
+  printf '%s %s\n' "$tag" "$commit" > "$pin_file"
+  echo "wrote $dest from openai/codex $tag ($commit)"
 
 
 # Validate every eval task's verifier against its oracle solution — no

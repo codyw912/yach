@@ -329,7 +329,7 @@ impl DiscoveryCache {
 /// meets, so a cached listing from a different binary describes a different
 /// model set and must be refetched. Other providers ignore the version.
 fn listing_client_version(provider: ProviderKind) -> Option<&'static str> {
-    (provider == ProviderKind::ChatGptSubscription).then(yach_catalog::baked_codex_protocol_version)
+    (provider == ProviderKind::ChatGptSubscription).then(yach_catalog::baked_codex_release_version)
 }
 
 #[must_use]
