@@ -106,6 +106,72 @@ pub enum ModelDiscoveryOutcome {
     Failed {
         message: String,
     },
+    /// Result of a [`RefreshMode::Forced`] refresh. Entries and warnings are
+    /// what a normal refresh would publish; the rest feeds one status line.
+    Forced(ForcedRefreshReport),
+}
+
+/// Whether a model refresh honours the usual cache intervals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefreshMode {
+    #[default]
+    Normal,
+    /// Ignore every interval and fresh cache entry.
+    Forced,
+}
+
+/// Outcome of a forced refresh, rendered by [`forced_refresh_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForcedRefreshReport {
+    pub entries: Vec<CatalogModelEntry>,
+    pub warnings: Vec<String>,
+    /// `(before, after)` when the Codex client version changed.
+    pub codex_version_change: Option<(String, String)>,
+    /// Bounded step names that failed, e.g. "release check", "Codex catalog".
+    pub failed_steps: Vec<String>,
+    /// The effective Codex version, for failure messages.
+    pub codex_version: Option<String>,
+}
+
+/// One status line for a forced refresh. `previous` is the catalog advertised
+/// before the refresh; `+N models` counts report rows absent from it, keyed
+/// by `(provider, id)`.
+#[must_use]
+pub fn forced_refresh_status(
+    previous: &[CatalogModelEntry],
+    report: &ForcedRefreshReport,
+) -> String {
+    use std::fmt::Write as _;
+
+    let known: std::collections::HashSet<(&str, &str)> = previous
+        .iter()
+        .map(|entry| (entry.info.provider.as_str(), entry.info.id.as_str()))
+        .collect();
+    let added = report
+        .entries
+        .iter()
+        .filter(|entry| !known.contains(&(entry.info.provider.as_str(), entry.info.id.as_str())))
+        .count();
+
+    let mut status = String::from("models refreshed");
+    if let Some((before, after)) = &report.codex_version_change {
+        let _ = write!(status, " · Codex {before} → {after}");
+    }
+    if added > 0 {
+        let _ = write!(status, " · +{added} models");
+    }
+    if report.codex_version_change.is_none() && added == 0 {
+        status.push_str(" · no changes");
+    }
+    for step in &report.failed_steps {
+        let _ = write!(status, " · {step} failed");
+        if step == "release check"
+            && let Some(version) = &report.codex_version
+        {
+            let _ = write!(status, " (using {version})");
+        }
+    }
+    status
 }
 
 /// An inert provider-model discovery request, owned by the runner until the
@@ -521,7 +587,10 @@ fn start_connection_model_refresh(
     debug_assert!(in_flight.is_none());
     *in_flight = Some(generation);
 
-    let future = runtime.refresh_models(current_connection_model_target(flow, provider));
+    let future = runtime.refresh_models(
+        current_connection_model_target(flow, provider),
+        RefreshMode::Normal,
+    );
     let updates = updates.clone();
     tokio::spawn(async move {
         let _ = updates.send((generation, future.await));
@@ -1385,7 +1454,8 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     | ModelDiscoveryOutcome::AvailableWithWarnings {
                         entries,
                         warnings: _,
-                    } => {
+                    }
+                    | ModelDiscoveryOutcome::Forced(ForcedRefreshReport { entries, .. }) => {
                         if let Some(provider) = provider.as_mut() {
                             provider.catalog_models = entries.into();
                         }
@@ -1549,7 +1619,12 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 Vec::new(),
                             );
                         }
-                        ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } => {
+                        ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings }
+                        | ModelDiscoveryOutcome::Forced(ForcedRefreshReport {
+                            entries,
+                            warnings,
+                            ..
+                        }) => {
                             publish_connection_catalog(
                                 &tx,
                                 provider.as_ref(),
@@ -10999,18 +11074,20 @@ mod tests {
         ActiveProviderTurn, AgentEditReviewDecision, CancellationToken, CatalogModelEntry,
         ConnectionFlowEffect, ConnectionFlowEffectContext, ConnectionMutationOperation,
         EMPTY_ASSISTANT_RESPONSE_MESSAGE, ExtensionActivationSnapshotState,
-        ExtensionManifestScanState, FixtureOutcome, InFlightModelActivation, LaunchProjectContext,
-        MAX_TOOL_CALL_PREVIEW_CHARS, ModelDiscoveryFuture, ModelDiscoveryOutcome,
-        ProjectExtensionResourceBroker, PromptCompletion, PromptSessionInput,
-        ProviderAgentToolBatch, ProviderAgentToolRound, ProviderBufferedEventSink, ProviderConfig,
-        ProviderConnectionFlow, ProviderFirstRound, ProviderRequester, ProviderRetryContext,
-        ProviderRoundError, ProviderRoundResult, ProviderToolLoopBudget, ProviderToolLoopPolicy,
-        ProviderToolRoundContext, RunnerConfig, SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState,
-        ThinkingLevel, UnconfiguredProviderPrompt, active_model, apply_active_connection_rename,
+        ExtensionManifestScanState, FixtureOutcome, ForcedRefreshReport, InFlightModelActivation,
+        LaunchProjectContext, MAX_TOOL_CALL_PREVIEW_CHARS, ModelDiscoveryFuture,
+        ModelDiscoveryOutcome, ProjectExtensionResourceBroker, PromptCompletion,
+        PromptSessionInput, ProviderAgentToolBatch, ProviderAgentToolRound,
+        ProviderBufferedEventSink, ProviderConfig, ProviderConnectionFlow, ProviderFirstRound,
+        ProviderRequester, ProviderRetryContext, ProviderRoundError, ProviderRoundResult,
+        ProviderToolLoopBudget, ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig,
+        SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState, ThinkingLevel,
+        UnconfiguredProviderPrompt, active_model, apply_active_connection_rename,
         apply_connection_flow_effects, apply_native_model_selection, backend_status_message,
         cancel_active_provider_turn, clear_connection_catalog, collect_native_provider_first_round,
         edit_permission_mode, execute_native_provider_agent_tool_batch, finish_native_prompt,
-        fixture_outcome, handle_native_extension_diagnostic_snapshot_request,
+        fixture_outcome, forced_refresh_status,
+        handle_native_extension_diagnostic_snapshot_request,
         handle_native_extension_lifecycle_request, handle_native_prompt,
         handle_native_prompt_unconfigured_provider, launch_project_context,
         launch_project_context_from_root, load_native_session_log_for_runner,
@@ -25861,6 +25938,40 @@ manual anchored summary"
     }
 
     #[test]
+    fn forced_refresh_status_reports_version_change_new_rows_and_failures() {
+        let row = |id: &str| catalog_entry(id, id, "openai-codex");
+        let previous = vec![row("gpt-6-sol")];
+        let report = ForcedRefreshReport {
+            entries: vec![row("gpt-6-sol"), row("gpt-6.1-sol")],
+            warnings: Vec::new(),
+            codex_version_change: Some((String::from("0.158.0"), String::from("0.160.0"))),
+            failed_steps: Vec::new(),
+            codex_version: Some(String::from("0.160.0")),
+        };
+        assert_eq!(
+            forced_refresh_status(&previous, &report),
+            "models refreshed · Codex 0.158.0 → 0.160.0 · +1 models"
+        );
+        let unchanged = ForcedRefreshReport {
+            entries: previous.clone(),
+            codex_version_change: None,
+            ..report.clone()
+        };
+        assert_eq!(
+            forced_refresh_status(&previous, &unchanged),
+            "models refreshed · no changes"
+        );
+        let failed = ForcedRefreshReport {
+            failed_steps: vec![String::from("release check")],
+            ..unchanged
+        };
+        assert_eq!(
+            forced_refresh_status(&previous, &failed),
+            "models refreshed · no changes · release check failed (using 0.160.0)"
+        );
+    }
+
+    #[test]
     fn provider_config_clone_shares_the_completed_catalog_snapshot() {
         let mut provider = provider_test_config();
         provider.catalog_models = vec![catalog_entry("gpt-new", "GPT New", "openai")].into();
@@ -28519,7 +28630,11 @@ manual anchored summary"
             self.cached_models.clone()
         }
 
-        fn refresh_models(&self, _: Option<crate::ActiveModelTarget>) -> ModelDiscoveryFuture {
+        fn refresh_models(
+            &self,
+            _: Option<crate::ActiveModelTarget>,
+            _: crate::RefreshMode,
+        ) -> ModelDiscoveryFuture {
             self.refresh_calls.fetch_add(1, Ordering::SeqCst);
             let receiver = match self.refresh_outcomes.lock() {
                 Ok(mut outcomes) => outcomes.pop_front(),
