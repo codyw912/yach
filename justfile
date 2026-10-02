@@ -222,27 +222,41 @@ catalog-codex-snapshot:
   dest=crates/yach-catalog/data/codex-models.json
   api=https://api.github.com/repos/openai/codex
   curl_gh() { curl -fsSL -H 'Accept: application/vnd.github+json' -H 'User-Agent: yach-catalog-snapshot' "$@"; }
-  tag="${CODEX_MODELS_TAG:-}"
-  if [[ -z "$tag" ]]; then
-    tag="$(curl_gh "$api/releases/latest" | jq -er .tag_name)"
-  fi
-  if [[ ! "$tag" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "catalog-codex-snapshot: not a stable release tag: $tag" >&2
-    exit 1
-  fi
+  stable_tag='^rust-v[0-9]+\.[0-9]+\.[0-9]+$'
   if [[ -n "${CODEX_MODELS_JSON:-}" ]]; then
-    commit="${CODEX_MODELS_PIN:?catalog-codex-snapshot: CODEX_MODELS_JSON requires CODEX_MODELS_PIN}"
+    tag="${CODEX_MODELS_TAG:-}"
+    commit="${CODEX_MODELS_PIN:-}"
+    if [[ -z "$tag" || -z "$commit" ]]; then
+      echo "catalog-codex-snapshot: CODEX_MODELS_JSON requires both CODEX_MODELS_TAG and CODEX_MODELS_PIN" >&2
+      exit 1
+    fi
+    if [[ ! "$tag" =~ $stable_tag ]]; then
+      echo "catalog-codex-snapshot: not a stable release tag: $tag" >&2
+      exit 1
+    fi
+    if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "catalog-codex-snapshot: not a full commit SHA: $commit" >&2
+      exit 1
+    fi
     [[ -f "$CODEX_MODELS_JSON" ]] || { echo "catalog-codex-snapshot: not a file: $CODEX_MODELS_JSON" >&2; exit 1; }
     src="$CODEX_MODELS_JSON"
   else
+    tag="${CODEX_MODELS_TAG:-}"
+    if [[ -z "$tag" ]]; then
+      tag="$(curl_gh "$api/releases/latest" | jq -er .tag_name)"
+    fi
+    if [[ ! "$tag" =~ $stable_tag ]]; then
+      echo "catalog-codex-snapshot: not a stable release tag: $tag" >&2
+      exit 1
+    fi
     commit="$(curl_gh "$api/commits/$tag" | jq -er .sha)"
+    if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "catalog-codex-snapshot: not a full commit SHA: $commit" >&2
+      exit 1
+    fi
     src="$(mktemp)"
     trap 'rm -f "$src"' EXIT
     curl -fsSL "https://raw.githubusercontent.com/openai/codex/${commit}/codex-rs/models-manager/models.json" -o "$src"
-  fi
-  if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "catalog-codex-snapshot: not a full commit SHA: $commit" >&2
-    exit 1
   fi
   cp "$src" "$dest"
   printf '%s %s\n' "$tag" "$commit" > "$pin_file"

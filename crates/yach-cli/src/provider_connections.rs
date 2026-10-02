@@ -494,6 +494,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             // runs them; injected-store runtimes stay hermetic.
             let codex_steps = state.check_codex_release && has_chatgpt;
             let mut failed_steps = Vec::new();
+            let mut succeeded_steps = 0_usize;
             let mut codex_version = None;
             let mut codex_version_change = None;
             if codex_steps {
@@ -510,6 +511,8 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                     Ok(check) => {
                         if check.failed {
                             failed_steps.push(String::from("release check"));
+                        } else {
+                            succeeded_steps += 1;
                         }
                         if check.before != check.after {
                             codex_version_change = Some((check.before, check.after.clone()));
@@ -523,8 +526,10 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             let mut layers = state.layers.clone();
             if mode == RefreshMode::Forced && codex_steps {
                 let ok = refresh_codex_catalog(&resolved.connections, RefreshMode::Forced).await;
-                if ok == Some(false) {
-                    failed_steps.push(String::from("Codex catalog"));
+                match ok {
+                    Some(false) => failed_steps.push(String::from("Codex catalog")),
+                    Some(true) => succeeded_steps += 1,
+                    None => {}
                 }
             }
             if let Some(cache) = super::catalog_refresh::load_codex_cache() {
@@ -536,6 +541,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                     refresh_codex_catalog(&connections, RefreshMode::Normal).await
                 });
             }
+            let discovered_count = resolved.connections.len();
             let discoverer = state.discoverer.clone();
             let discovery_cache = state.discovery_cache.clone();
             let active_for_discovery = active.clone();
@@ -556,14 +562,27 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             let mut warnings = resolved.warnings;
             let mut entries = Vec::new();
             let mut cache_updates = Vec::new();
+            let mut discovery_failures = 0_usize;
             for discovery in discovered {
                 entries.extend(discovery.entries);
                 if let Some(update) = discovery.cache_update {
                     cache_updates.push(update);
                 }
                 if let Some(failure) = discovery.failure {
+                    discovery_failures += 1;
                     warnings.push(failure.status_message().to_owned());
                 }
+            }
+            // Discovery is one step. Rows alone prove nothing — a failed
+            // listing keeps cached and baked fallback rows — so it succeeded
+            // only if some connection listed its models. Any connection
+            // failing, or every stored connection being unusable, is
+            // reported as one bounded "discovery" failure.
+            if discovered_count > discovery_failures {
+                succeeded_steps += 1;
+            }
+            if discovery_failures > 0 || (discovered_count == 0 && !warnings.is_empty()) {
+                failed_steps.push(String::from("discovery"));
             }
             entries.sort_by(|left, right| entry_order(left, right, active.as_ref()));
             let truncated = entries.len() > MAX_SNAPSHOT_ROWS;
@@ -599,6 +618,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                     warnings,
                     codex_version_change,
                     failed_steps,
+                    succeeded_steps,
                     codex_version,
                 }),
             }
@@ -2301,6 +2321,91 @@ mod tests {
         );
         let _ = std::fs::remove_file(cache_path);
     }
+
+    fn forced_report_with_discoverer(
+        connection: &ProviderConnection,
+        cache_path: &std::path::Path,
+        discoverer: ModelDiscoverer,
+    ) -> ForcedRefreshReport {
+        let mut cache = DiscoveryCache::default();
+        cache.update(
+            connection,
+            unix_timestamp_seconds() - CACHE_FRESHNESS_SECONDS - 1,
+            None,
+            vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                id: String::from("stale-model"),
+                display_name: None,
+            }],
+        );
+        cache.persist(cache_path).test_unwrap();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            Arc::new(FixedMetadata {
+                records: vec![connection.clone()],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            discoverer,
+            Some(cache_path.to_path_buf()),
+        );
+        let ModelDiscoveryOutcome::Forced(report) = tokio::runtime::Runtime::new()
+            .test_unwrap()
+            .block_on(runtime.refresh_models(None, RefreshMode::Forced))
+        else {
+            unreachable!("forced refresh must return a report");
+        };
+        report
+    }
+
+    #[test]
+    fn forced_report_records_failed_discovery_even_when_fallback_rows_remain() {
+        let connection = ready_compatible("Cached", "http://cache.invalid/v1");
+        let cache_path = registry_fixture_path();
+        let report = forced_report_with_discoverer(
+            &connection,
+            &cache_path,
+            Arc::new(|_, _| {
+                Box::pin(async {
+                    Err(ModelDiscoveryError::Provider(yach_backend::ProviderError {
+                        kind: yach_backend::ProviderErrorKind::Authentication,
+                        message: String::from("redacted"),
+                        redacted_debug: None,
+                        metadata: yach_backend::ProviderErrorMetadata::default(),
+                    }))
+                })
+            }),
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.info.id == "stale-model"),
+            "the cached rows stay as the fallback"
+        );
+        assert_eq!(report.failed_steps, vec![String::from("discovery")]);
+        assert_eq!(report.succeeded_steps, 0);
+        assert_eq!(
+            yach_backend::forced_refresh_status(&report.entries, &report),
+            "models refreshed · no changes · discovery failed",
+            "the single final status line carries the failure"
+        );
+        let _ = std::fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn forced_report_treats_an_empty_successful_listing_as_success() {
+        let connection = ready_compatible("Empty", "http://empty.invalid/v1");
+        let cache_path = registry_fixture_path();
+        let report = forced_report_with_discoverer(
+            &connection,
+            &cache_path,
+            Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
+        );
+        assert!(report.failed_steps.is_empty());
+        assert_eq!(report.succeeded_steps, 1);
+        let _ = std::fs::remove_file(cache_path);
+    }
+
     #[test]
     fn runtime_environment_uses_a_distinct_adapter_arc_from_the_runner() {
         let runner_adapter = Arc::new(RigProviderAdapterConfig {

@@ -127,8 +127,13 @@ pub struct ForcedRefreshReport {
     pub warnings: Vec<String>,
     /// `(before, after)` when the Codex client version changed.
     pub codex_version_change: Option<(String, String)>,
-    /// Bounded step names that failed, e.g. "release check", "Codex catalog".
+    /// Bounded step names that failed: "release check", "Codex catalog",
+    /// "discovery".
     pub failed_steps: Vec<String>,
+    /// Attempted steps that succeeded. A forced refresh failed outright only
+    /// when steps were attempted and none of them succeeded; fallback rows
+    /// kept by a failed discovery say nothing about that.
+    pub succeeded_steps: usize,
     /// The effective Codex version, for failure messages.
     pub codex_version: Option<String>,
 }
@@ -25987,6 +25992,7 @@ manual anchored summary"
             warnings: Vec::new(),
             codex_version_change: Some((String::from("0.158.0"), String::from("0.160.0"))),
             failed_steps: Vec::new(),
+            succeeded_steps: 2,
             codex_version: Some(String::from("0.160.0")),
         };
         assert_eq!(
@@ -26009,6 +26015,14 @@ manual anchored summary"
         assert_eq!(
             forced_refresh_status(&previous, &failed),
             "models refreshed · no changes · release check failed (using 0.160.0)"
+        );
+        let discovery_failed = ForcedRefreshReport {
+            failed_steps: vec![String::from("discovery")],
+            ..failed.clone()
+        };
+        assert_eq!(
+            forced_refresh_status(&previous, &discovery_failed),
+            "models refreshed · no changes · discovery failed",
         );
     }
 
@@ -30450,6 +30464,7 @@ manual anchored summary"
                     warnings: vec![String::from("one provider was skipped")],
                     codex_version_change: None,
                     failed_steps: Vec::new(),
+                    succeeded_steps: 1,
                     codex_version: None,
                 }))
                 .is_ok()
