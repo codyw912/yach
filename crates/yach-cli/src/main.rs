@@ -45,6 +45,7 @@ use yach_ui::{
     run_tui_with_trace_and_options,
 };
 mod bundled;
+mod codex_release;
 mod model_discovery_cache;
 mod provider_connections;
 
@@ -949,6 +950,7 @@ fn run_headless_cli_command(
         runtime_timeout,
         provider_test_delay_ms(),
     )
+    .map(provider_connections::CliProviderConnectionRuntime::with_codex_release_check)
     .map(|runtime| Arc::new(runtime) as Arc<dyn yach_backend::ProviderConnectionRuntime>);
     if provider.is_none() && provider_runtime.is_none() {
         return setup_error(String::from("no provider connection is configured"));
@@ -4042,6 +4044,7 @@ async fn run_tui_with_native_backend_config_observed(
             runtime_timeout,
             runtime_test_delay_ms,
         )
+        .map(provider_connections::CliProviderConnectionRuntime::with_codex_release_check)
         .map(|runtime| Arc::new(runtime) as Arc<dyn yach_backend::ProviderConnectionRuntime>)
     });
     let backend_handshake = native_backend_handshake(&setup, provider_connections.is_some());
@@ -4084,10 +4087,11 @@ async fn run_tui_with_native_backend_config_observed(
                 let adapter = adapter.clone();
                 let layers = layers.clone();
                 Box::pin(async move {
+                    let client_version = crate::codex_release::effective_client_version();
                     match yach_backend::model_discovery::discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
-                        Some(yach_catalog::baked_codex_release_version()),
+                        Some(client_version.as_str()),
                     )
                     .await
                     {
