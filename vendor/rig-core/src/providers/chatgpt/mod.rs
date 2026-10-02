@@ -619,7 +619,8 @@ where
 
         let client = self.client.clone();
         let event_source = crate::http_client::sse::GenericEventSource::new(client, req)
-            .allow_missing_content_type();
+            .allow_missing_content_type()
+            .allow_text_plain_content_type();
 
         Ok(responses_api::streaming::stream_from_event_source(
             event_source,

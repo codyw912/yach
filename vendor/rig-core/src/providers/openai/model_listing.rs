@@ -12,18 +12,20 @@ struct ListModelsResponse {
     data: Vec<ListModelEntry>,
 }
 
+/// OpenAI documents `created` and `owned_by` as always present, but
+/// OpenAI-compatible gateways omit them; only `id` is required.
 #[derive(Debug, Deserialize)]
 struct ListModelEntry {
     id: String,
-    created: u64,
-    owned_by: String,
+    created: Option<u64>,
+    owned_by: Option<String>,
 }
 
 impl From<ListModelEntry> for Model {
     fn from(value: ListModelEntry) -> Self {
         let mut model = Model::from_id(value.id);
-        model.created_at = Some(value.created);
-        model.owned_by = Some(value.owned_by);
+        model.created_at = value.created;
+        model.owned_by = value.owned_by;
         model
     }
 }
@@ -67,5 +69,36 @@ where
         let models = api_resp.data.into_iter().map(Model::from).collect();
 
         Ok(ModelList::new(models))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ListModelsResponse;
+    use crate::model::Model;
+
+    #[test]
+    fn compatible_listing_without_created_or_owner_parses() {
+        // OpenAI-compatible gateways often omit `created` and `owned_by`.
+        let body = br#"{"object":"list","data":[
+            {"id":"openai-codex/gpt-6.1-sol","object":"model","owned_by":"openai-codex"},
+            {"id":"bare-model"},
+            {"id":"gpt-4o","object":"model","created":1715367049,"owned_by":"system"}
+        ]}"#;
+        let response: ListModelsResponse =
+            serde_json::from_slice(body).expect("compatible listing should parse");
+        let models: Vec<Model> = response.data.into_iter().map(Model::from).collect();
+        let summary: Vec<_> = models
+            .iter()
+            .map(|model| (model.id.as_str(), model.created_at, model.owned_by.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("openai-codex/gpt-6.1-sol", None, Some("openai-codex")),
+                ("bare-model", None, None),
+                ("gpt-4o", Some(1_715_367_049), Some("system")),
+            ]
+        );
     }
 }

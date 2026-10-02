@@ -198,6 +198,7 @@ pin_project! {
         retry_policy: Retry,
         last_event_id: Option<String>,
         allow_missing_content_type: bool,
+        allow_text_plain_content_type: bool,
         #[pin]
         state: SourceState,
     }
@@ -219,12 +220,21 @@ where
             retry_policy: DEFAULT_RETRY,
             last_event_id: None,
             allow_missing_content_type: false,
+            allow_text_plain_content_type: false,
             state,
         }
     }
 
     pub fn allow_missing_content_type(mut self) -> Self {
         self.allow_missing_content_type = true;
+        self
+    }
+
+    /// Accept a successful `text/plain` response as an event stream. The
+    /// ChatGPT Codex endpoint streams valid SSE labelled
+    /// `text/plain; charset=utf-8`; other media types still fail fast.
+    pub fn allow_text_plain_content_type(mut self) -> Self {
+        self.allow_text_plain_content_type = true;
         self
     }
 
@@ -295,7 +305,11 @@ where
                     match response_future.poll(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(response)) => {
-                            match check_response(response, *this.allow_missing_content_type) {
+                            match check_response(
+                                response,
+                                *this.allow_missing_content_type,
+                                *this.allow_text_plain_content_type,
+                            ) {
                                 Ok(response) => {
                                     // Transition: Connecting -> Open
                                     let event_stream = open_event_stream(
@@ -337,7 +351,11 @@ where
                     match response_future.poll(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(response)) => {
-                            match check_response(response, *this.allow_missing_content_type) {
+                            match check_response(
+                                response,
+                                *this.allow_missing_content_type,
+                                *this.allow_text_plain_content_type,
+                            ) {
                                 Ok(response) => {
                                     // Transition: Reconnecting -> Open (retry cycle complete)
                                     let event_stream = open_event_stream(
@@ -454,6 +472,7 @@ where
 fn check_response<T>(
     response: Response<T>,
     allow_missing_content_type: bool,
+    allow_text_plain_content_type: bool,
 ) -> Result<Response<T>, super::Error> {
     let StatusCode::OK = response.status() else {
         return Err(super::Error::InvalidStatusCode(response.status()));
@@ -478,7 +497,11 @@ fn check_response<T>(
             matches!(
                 (mime_type.type_(), mime_type.subtype()),
                 (mime::TEXT, mime::EVENT_STREAM)
-            )
+            ) || (allow_text_plain_content_type
+                && matches!(
+                    (mime_type.type_(), mime_type.subtype()),
+                    (mime::TEXT, mime::PLAIN)
+                ))
         })
         .unwrap_or(false)
     {
@@ -490,13 +513,49 @@ fn check_response<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedSseByteStream, SSE_EVENT_MAX_BYTES, SseEventByteLimiter};
+    use super::{BoundedSseByteStream, SSE_EVENT_MAX_BYTES, SseEventByteLimiter, check_response};
     use bytes::Bytes;
     use futures::StreamExt;
 
     #[test]
     fn sse_event_max_bytes_is_high_enough_for_completed_payloads() {
         assert_eq!(SSE_EVENT_MAX_BYTES, 8 * 1024 * 1024);
+    }
+
+    fn ok_response(content_type: Option<&'static str>) -> http::Response<()> {
+        let mut builder = http::Response::builder().status(http::StatusCode::OK);
+        if let Some(content_type) = content_type {
+            builder = builder.header(http::header::CONTENT_TYPE, content_type);
+        }
+        builder.body(()).expect("response should build")
+    }
+
+    fn accepts(content_type: Option<&'static str>, missing: bool, text_plain: bool) -> bool {
+        match check_response(ok_response(content_type), missing, text_plain) {
+            Ok(_) => true,
+            Err(super::super::Error::InvalidContentType(_)) => false,
+            Err(other) => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_plain_allowance_accepts_only_text_plain() {
+        // The ChatGPT Codex endpoint streams valid SSE as `text/plain; charset=utf-8`.
+        assert!(accepts(Some("text/plain; charset=utf-8"), false, true));
+        assert!(accepts(Some("text/event-stream"), false, true));
+        // JSON or HTML error pages must still fail fast instead of reaching
+        // the SSE parser and ending as an opaque incomplete stream.
+        assert!(!accepts(Some("application/json"), true, true));
+        assert!(!accepts(Some("text/html; charset=utf-8"), true, true));
+    }
+
+    #[test]
+    fn default_sources_still_require_event_stream() {
+        assert!(accepts(Some("text/event-stream"), false, false));
+        assert!(!accepts(Some("text/plain; charset=utf-8"), false, false));
+        assert!(!accepts(Some("application/json"), false, false));
+        assert!(!accepts(None, false, false));
+        assert!(accepts(None, true, false));
     }
 
     #[test]
