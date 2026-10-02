@@ -30,6 +30,9 @@ pub(crate) struct CachedModels {
 struct CachedConnectionDiscovery {
     provider: ProviderKind,
     endpoint: Option<String>,
+    /// `client_version` the listing was requested with; see
+    /// [`listing_client_version`].
+    client_version: Option<String>,
     refreshed_at: u64,
     models: Vec<DiscoveredProviderModel>,
     truncated: bool,
@@ -46,6 +49,8 @@ struct CacheConnectionDocument {
     connection_id: String,
     provider: ProviderKind,
     endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_version: Option<String>,
     refreshed_at: u64,
     models: Vec<CacheModelDocument>,
     #[serde(default)]
@@ -106,6 +111,7 @@ impl DiscoveryCache {
                 CachedConnectionDiscovery {
                     provider: entry.provider,
                     endpoint: entry.endpoint,
+                    client_version: entry.client_version,
                     refreshed_at: entry.refreshed_at,
                     models: entry
                         .models
@@ -136,6 +142,7 @@ impl DiscoveryCache {
         Some(CachedModels {
             models: entry.models.clone(),
             fresh: !entry.truncated
+                && entry.client_version.as_deref() == listing_client_version(connection.provider)
                 && entry.refreshed_at <= now
                 && now - entry.refreshed_at < freshness_seconds,
         })
@@ -172,6 +179,7 @@ impl DiscoveryCache {
             CachedConnectionDiscovery {
                 provider: connection.provider,
                 endpoint: connection.base_url.clone(),
+                client_version: listing_client_version(connection.provider).map(String::from),
                 refreshed_at,
                 models: bounded_models,
                 truncated,
@@ -248,6 +256,7 @@ impl DiscoveryCache {
                     connection_id: connection_id.as_str().to_owned(),
                     provider: entry.provider,
                     endpoint: entry.endpoint.clone(),
+                    client_version: entry.client_version.clone(),
                     refreshed_at: entry.refreshed_at,
                     models: entry
                         .models
@@ -313,6 +322,14 @@ impl DiscoveryCache {
         }
         sync_parent_directory(parent)
     }
+}
+
+/// The `client_version` a provider's model listing depends on. The ChatGPT
+/// Codex backend only lists models whose minimum client version the request
+/// meets, so a cached listing from a different binary describes a different
+/// model set and must be refetched. Other providers ignore the version.
+fn listing_client_version(provider: ProviderKind) -> Option<&'static str> {
+    (provider == ProviderKind::ChatGptSubscription).then(yach_catalog::baked_codex_protocol_version)
 }
 
 #[must_use]
@@ -490,6 +507,57 @@ mod tests {
         let cached = cache.models_for(&connection, 100, 7_200).test_unwrap();
         assert!(cached.fresh);
         assert_eq!(cached.models[0].id, "environment-model");
+    }
+
+    #[test]
+    fn codex_listing_from_another_client_version_is_stale() {
+        let connection = ProviderConnection {
+            id: ConnectionId::new_stored(),
+            provider: ProviderKind::ChatGptSubscription,
+            label: Some(String::from("Codex")),
+            key: None,
+            base_url: None,
+            authentication: yach_connections::ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file: std::path::PathBuf::from("/tmp/chatgpt-subscription.json"),
+                account_id: String::from("acct_123"),
+            },
+            state: yach_connections::ConnectionState::Ready,
+        };
+        let path = std::env::temp_dir().join(format!("yach-cache-{}.json", Uuid::new_v4()));
+        let mut cache = DiscoveryCache::default();
+        cache.update(
+            &connection,
+            100,
+            vec![DiscoveredProviderModel {
+                id: String::from("gpt-5.5"),
+                display_name: None,
+            }],
+        );
+        cache.persist(&path).test_unwrap();
+
+        // Listed by this binary: fresh after a reload.
+        let reloaded = DiscoveryCache::load(&path);
+        assert!(
+            reloaded
+                .models_for(&connection, 100, 7_200)
+                .test_unwrap()
+                .fresh
+        );
+
+        // Listed under another client_version (or before versions were
+        // recorded): kept as a fallback, but refetched.
+        for recorded in [Some("0.0.1"), None] {
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).test_unwrap()).test_unwrap();
+            document["connections"][0]["client_version"] =
+                recorded.map_or(serde_json::Value::Null, serde_json::Value::from);
+            fs::write(&path, serde_json::to_vec(&document).test_unwrap()).test_unwrap();
+            let older = DiscoveryCache::load(&path);
+            let cached = older.models_for(&connection, 100, 7_200).test_unwrap();
+            assert!(!cached.fresh, "{recorded:?} listing must be refetched");
+            assert_eq!(cached.models[0].id, "gpt-5.5");
+        }
+        let _ = fs::remove_file(path);
     }
 
     #[test]

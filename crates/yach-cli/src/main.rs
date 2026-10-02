@@ -1864,6 +1864,7 @@ fn model_override_layers_resolve_prefers_fetched_over_baked_but_loses_to_project
         etag: None,
         last_modified: None,
         checked_at_unix_ms: None,
+        client_version: None,
         retrieved: String::from("2026-08-03"),
         catalog: fetched_catalog,
     };
@@ -4083,11 +4084,10 @@ async fn run_tui_with_native_backend_config_observed(
                 let adapter = adapter.clone();
                 let layers = layers.clone();
                 Box::pin(async move {
-                    let version = yach_catalog::baked_codex_protocol_version();
                     match yach_backend::model_discovery::discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
-                        Some(version.as_str()),
+                        Some(yach_catalog::baked_codex_protocol_version()),
                     )
                     .await
                     {

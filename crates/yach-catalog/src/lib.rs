@@ -255,10 +255,14 @@ pub fn baked_catalog() -> &'static Catalog {
 
 /// Highest `minimal_client_version` among listed, API-supported models in
 /// the pinned Codex snapshot. Used as the `/models?client_version=` value.
+/// Parsed from the baked snapshot once per process.
 #[must_use]
-pub fn baked_codex_protocol_version() -> String {
-    max_listed_codex_protocol_version(include_str!("../data/codex-models.json"))
-        .unwrap_or_else(|| String::from("0.0.1"))
+pub fn baked_codex_protocol_version() -> &'static str {
+    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        max_listed_codex_protocol_version(include_str!("../data/codex-models.json"))
+            .unwrap_or_else(|| String::from("0.0.1"))
+    });
+    VERSION.as_str()
 }
 
 fn max_listed_codex_protocol_version(raw: &str) -> Option<String> {
@@ -293,6 +297,11 @@ pub struct CachedCatalog {
     pub last_modified: Option<String>,
     #[serde(default)]
     pub checked_at_unix_ms: Option<u64>,
+    /// `client_version` the source was queried with, for sources that gate
+    /// their contents on it (the ChatGPT Codex model list). `None` for
+    /// version-independent sources and for caches written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
     pub retrieved: String,
     pub catalog: Catalog,
 }
@@ -1369,6 +1378,7 @@ mod tests {
             etag: Some(String::from("\"abc\"")),
             last_modified: None,
             checked_at_unix_ms: Some(1),
+            client_version: None,
             retrieved: String::from("2026-08-03"),
             catalog,
         };
@@ -1463,6 +1473,7 @@ mod tests {
             etag: None,
             last_modified: None,
             checked_at_unix_ms: None,
+            client_version: None,
             retrieved: String::from("2026-08-06"),
             catalog,
         };
@@ -1904,6 +1915,7 @@ mod tests {
             etag: None,
             last_modified: None,
             checked_at_unix_ms: None,
+            client_version: None,
             retrieved: String::from("2026-08-07"),
             catalog,
         };

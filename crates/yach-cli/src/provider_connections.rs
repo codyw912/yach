@@ -249,11 +249,10 @@ impl CliProviderConnectionRuntime {
             environment,
             Arc::new(|adapter| {
                 Box::pin(async move {
-                    let version = yach_catalog::baked_codex_protocol_version();
                     discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
-                        Some(version.as_str()),
+                        Some(yach_catalog::baked_codex_protocol_version()),
                     )
                     .await
                 })
@@ -280,11 +279,10 @@ impl CliProviderConnectionRuntime {
             environment,
             Arc::new(|adapter| {
                 Box::pin(async move {
-                    let version = yach_catalog::baked_codex_protocol_version();
                     discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
-                        Some(version.as_str()),
+                        Some(yach_catalog::baked_codex_protocol_version()),
                     )
                     .await
                 })
@@ -1522,9 +1520,11 @@ fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) -> bool {
     else {
         return false;
     };
+    let client_version = yach_catalog::baked_codex_protocol_version();
     let existing = super::catalog_refresh::load_codex_cache();
-    if !super::catalog_refresh::refresh_due(
+    if !super::catalog_refresh::codex_refresh_due(
         existing.as_ref(),
+        client_version,
         super::catalog_refresh::catalog_date_now().1,
     ) {
         return false;
@@ -1547,7 +1547,11 @@ fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) -> bool {
             _ => None,
         })
         .unwrap_or(std::time::Duration::from_secs(10));
-    let existing_etag = existing.and_then(|cache| cache.etag);
+    // An ETag from a listing under another client_version would let the
+    // backend answer 304 for a different model set.
+    let existing_etag = existing
+        .filter(|cache| super::catalog_refresh::codex_cache_matches_version(cache, client_version))
+        .and_then(|cache| cache.etag);
     tokio::spawn(async move {
         let _guard = CodexCatalogRefreshGuard;
         let existing = super::catalog_refresh::load_codex_cache();
@@ -1555,7 +1559,7 @@ fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) -> bool {
             &auth_file,
             existing_etag.as_deref(),
             timeout,
-            Some(yach_catalog::baked_codex_protocol_version().as_str()),
+            Some(client_version),
         )
         .await
         {
@@ -1580,7 +1584,11 @@ fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) -> bool {
             Ok(yach_backend::model_discovery::CodexCatalogDocument::Modified { body, etag }) => {
                 let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
                 match super::catalog_refresh::apply_codex_catalog_response(
-                    &body, &now_date, checked_at, etag,
+                    &body,
+                    &now_date,
+                    checked_at,
+                    etag,
+                    client_version,
                 ) {
                     Ok(cache) => super::catalog_refresh::persist_codex_cache(&cache),
                     Err(_) => {
@@ -1852,6 +1860,7 @@ mod tests {
                 etag: None,
                 last_modified: None,
                 checked_at_unix_ms: None,
+                client_version: None,
                 retrieved: String::from("test"),
                 catalog: fetched_catalog,
             }),
@@ -1905,6 +1914,7 @@ mod tests {
                 etag: None,
                 last_modified: None,
                 checked_at_unix_ms: None,
+                client_version: None,
                 retrieved: String::from("test"),
                 catalog: fetched_catalog,
             }),
