@@ -1905,8 +1905,18 @@ impl App {
         self.maybe_open_pending_thinking_handoff();
     }
 
+    /// Routes keys to the inline review row while it awaits the user's
+    /// decision. Once the decision is submitted the tool may run for a long
+    /// time, so the keyboard returns to the composer and the normal handlers,
+    /// except Esc: until the tool's result arrives it is swallowed, so a
+    /// repeated Esc after rejecting cannot cancel the whole turn. Ctrl+C
+    /// stays the deliberate cancel.
     fn handle_inline_tool_review_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> bool {
-        if !self.transcript.has_unresolved_review() {
+        if !self.transcript.has_pending_review() {
+            if key == KeyCode::Esc && self.transcript.has_unresolved_review() {
+                self.status_message = String::from("tool running · Ctrl+C cancels the turn");
+                return true;
+            }
             return false;
         }
         match (key, modifiers) {
@@ -1918,32 +1928,21 @@ impl App {
                 self.transcript.toggle_tool_details();
                 self.scroll_to_bottom();
             }
-            (KeyCode::Up | KeyCode::Char('k'), modifiers)
-                if modifiers.is_empty() && self.transcript.has_pending_review() =>
-            {
+            (KeyCode::Up | KeyCode::Char('k'), modifiers) if modifiers.is_empty() => {
                 self.step_pending_review_selection(-1);
             }
-            (KeyCode::Down | KeyCode::Char('j'), modifiers)
-                if modifiers.is_empty() && self.transcript.has_pending_review() =>
-            {
+            (KeyCode::Down | KeyCode::Char('j'), modifiers) if modifiers.is_empty() => {
                 self.step_pending_review_selection(1);
             }
-            (KeyCode::Enter, modifiers)
-                if modifiers.is_empty() && self.transcript.has_pending_review() =>
-            {
+            (KeyCode::Enter, modifiers) if modifiers.is_empty() => {
                 self.submit_inline_tool_review(None);
             }
-            (KeyCode::Esc, modifiers)
-                if modifiers.is_empty() && self.transcript.has_pending_review() =>
-            {
+            (KeyCode::Esc, modifiers) if modifiers.is_empty() => {
                 self.submit_inline_tool_review(Some(ToolReviewDecision::Reject));
             }
             _ => {
-                self.status_message = if self.transcript.has_pending_review() {
-                    String::from("review pending · ↑/↓ or j/k select · Enter confirm")
-                } else {
-                    String::from("review decision submitted; waiting for tool result")
-                };
+                self.status_message =
+                    String::from("review pending · ↑/↓ or j/k select · Enter confirm");
             }
         }
         true
@@ -2218,10 +2217,10 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) {
-        if self.transcript.has_unresolved_review()
+        if self.transcript.has_pending_review()
             && matches!(self.mode, AppMode::Normal | AppMode::SlashComplete { .. })
         {
-            self.status_message = String::from("review active; paste ignored");
+            self.status_message = String::from("review pending; paste ignored");
             return;
         }
         match self.mode {
@@ -7797,12 +7796,12 @@ mod tests {
         );
         assert_eq!(app.status_message, "review rejection submitted");
 
+        // The decision is final, and while the reviewed tool still runs a
+        // second Esc neither re-decides nor cancels the turn.
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
         assert!(rx.try_recv().is_err());
-        assert_eq!(
-            app.status_message,
-            "review decision submitted; waiting for tool result"
-        );
+        assert!(!app.transcript.has_pending_review());
+        assert_eq!(app.status_message, "tool running · Ctrl+C cancels the turn");
     }
 
     #[test]
@@ -7884,7 +7883,7 @@ mod tests {
         });
         assert!(app.transcript.has_unresolved_review());
         app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
-        assert!(app.prompt_text().is_empty());
+        assert_eq!(app.prompt_text(), "x");
 
         app.handle_server_event(ServerEvent::ToolCallFinished(ToolResult {
             tool_call_id: Some(String::from("tool-review-request-1")),
@@ -7938,6 +7937,127 @@ mod tests {
         app.handle_key(KeyCode::Char('o'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
         assert_eq!(app.prompt_text(), "ok");
+    }
+
+    fn busy_app_with_resolved_command_review() -> (App, mpsc::UnboundedReceiver<ClientEvent>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(cancellable_native_connected_event());
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+        app.handle_server_event(ServerEvent::ToolCallStarted {
+            tool_call_id: Some(String::from("tool-review-request-1")),
+            tool_name: String::from("edit_text_file"),
+            preview: Some(String::from("src/lib.rs")),
+        });
+        app.handle_server_event(ServerEvent::ToolReviewRequested {
+            request_id: String::from("tool-review-request-1"),
+            tool_name: String::from("edit_text_file"),
+            payload: ToolReviewPayload::LocalEdit {
+                preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+            },
+        });
+        while rx.try_recv().is_ok() {}
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientEvent::ToolReviewDecisionSubmitted { .. })
+        ));
+        assert!(app.backend_busy());
+        assert!(app.transcript.has_unresolved_review());
+        assert!(!app.transcript.has_pending_review());
+        (app, rx)
+    }
+
+    #[test]
+    fn composer_accepts_typing_and_paste_while_reviewed_tool_runs() {
+        let (mut app, mut rx) = busy_app_with_resolved_command_review();
+
+        for ch in "next".chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.handle_paste(" turn\nnotes");
+
+        assert_eq!(app.prompt_text(), "next turn\nnotes");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn enter_keeps_draft_unsent_while_reviewed_tool_runs() {
+        let (mut app, mut rx) = busy_app_with_resolved_command_review();
+        app.handle_paste("draft");
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.prompt_text(), "draft");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            app.status_message,
+            "wait for current response before submitting"
+        );
+    }
+
+    #[test]
+    fn transcript_scroll_and_cancel_still_work_while_reviewed_tool_runs() {
+        let (mut app, mut rx) = busy_app_with_resolved_command_review();
+        app.handle_paste("draft");
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::PromptCancelled {
+                session_id: String::from("default"),
+            })
+        );
+        assert_eq!(app.prompt_text(), "draft");
+    }
+
+    #[test]
+    fn esc_after_review_decision_does_not_cancel_the_running_turn() {
+        let (mut app, mut rx) = busy_app_with_resolved_command_review();
+        app.handle_paste("draft");
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(rx.try_recv().is_err());
+        assert!(app.backend_busy());
+        assert_eq!(app.prompt_text(), "draft");
+    }
+
+    #[test]
+    fn pending_review_keeps_keyboard_and_ignores_paste() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_server_event(ServerEvent::ToolCallStarted {
+            tool_call_id: Some(String::from("tool-review-request-1")),
+            tool_name: String::from("edit_text_file"),
+            preview: Some(String::from("src/lib.rs")),
+        });
+        app.handle_server_event(ServerEvent::ToolReviewRequested {
+            request_id: String::from("tool-review-request-1"),
+            tool_name: String::from("edit_text_file"),
+            payload: ToolReviewPayload::LocalEdit {
+                preview: local_edit_preview(LocalEditReviewState::NeedsUserApproval),
+            },
+        });
+
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        app.handle_paste("pasted");
+        assert!(app.prompt_text().is_empty());
+        assert!(app.transcript.has_pending_review());
+        assert!(rx.try_recv().is_err());
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientEvent::ToolReviewDecisionSubmitted {
+                decision: ToolReviewDecision::Reject,
+                ..
+            })
+        ));
     }
 
     #[test]
