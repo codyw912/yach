@@ -2051,11 +2051,14 @@ mod tests {
     fn baked_catalog_includes_codex_bundle_under_openai_codex() {
         let catalog = baked_catalog();
         for slug in [
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
             "gpt-5.5",
-            "gpt-5.2",
         ] {
             let Some(entry) = catalog.entry("openai-codex", slug) else {
                 unreachable!("baked catalog must include {slug}");
@@ -2063,9 +2066,14 @@ mod tests {
             assert_eq!(entry.context_window, Some(272_000));
             assert_eq!(entry.tool_call, Some(true));
         }
-        assert!(catalog.entry("openai-codex", "gpt-5.4").is_none());
+        assert!(catalog.entry("openai-codex", "gpt-5.2").is_none());
+        assert!(
+            catalog
+                .entry("openai-codex", "gpt-daybreak-blue-latest")
+                .is_none()
+        );
         assert!(catalog.entry("openai-codex", "codex-auto-review").is_none());
-        assert_eq!(baked_codex_protocol_version(), "0.144.0");
+        assert_eq!(baked_codex_protocol_version(), "0.155.0");
     }
 
     #[test]
