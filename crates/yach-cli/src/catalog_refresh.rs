@@ -68,6 +68,7 @@ pub fn apply_codex_catalog_response(
     now_date: &str,
     checked_at_unix_ms: u64,
     etag: Option<String>,
+    client_version: &str,
 ) -> Result<CachedCatalog, serde_json::Error> {
     let transformed = transform_codex_models(body, now_date)?;
     let catalog = Catalog::from_json_str(&transformed.to_string())?;
@@ -75,9 +76,31 @@ pub fn apply_codex_catalog_response(
         etag,
         last_modified: None,
         checked_at_unix_ms: Some(checked_at_unix_ms),
+        client_version: Some(String::from(client_version)),
         retrieved: String::from(now_date),
         catalog,
     })
+}
+
+/// Whether the cached Codex catalog was listed with `client_version`. The
+/// backend gates its model list on that version, so a cache from another
+/// version (including caches written before versions were recorded)
+/// describes a different model set.
+#[must_use]
+pub fn codex_cache_matches_version(cache: &CachedCatalog, client_version: &str) -> bool {
+    cache.client_version.as_deref() == Some(client_version)
+}
+
+/// [`refresh_due`] for the Codex catalog: also due immediately when the
+/// cache was listed under a different `client_version`.
+#[must_use]
+pub fn codex_refresh_due(
+    existing: Option<&CachedCatalog>,
+    client_version: &str,
+    now_unix_ms: u64,
+) -> bool {
+    existing.is_some_and(|cache| !codex_cache_matches_version(cache, client_version))
+        || refresh_due(existing, now_unix_ms)
 }
 
 pub fn persist_codex_cache(cache: &CachedCatalog) {
@@ -259,6 +282,7 @@ fn apply_success_response(
         etag,
         last_modified,
         checked_at_unix_ms: Some(checked_at_unix_ms),
+        client_version: None,
         retrieved: String::from(now_date),
         catalog,
     };
@@ -314,6 +338,7 @@ pub fn cache_after_not_modified(
         etag: existing.etag.clone(),
         last_modified: existing.last_modified.clone(),
         checked_at_unix_ms: Some(checked_at_unix_ms),
+        client_version: existing.client_version.clone(),
         retrieved: String::from(now_date),
         catalog: existing.catalog.clone(),
     }
@@ -531,6 +556,7 @@ mod tests {
             etag: Some(String::from("\"etag-1\"")),
             last_modified: Some(String::from("Mon, 03 Aug 2026 00:00:00 GMT")),
             checked_at_unix_ms,
+            client_version: None,
             retrieved: String::from("2026-08-01"),
             catalog: Catalog::empty("unused"),
         }
@@ -704,6 +730,7 @@ mod tests {
             etag: Some(String::from("\"etag-1\"")),
             last_modified: Some(String::from("Mon, 03 Aug 2026 00:00:00 GMT")),
             checked_at_unix_ms: None,
+            client_version: None,
             retrieved: String::from("2026-08-01"),
             catalog,
         };
@@ -810,6 +837,7 @@ mod tests {
             etag: None,
             last_modified: None,
             checked_at_unix_ms: None,
+            client_version: None,
             retrieved: String::from("2026-08-06"),
             catalog,
         };
@@ -857,6 +885,7 @@ mod tests {
             etag: None,
             last_modified: None,
             checked_at_unix_ms: None,
+            client_version: None,
             retrieved: String::from("2026-08-03"),
             catalog,
         };
@@ -922,6 +951,7 @@ mod tests {
             etag: Some(String::from("\"abc\"")),
             last_modified: None,
             checked_at_unix_ms: None,
+            client_version: None,
             retrieved: String::from("2026-08-03"),
             catalog,
         };
@@ -971,6 +1001,7 @@ mod tests {
             etag: None,
             last_modified: None,
             checked_at_unix_ms: None,
+            client_version: None,
             retrieved: String::from("2026-08-01"),
             catalog,
         };
@@ -1014,18 +1045,55 @@ mod tests {
                 }
             ]
         }"#;
-        let Ok(cache) =
-            apply_codex_catalog_response(body, "2026-08-16", 1, Some(String::from("\"etag\"")))
-        else {
+        let Ok(cache) = apply_codex_catalog_response(
+            body,
+            "2026-08-16",
+            1,
+            Some(String::from("\"etag\"")),
+            "0.155.0",
+        ) else {
             unreachable!("Codex catalog body must apply");
         };
         assert_eq!(cache.retrieved, "2026-08-16");
         assert_eq!(cache.etag.as_deref(), Some("\"etag\""));
+        assert_eq!(cache.client_version.as_deref(), Some("0.155.0"));
         let Some(entry) = cache.catalog.entry("openai-codex", "gpt-5.4") else {
             unreachable!("applied Codex cache must contain openai-codex");
         };
         assert_eq!(entry.context_window, Some(272_000));
         assert_eq!(entry.max_context_window, Some(1_000_000));
         assert!(cache.catalog.entry("openai", "gpt-5.4").is_none());
+    }
+
+    #[test]
+    fn codex_refresh_is_due_when_the_client_version_changed() {
+        let mut cache = cached_fixture_with_checked_at(Some(1_000));
+        let inside_interval = 1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS - 1;
+
+        // Written before versions were recorded: always refetch.
+        assert!(codex_refresh_due(Some(&cache), "0.155.0", inside_interval));
+
+        cache.client_version = Some(String::from("0.144.0"));
+        assert!(codex_refresh_due(Some(&cache), "0.155.0", inside_interval));
+
+        cache.client_version = Some(String::from("0.155.0"));
+        assert!(!codex_refresh_due(Some(&cache), "0.155.0", inside_interval));
+        assert!(codex_refresh_due(
+            Some(&cache),
+            "0.155.0",
+            1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS
+        ));
+        assert!(codex_refresh_due(None, "0.155.0", 1_000));
+    }
+
+    #[test]
+    fn not_modified_codex_cache_keeps_its_client_version() {
+        let mut cache = cached_fixture_with_checked_at(Some(1_000));
+        cache.client_version = Some(String::from("0.155.0"));
+
+        let updated = cache_after_not_modified(&cache, "2026-08-16", 2_000);
+
+        assert!(codex_cache_matches_version(&updated, "0.155.0"));
+        assert!(!codex_refresh_due(Some(&updated), "0.155.0", 2_001));
     }
 }
