@@ -218,6 +218,7 @@ pub fn parse_slash_command(input: &str) -> SlashParseResult {
                 | SlashAction::ExtensionStatus
                 | SlashAction::Compact
                 | SlashAction::Approval
+                | SlashAction::Model
         ) {
             return SlashParseResult::CommandWithArgs {
                 action: command.action,
@@ -338,9 +339,16 @@ mod tests {
             parse_slash_command("/clear now"),
             SlashParseResult::ArgumentsUnsupported
         );
+    }
+
+    #[test]
+    fn parser_passes_model_arguments_to_the_app() {
         assert_eq!(
-            parse_slash_command("/model gpt-5"),
-            SlashParseResult::ArgumentsUnsupported
+            parse_slash_command("/model refresh"),
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::Model,
+                args: String::from("refresh"),
+            }
         );
     }
 

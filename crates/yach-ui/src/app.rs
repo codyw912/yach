@@ -1118,6 +1118,15 @@ impl App {
         requested
     }
 
+    fn request_forced_model_refresh(&mut self) -> bool {
+        let requested = self.send_client_event(ClientEvent::AvailableModelsRefreshRequested);
+        if requested {
+            self.model_availability_refresh = ModelAvailabilityRefresh::Pending;
+            self.status_message = String::from("refreshing models");
+        }
+        requested
+    }
+
     fn mark_disconnected(&mut self, reason: String) {
         self.is_connected = false;
         self.pending_thinking_handoff = None;
@@ -2022,7 +2031,7 @@ impl App {
                     || modifiers.contains(KeyModifiers::META)
                     || modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                self.open_model_selector();
+                self.open_model_selector(false);
             }
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.open_session_selector(),
             (KeyCode::Char('b'), KeyModifiers::CONTROL) => self.request_session_tree(),
@@ -2280,11 +2289,13 @@ impl App {
         }
     }
 
-    fn open_model_selector(&mut self) {
+    fn open_model_selector(&mut self, forced: bool) {
         if self.backend_busy() {
             self.status_message = String::from("wait for current response before changing model");
         } else {
-            if self.request_available_models() {
+            if forced {
+                self.request_forced_model_refresh();
+            } else if self.request_available_models() {
                 self.status_message = String::from("loading available models");
             }
             self.mode = AppMode::ModelSelect {
@@ -2549,6 +2560,14 @@ impl App {
                     *save_default_action = false;
                 }
                 self.clamp_model_select_selection();
+            }
+            (KeyCode::Char('r'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.backend_busy() {
+                    self.status_message =
+                        String::from("wait for current response before refreshing models");
+                } else {
+                    self.request_forced_model_refresh();
+                }
             }
             (KeyCode::Char(ch), modifiers) if accepts_plain_text_modifier(modifiers) => {
                 if let AppMode::ModelSelect {
@@ -3441,7 +3460,19 @@ impl App {
             }
             SlashParseResult::Command(SlashAction::Model) => {
                 self.clear_input();
-                self.open_model_selector();
+                self.open_model_selector(false);
+                return;
+            }
+            SlashParseResult::CommandWithArgs {
+                action: SlashAction::Model,
+                args,
+            } => {
+                self.clear_input();
+                if args == "refresh" {
+                    self.open_model_selector(true);
+                } else {
+                    self.status_message = String::from("usage: /model [refresh]");
+                }
                 return;
             }
             SlashParseResult::Command(SlashAction::Connect) => {
@@ -6084,6 +6115,46 @@ mod tests {
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.status_message, "available models not loaded yet");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn model_refresh_command_opens_the_picker_and_requests_a_forced_refresh() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_prompt_text("/model refresh");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
+        assert_eq!(app.status_message, "refreshing models");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::AvailableModelsRefreshRequested)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn model_command_rejects_other_arguments_without_opening_the_picker() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.set_prompt_text("/model gpt-5");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.status_message, "usage: /model [refresh]");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ctrl_r_in_the_model_picker_requests_a_forced_refresh_without_editing_the_query() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
+        app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::AvailableModelsRefreshRequested)
+        );
+        assert!(matches!(&app.mode, AppMode::ModelSelect { query, .. } if query.is_empty()));
     }
 
     #[test]

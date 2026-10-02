@@ -40,7 +40,7 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(self.theme.colors.border))
-            .title("Select Model")
+            .title("Select Model · Ctrl+R refresh")
             .title_style(
                 Style::new()
                     .fg(self.theme.colors.accent)

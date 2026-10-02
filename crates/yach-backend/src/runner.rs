@@ -581,16 +581,14 @@ fn start_connection_model_refresh(
     flow: &ProviderConnectionFlow,
     provider: Option<&ProviderConfig>,
     generation: u64,
+    mode: RefreshMode,
     in_flight: &mut Option<u64>,
     updates: &mpsc::UnboundedSender<(u64, ModelDiscoveryOutcome)>,
 ) {
     debug_assert!(in_flight.is_none());
     *in_flight = Some(generation);
 
-    let future = runtime.refresh_models(
-        current_connection_model_target(flow, provider),
-        RefreshMode::Normal,
-    );
+    let future = runtime.refresh_models(current_connection_model_target(flow, provider), mode);
     let updates = updates.clone();
     tokio::spawn(async move {
         let _ = updates.send((generation, future.await));
@@ -600,21 +598,38 @@ fn start_connection_model_refresh(
 /// Coalesce a refresh request into at most one active and one pending task.
 /// Every request retires the previous accepted generation immediately, so an
 /// in-flight picker result cannot republish rows after a connection mutation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the generation, in-flight, and pending slots are separate runner-loop locals"
+)]
 fn request_connection_model_refresh(
     runtime: &Arc<dyn ProviderConnectionRuntime>,
     flow: &ProviderConnectionFlow,
     provider: Option<&ProviderConfig>,
     generation: &mut u64,
+    mode: RefreshMode,
     in_flight: &mut Option<u64>,
-    pending: &mut bool,
+    pending: &mut Option<RefreshMode>,
     updates: &mpsc::UnboundedSender<(u64, ModelDiscoveryOutcome)>,
 ) {
     *generation = generation.wrapping_add(1);
     if in_flight.is_some() {
-        *pending = true;
+        // A forced request must not be downgraded by a later normal one.
+        *pending = Some(match (*pending, mode) {
+            (Some(RefreshMode::Forced), _) | (_, RefreshMode::Forced) => RefreshMode::Forced,
+            _ => RefreshMode::Normal,
+        });
         return;
     }
-    start_connection_model_refresh(runtime, flow, provider, *generation, in_flight, updates);
+    start_connection_model_refresh(
+        runtime,
+        flow,
+        provider,
+        *generation,
+        mode,
+        in_flight,
+        updates,
+    );
 }
 fn publish_connection_catalog(
     tx: &mpsc::UnboundedSender<BackendEvent>,
@@ -623,6 +638,7 @@ fn publish_connection_catalog(
     advertised_catalog: &mut Arc<[CatalogModelEntry]>,
     entries: Vec<CatalogModelEntry>,
     warnings: Vec<String>,
+    final_message: String,
 ) {
     *advertised_catalog = entries.into();
     send_native_models_with_catalog(tx, provider, provider_setup_error, Some(advertised_catalog));
@@ -630,7 +646,7 @@ fn publish_connection_catalog(
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated { message }));
     }
     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-        message: String::from("provider models refreshed"),
+        message: final_message,
     }));
 }
 
@@ -673,7 +689,7 @@ struct ConnectionFlowEffectContext<'a> {
     model_refresh_updates: &'a mpsc::UnboundedSender<(u64, ModelDiscoveryOutcome)>,
     model_refresh_generation: &'a mut u64,
     model_refresh_in_flight: &'a mut Option<u64>,
-    model_refresh_pending: &'a mut bool,
+    model_refresh_pending: &'a mut Option<RefreshMode>,
     activation_generation: &'a mut u64,
     activation_in_flight: &'a mut Option<InFlightModelActivation>,
     chatgpt_login: &'a mut Option<tokio::task::JoinHandle<()>>,
@@ -735,6 +751,7 @@ fn apply_connection_flow_effects(
                         flow,
                         provider,
                         model_refresh_generation,
+                        RefreshMode::Normal,
                         model_refresh_in_flight,
                         model_refresh_pending,
                         model_refresh_updates,
@@ -1401,7 +1418,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut activation_in_flight: Option<InFlightModelActivation> = None;
     let mut connection_model_refresh_generation = 0_u64;
     let mut connection_model_refresh_in_flight = None;
-    let mut connection_model_refresh_pending = false;
+    let mut connection_model_refresh_pending: Option<RefreshMode> = None;
     let mut chatgpt_login: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut first_render_completed = false;
@@ -1617,14 +1634,10 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 &mut advertised_catalog,
                                 entries,
                                 Vec::new(),
+                                String::from("provider models refreshed"),
                             );
                         }
-                        ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings }
-                        | ModelDiscoveryOutcome::Forced(ForcedRefreshReport {
-                            entries,
-                            warnings,
-                            ..
-                        }) => {
+                        ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } => {
                             publish_connection_catalog(
                                 &tx,
                                 provider.as_ref(),
@@ -1632,6 +1645,22 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                                 &mut advertised_catalog,
                                 entries,
                                 warnings,
+                                String::from("provider models refreshed"),
+                            );
+                        }
+                        ModelDiscoveryOutcome::Forced(report) => {
+                            let status = forced_refresh_status(&advertised_catalog, &report);
+                            let ForcedRefreshReport {
+                                entries, warnings, ..
+                            } = report;
+                            publish_connection_catalog(
+                                &tx,
+                                provider.as_ref(),
+                                provider_setup_error.as_deref(),
+                                &mut advertised_catalog,
+                                entries,
+                                warnings,
+                                status,
                             );
                         }
                         ModelDiscoveryOutcome::Superseded => {}
@@ -1642,18 +1671,18 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         }
                     }
                 }
-                if connection_model_refresh_pending {
-                    connection_model_refresh_pending = false;
-                    if let Some(runtime) = provider_connections.as_ref() {
-                        start_connection_model_refresh(
-                            runtime,
-                            &connection_flow,
-                            provider.as_ref(),
-                            connection_model_refresh_generation,
-                            &mut connection_model_refresh_in_flight,
-                            &connection_model_refresh_tx,
-                        );
-                    }
+                if let Some(mode) = connection_model_refresh_pending.take()
+                    && let Some(runtime) = provider_connections.as_ref()
+                {
+                    start_connection_model_refresh(
+                        runtime,
+                        &connection_flow,
+                        provider.as_ref(),
+                        connection_model_refresh_generation,
+                        mode,
+                        &mut connection_model_refresh_in_flight,
+                        &connection_model_refresh_tx,
+                    );
                 }
                 continue;
             }
@@ -1966,7 +1995,13 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                     }));
                 }
             }
-            ClientEvent::AvailableModelsRequested => {
+            requested @ (ClientEvent::AvailableModelsRequested
+            | ClientEvent::AvailableModelsRefreshRequested) => {
+                let mode = if matches!(requested, ClientEvent::AvailableModelsRefreshRequested) {
+                    RefreshMode::Forced
+                } else {
+                    RefreshMode::Normal
+                };
                 if first_render_completed && let Some(runtime) = provider_connections.as_ref() {
                     if let Some(cached) = runtime.cached_models() {
                         advertised_catalog = cached;
@@ -1982,6 +2017,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         &connection_flow,
                         provider.as_ref(),
                         &mut connection_model_refresh_generation,
+                        mode,
                         &mut connection_model_refresh_in_flight,
                         &mut connection_model_refresh_pending,
                         &connection_model_refresh_tx,
@@ -1995,6 +2031,11 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         discovery_in_flight = true;
                     }
                     send_native_models(&tx, provider.as_ref(), provider_setup_error.as_deref());
+                    if mode == RefreshMode::Forced && provider_connections.is_none() {
+                        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+                            message: String::from("forced refresh needs a stored connection"),
+                        }));
+                    }
                 }
             }
             ClientEvent::PromptCancelled { .. } => {
@@ -28593,12 +28634,20 @@ manual anchored summary"
         activation_outcomes: Mutex<VecDeque<oneshot::Receiver<crate::ProviderActivationOutcome>>>,
         configured_default: Option<crate::ActiveModelTarget>,
         saved_defaults: Mutex<Vec<crate::ActiveModelTarget>>,
+        refresh_modes: Mutex<Vec<crate::RefreshMode>>,
     }
 
     impl FakeConnectionRuntime {
         fn recorded_saved_defaults(&self) -> Vec<crate::ActiveModelTarget> {
             match self.saved_defaults.lock() {
                 Ok(targets) => targets.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            }
+        }
+
+        fn recorded_refresh_modes(&self) -> Vec<crate::RefreshMode> {
+            match self.refresh_modes.lock() {
+                Ok(modes) => modes.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             }
         }
@@ -28633,8 +28682,12 @@ manual anchored summary"
         fn refresh_models(
             &self,
             _: Option<crate::ActiveModelTarget>,
-            _: crate::RefreshMode,
+            mode: crate::RefreshMode,
         ) -> ModelDiscoveryFuture {
+            match self.refresh_modes.lock() {
+                Ok(mut modes) => modes.push(mode),
+                Err(poisoned) => poisoned.into_inner().push(mode),
+            }
             self.refresh_calls.fetch_add(1, Ordering::SeqCst);
             let receiver = match self.refresh_outcomes.lock() {
                 Ok(mut outcomes) => outcomes.pop_front(),
@@ -28752,7 +28805,7 @@ manual anchored summary"
         let (model_refresh_tx, _model_refresh_rx) = mpsc::unbounded_channel();
         let mut model_refresh_generation = 0;
         let mut model_refresh_in_flight = None;
-        let mut model_refresh_pending = false;
+        let mut model_refresh_pending = None;
         let mut activation_generation = 7;
         let mut activation_in_flight = Some(InFlightModelActivation {
             generation: 7,
@@ -30220,6 +30273,224 @@ manual anchored summary"
         drop(client_tx);
         assert!(handle.await.is_ok());
     }
+    fn forced_refresh_runner_config(
+        root: &ProviderTempRoot,
+        runtime: Option<Arc<FakeConnectionRuntime>>,
+    ) -> RunnerConfig {
+        RunnerConfig {
+            components: crate::ComponentSet::full(),
+            session_path: root.path().join("session.jsonl"),
+            project_root: None,
+            provider: Some(provider_test_config()),
+            startup_model_override: None,
+            provider_setup_error: None,
+            extension_package_roots: Vec::new(),
+            extension_package_root_loader: None,
+            trace: None,
+            model_discovery: None,
+            catalog_refresh: None,
+            provider_connections: runtime
+                .map(|runtime| runtime as Arc<dyn crate::ProviderConnectionRuntime>),
+        }
+    }
+
+    async fn wait_for_refresh_calls(runtime: &FakeConnectionRuntime, calls: u64) {
+        let started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while runtime.refresh_calls.load(Ordering::SeqCst) < calls {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "expected {calls} refresh call(s)");
+    }
+
+    /// Status messages up to and including the first one that is not a
+    /// warning-free refresh progress line, i.e. the last of a refresh.
+    async fn status_messages_until(
+        backend_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+        last: &str,
+    ) -> Vec<String> {
+        let mut messages = Vec::new();
+        let done = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = backend_rx.recv().await {
+                if let BackendEvent::Server(ServerEvent::StatusUpdated { message }) = event {
+                    let is_last = message == last;
+                    messages.push(message);
+                    if is_last {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(done.is_ok(), "never saw status {last:?}; saw {messages:?}");
+        messages
+    }
+
+    #[tokio::test]
+    async fn forced_model_refresh_request_runs_a_forced_runtime_refresh() {
+        let root = temp_native_provider_root("forced-model-refresh-mode");
+        let runtime = Arc::new(FakeConnectionRuntime {
+            cached_models: Some(vec![catalog_entry("cached", "Cached", "openai")].into()),
+            ..FakeConnectionRuntime::default()
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            forced_refresh_runner_config(&root, Some(runtime.clone())),
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRefreshRequested)
+                .is_ok()
+        );
+        expect_model_snapshot_with_id(&mut backend_rx, "cached").await;
+        wait_for_refresh_calls(&runtime, 1).await;
+        assert_eq!(
+            runtime.recorded_refresh_modes(),
+            vec![crate::RefreshMode::Forced]
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn forced_model_refresh_during_a_normal_refresh_restarts_forced() {
+        let root = temp_native_provider_root("forced-model-refresh-pending");
+        let (first_sender, first_receiver) = oneshot::channel();
+        let (second_sender, second_receiver) = oneshot::channel();
+        let runtime = Arc::new(FakeConnectionRuntime {
+            cached_models: Some(vec![catalog_entry("cached", "Cached", "openai")].into()),
+            refresh_outcomes: Mutex::new(VecDeque::from([first_receiver, second_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            forced_refresh_runner_config(&root, Some(runtime.clone())),
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        wait_for_refresh_calls(&runtime, 1).await;
+        // A forced request, then a normal one: the normal one must not
+        // downgrade the queued restart.
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRefreshRequested)
+                .is_ok()
+        );
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        assert!(
+            first_sender
+                .send(ModelDiscoveryOutcome::Available(vec![catalog_entry(
+                    "stale", "Stale", "openai",
+                )]))
+                .is_ok()
+        );
+        wait_for_refresh_calls(&runtime, 2).await;
+        assert_eq!(
+            runtime.recorded_refresh_modes(),
+            vec![crate::RefreshMode::Normal, crate::RefreshMode::Forced]
+        );
+        assert!(
+            second_sender
+                .send(ModelDiscoveryOutcome::Superseded)
+                .is_ok()
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn forced_model_refresh_outcome_ends_with_the_forced_status_line() {
+        let root = temp_native_provider_root("forced-model-refresh-status");
+        let (sender, receiver) = oneshot::channel();
+        let runtime = Arc::new(FakeConnectionRuntime {
+            cached_models: Some(vec![catalog_entry("cached", "Cached", "openai")].into()),
+            refresh_outcomes: Mutex::new(VecDeque::from([receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            forced_refresh_runner_config(&root, Some(runtime.clone())),
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRefreshRequested)
+                .is_ok()
+        );
+        wait_for_refresh_calls(&runtime, 1).await;
+        assert!(
+            sender
+                .send(ModelDiscoveryOutcome::Forced(ForcedRefreshReport {
+                    entries: vec![
+                        catalog_entry("cached", "Cached", "openai"),
+                        catalog_entry("brand-new", "Brand New", "openai"),
+                    ],
+                    warnings: vec![String::from("one provider was skipped")],
+                    codex_version_change: None,
+                    failed_steps: Vec::new(),
+                    codex_version: None,
+                }))
+                .is_ok()
+        );
+        let messages = status_messages_until(&mut backend_rx, "models refreshed · +1 models").await;
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message == "provider models refreshed"),
+            "forced refresh must replace the generic text: {messages:?}"
+        );
+        assert_eq!(
+            messages.iter().rev().nth(1).map(String::as_str),
+            Some("one provider was skipped"),
+            "warnings precede the final status line"
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn forced_model_refresh_without_a_connection_runtime_reports_the_requirement() {
+        let root = temp_native_provider_root("forced-model-refresh-legacy");
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            forced_refresh_runner_config(&root, None),
+        ));
+
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRefreshRequested)
+                .is_ok()
+        );
+        status_messages_until(&mut backend_rx, "forced refresh needs a stored connection").await;
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
     #[test]
     fn native_models_preserve_same_model_on_distinct_connections() {
         let active = ModelInfo {
