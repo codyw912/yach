@@ -252,7 +252,7 @@ impl CliProviderConnectionRuntime {
                     discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
-                        Some(yach_catalog::baked_codex_protocol_version()),
+                        Some(yach_catalog::baked_codex_release_version()),
                     )
                     .await
                 })
@@ -282,7 +282,7 @@ impl CliProviderConnectionRuntime {
                     discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
-                        Some(yach_catalog::baked_codex_protocol_version()),
+                        Some(yach_catalog::baked_codex_release_version()),
                     )
                     .await
                 })
@@ -1520,7 +1520,7 @@ fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) -> bool {
     else {
         return false;
     };
-    let client_version = yach_catalog::baked_codex_protocol_version();
+    let client_version = yach_catalog::baked_codex_release_version();
     let existing = super::catalog_refresh::load_codex_cache();
     if !super::catalog_refresh::codex_refresh_due(
         existing.as_ref(),

@@ -4087,7 +4087,7 @@ async fn run_tui_with_native_backend_config_observed(
                     match yach_backend::model_discovery::discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
-                        Some(yach_catalog::baked_codex_protocol_version()),
+                        Some(yach_catalog::baked_codex_release_version()),
                     )
                     .await
                     {
