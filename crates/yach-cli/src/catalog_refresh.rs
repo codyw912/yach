@@ -17,7 +17,7 @@ use yach_catalog::{CachedCatalog, Catalog, transform_codex_models, transform_mod
 
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 
-const REMOTE_CATALOG_REFRESH_INTERVAL_MS: u64 = 4 * 60 * 60 * 1_000;
+pub(crate) const REMOTE_CATALOG_REFRESH_INTERVAL_MS: u64 = 4 * 60 * 60 * 1_000;
 
 /// The refresh's result, in the CLI's own vocabulary (not `RunnerConfig`'s
 /// — see `format_status_message` and `spawn_refresh_status` for the hop
@@ -171,7 +171,12 @@ fn write_cache(cache: &CachedCatalog) {
     write_cache_to(&path, cache);
 }
 
-/// Writes the cache atomically: the JSON lands in a same-directory temp
+fn write_cache_to(path: &Path, cache: &CachedCatalog) {
+    write_json_to(path, cache);
+}
+
+/// Writes any serializable cache (the catalog cache, the Codex release
+/// cache) atomically: the JSON lands in a same-directory temp
 /// file first, then `rename` swaps it into place in one filesystem
 /// operation. A reader (`load_cache_from`, running in whatever session
 /// happens to start concurrently) that opens the path mid-write can no
@@ -182,12 +187,12 @@ fn write_cache(cache: &CachedCatalog) {
 /// error return, no panic, just "the next session still has the old
 /// cache" — and the orphaned temp file is best-effort cleaned up rather
 /// than left to accumulate.
-fn write_cache_to(path: &Path, cache: &CachedCatalog) {
+pub(crate) fn write_json_to(path: &Path, value: &impl serde::Serialize) {
     let Some(parent) = path.parent() else {
         return;
     };
     let _ = std::fs::create_dir_all(parent);
-    let Ok(json) = cache.to_json_string() else {
+    let Ok(json) = serde_json::to_string_pretty(value) else {
         return;
     };
     // Deterministic per-process name (no tempfile-crate dependency needed
