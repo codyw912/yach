@@ -2112,7 +2112,6 @@ mod tests {
                 .is_none()
         );
         assert!(catalog.entry("openai-codex", "codex-auto-review").is_none());
-        assert_eq!(baked_codex_release_version(), "0.160.0");
     }
 
     #[test]
@@ -2154,7 +2153,7 @@ mod tests {
             unreachable!("committed pin must parse");
         };
         assert_eq!(baked_codex_release_version(), pin.version);
-        assert_eq!(baked_codex_release_version(), "0.160.0");
+        assert_eq!(release_tag_version(&pin.tag), Some(pin.version.as_str()));
     }
 
     #[test]

@@ -4596,26 +4596,16 @@ fn run_models_refresh_command() -> CommandResult {
     models_refresh_result(previous.as_deref().unwrap_or_default(), outcome)
 }
 
-/// Renders a forced-refresh outcome. Exits non-zero only when every attempted
-/// step failed and discovery returned no entries.
+/// Renders a forced-refresh outcome. Exits non-zero only when steps were
+/// attempted and every one failed; fallback rows kept by a failed discovery
+/// don't count as success.
 fn models_refresh_result(
     previous: &[CatalogModelEntry],
     outcome: ModelDiscoveryOutcome,
 ) -> CommandResult {
     match outcome {
         ModelDiscoveryOutcome::Forced(report) => {
-            // Attempted steps are the Codex steps (when a ChatGPT connection
-            // exists) and discovery. Discovery failed when it yielded no rows
-            // and at least one warning.
-            let codex_attempted = report.codex_version.is_some() || !report.failed_steps.is_empty();
-            let codex_all_failed = report.failed_steps.len() >= 2;
-            let discovery_failed = report.entries.is_empty() && !report.warnings.is_empty();
-            let failed = report.entries.is_empty()
-                && if codex_attempted {
-                    codex_all_failed
-                } else {
-                    discovery_failed
-                };
+            let failed = !report.failed_steps.is_empty() && report.succeeded_steps == 0;
             let mut lines = vec![yach_backend::forced_refresh_status(previous, &report)];
             lines.extend(
                 report
@@ -6291,7 +6281,7 @@ mod tests {
     fn refresh_report(
         entries: Vec<yach_backend::CatalogModelEntry>,
         failed_steps: &[&str],
-        codex_attempted: bool,
+        succeeded_steps: usize,
     ) -> yach_backend::ModelDiscoveryOutcome {
         yach_backend::ModelDiscoveryOutcome::Forced(yach_backend::ForcedRefreshReport {
             entries,
@@ -6301,7 +6291,8 @@ mod tests {
                 .iter()
                 .map(|step| String::from(*step))
                 .collect(),
-            codex_version: codex_attempted.then(|| String::from("0.160.0")),
+            succeeded_steps,
+            codex_version: None,
         })
     }
 
@@ -6310,7 +6301,7 @@ mod tests {
         let previous = [refresh_entry("old")];
         let result = super::models_refresh_result(
             &previous,
-            refresh_report(vec![refresh_entry("old"), refresh_entry("new")], &[], false),
+            refresh_report(vec![refresh_entry("old"), refresh_entry("new")], &[], 1),
         );
         assert_eq!(result.exit_code(), 0);
         assert_eq!(
@@ -6320,49 +6311,61 @@ mod tests {
     }
 
     #[test]
-    fn models_refresh_exits_non_zero_only_when_every_attempted_step_failed() {
-        // Both Codex steps failed and nothing was discovered.
-        let all_failed = super::models_refresh_result(
-            &[],
-            refresh_report(Vec::new(), &["release check", "Codex catalog"], true),
+    fn models_refresh_exits_non_zero_when_every_attempted_step_failed() {
+        // Every step failed, but discovery kept cached rows as the fallback:
+        // the rows must not read as success.
+        let all_failed_with_rows = super::models_refresh_result(
+            &[refresh_entry("cached")],
+            refresh_report(
+                vec![refresh_entry("cached")],
+                &["release check", "Codex catalog", "discovery"],
+                0,
+            ),
         );
-        assert_eq!(all_failed.exit_code(), 1);
+        assert_eq!(all_failed_with_rows.exit_code(), 1);
         assert_eq!(
-            all_failed.render_lines(),
+            all_failed_with_rows.render_lines(),
             vec![String::from(
-                "models refreshed · no changes · release check failed (using 0.160.0) · Codex catalog failed"
+                "models refreshed · no changes · release check failed · Codex catalog failed · discovery failed"
             )]
         );
 
-        // One step failed but the other worked.
-        let partial =
-            super::models_refresh_result(&[], refresh_report(Vec::new(), &["release check"], true));
-        assert_eq!(partial.exit_code(), 0);
-
-        // Steps failed but discovery still produced rows.
-        let with_rows = super::models_refresh_result(
-            &[],
-            refresh_report(
-                vec![refresh_entry("kept")],
-                &["release check", "Codex catalog"],
-                true,
-            ),
+        // Discovery alone, with fallback rows.
+        let discovery_only = super::models_refresh_result(
+            &[refresh_entry("cached")],
+            refresh_report(vec![refresh_entry("cached")], &["discovery"], 0),
         );
-        assert_eq!(with_rows.exit_code(), 0);
-
-        // No Codex steps attempted and nothing failed: an empty catalog is not an error.
-        let idle = super::models_refresh_result(&[], refresh_report(Vec::new(), &[], false));
-        assert_eq!(idle.exit_code(), 0);
+        assert_eq!(discovery_only.exit_code(), 1);
     }
 
     #[test]
-    fn models_refresh_discovery_failure_without_rows_fails() {
+    fn models_refresh_exits_zero_when_any_step_succeeded() {
+        let partial = super::models_refresh_result(
+            &[],
+            refresh_report(
+                vec![refresh_entry("cached")],
+                &["release check", "Codex catalog"],
+                1,
+            ),
+        );
+        assert_eq!(partial.exit_code(), 0);
+    }
+
+    #[test]
+    fn models_refresh_empty_successful_listing_is_not_a_failure() {
+        let empty = super::models_refresh_result(&[], refresh_report(Vec::new(), &[], 1));
+        assert_eq!(empty.exit_code(), 0);
+    }
+
+    #[test]
+    fn models_refresh_prints_warnings_after_the_status_line() {
         let outcome =
             yach_backend::ModelDiscoveryOutcome::Forced(yach_backend::ForcedRefreshReport {
                 entries: Vec::new(),
                 warnings: vec![String::from("provider models unavailable")],
                 codex_version_change: None,
-                failed_steps: Vec::new(),
+                failed_steps: vec![String::from("discovery")],
+                succeeded_steps: 0,
                 codex_version: None,
             });
         let result = super::models_refresh_result(&[], outcome);
@@ -6370,7 +6373,7 @@ mod tests {
         assert_eq!(
             result.render_lines(),
             vec![
-                String::from("models refreshed · no changes"),
+                String::from("models refreshed · no changes · discovery failed"),
                 String::from("warning=provider models unavailable"),
             ]
         );
