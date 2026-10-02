@@ -844,6 +844,8 @@ pub enum ClientEvent {
         session_path: String,
     },
     AvailableModelsRequested,
+    /// Like `AvailableModelsRequested`, but every provider cache interval is ignored.
+    AvailableModelsRefreshRequested,
     ForkMessagesRequested,
     SessionMessagesRequested,
     SessionStatsRequested,

@@ -8,7 +8,7 @@ use yach_connections::{
 };
 use yach_proto::{DialogKind, DialogOption, DialogRequest, DialogResponse};
 
-use crate::{CatalogModelEntry, ModelDiscoveryFuture, ProviderConfig};
+use crate::{CatalogModelEntry, ModelDiscoveryFuture, ProviderConfig, RefreshMode};
 
 pub type DeviceCodeCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 
@@ -260,7 +260,11 @@ pub type ChatGptProbeFuture = Pin<Box<dyn Future<Output = ChatGptProbeOutcome> +
 pub trait ProviderConnectionRuntime: Send + Sync {
     fn list(&self) -> ConnectionListFuture;
     fn cached_models(&self) -> Option<Arc<[CatalogModelEntry]>>;
-    fn refresh_models(&self, active: Option<ActiveModelTarget>) -> ModelDiscoveryFuture;
+    fn refresh_models(
+        &self,
+        active: Option<ActiveModelTarget>,
+        mode: RefreshMode,
+    ) -> ModelDiscoveryFuture;
     fn create(&self, draft: NewConnectionDraft, secret: ProviderSecret)
     -> ConnectionMutationFuture;
     fn repair(&self, id: ConnectionId, secret: ProviderSecret) -> ConnectionMutationFuture;

@@ -117,6 +117,11 @@ visible in the status bar and `/status`. `/help` lists commands; useful
 day-to-day commands include `/resume`, `/model`, `/approval`, `/fork`, and
 `/quit`.
 
+`/model refresh` (or `Ctrl+R` in the `/model` picker) re-checks every provider's
+model list now, ignoring cache windows; `yach models refresh` does the same from
+the shell. For ChatGPT subscriptions, Yach identifies as the latest stable Codex
+release, checked at most every four hours.
+
 `Ctrl+T` selects provider thinking effort. An explicit selection is owned by the
 backend, recorded in the session, and written to
 `~/.yach/config.toml` as the global default for new sessions. Session evidence

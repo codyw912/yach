@@ -13,11 +13,12 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use yach_backend::RefreshMode;
 use yach_catalog::{CachedCatalog, Catalog, transform_codex_models, transform_models_dev};
 
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 
-const REMOTE_CATALOG_REFRESH_INTERVAL_MS: u64 = 4 * 60 * 60 * 1_000;
+pub(crate) const REMOTE_CATALOG_REFRESH_INTERVAL_MS: u64 = 4 * 60 * 60 * 1_000;
 
 /// The refresh's result, in the CLI's own vocabulary (not `RunnerConfig`'s
 /// — see `format_status_message` and `spawn_refresh_status` for the hop
@@ -92,14 +93,17 @@ pub fn codex_cache_matches_version(cache: &CachedCatalog, client_version: &str) 
 }
 
 /// [`refresh_due`] for the Codex catalog: also due immediately when the
-/// cache was listed under a different `client_version`.
+/// cache was listed under a different `client_version`, and always due when
+/// the refresh is forced.
 #[must_use]
 pub fn codex_refresh_due(
     existing: Option<&CachedCatalog>,
     client_version: &str,
     now_unix_ms: u64,
+    mode: RefreshMode,
 ) -> bool {
-    existing.is_some_and(|cache| !codex_cache_matches_version(cache, client_version))
+    mode == RefreshMode::Forced
+        || existing.is_some_and(|cache| !codex_cache_matches_version(cache, client_version))
         || refresh_due(existing, now_unix_ms)
 }
 
@@ -171,7 +175,12 @@ fn write_cache(cache: &CachedCatalog) {
     write_cache_to(&path, cache);
 }
 
-/// Writes the cache atomically: the JSON lands in a same-directory temp
+fn write_cache_to(path: &Path, cache: &CachedCatalog) {
+    write_json_to(path, cache);
+}
+
+/// Writes any serializable cache (the catalog cache, the Codex release
+/// cache) atomically: the JSON lands in a same-directory temp
 /// file first, then `rename` swaps it into place in one filesystem
 /// operation. A reader (`load_cache_from`, running in whatever session
 /// happens to start concurrently) that opens the path mid-write can no
@@ -182,12 +191,12 @@ fn write_cache(cache: &CachedCatalog) {
 /// error return, no panic, just "the next session still has the old
 /// cache" — and the orphaned temp file is best-effort cleaned up rather
 /// than left to accumulate.
-fn write_cache_to(path: &Path, cache: &CachedCatalog) {
+pub(crate) fn write_json_to(path: &Path, value: &impl serde::Serialize) {
     let Some(parent) = path.parent() else {
         return;
     };
     let _ = std::fs::create_dir_all(parent);
-    let Ok(json) = cache.to_json_string() else {
+    let Ok(json) = serde_json::to_string_pretty(value) else {
         return;
     };
     // Deterministic per-process name (no tempfile-crate dependency needed
@@ -1069,21 +1078,41 @@ mod tests {
     fn codex_refresh_is_due_when_the_client_version_changed() {
         let mut cache = cached_fixture_with_checked_at(Some(1_000));
         let inside_interval = 1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS - 1;
+        let due = |cache: Option<&CachedCatalog>, now: u64| {
+            codex_refresh_due(cache, "0.155.0", now, RefreshMode::Normal)
+        };
 
         // Written before versions were recorded: always refetch.
-        assert!(codex_refresh_due(Some(&cache), "0.155.0", inside_interval));
+        assert!(due(Some(&cache), inside_interval));
 
         cache.client_version = Some(String::from("0.144.0"));
-        assert!(codex_refresh_due(Some(&cache), "0.155.0", inside_interval));
+        assert!(due(Some(&cache), inside_interval));
 
         cache.client_version = Some(String::from("0.155.0"));
-        assert!(!codex_refresh_due(Some(&cache), "0.155.0", inside_interval));
-        assert!(codex_refresh_due(
+        assert!(!due(Some(&cache), inside_interval));
+        assert!(due(
             Some(&cache),
-            "0.155.0",
             1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS
         ));
-        assert!(codex_refresh_due(None, "0.155.0", 1_000));
+        assert!(due(None, 1_000));
+    }
+
+    #[test]
+    fn forced_codex_catalog_refresh_ignores_the_interval() {
+        let mut cache = cached_fixture_with_checked_at(Some(1_000));
+        cache.client_version = Some(String::from("0.160.0"));
+        assert!(!codex_refresh_due(
+            Some(&cache),
+            "0.160.0",
+            1_001,
+            RefreshMode::Normal
+        ));
+        assert!(codex_refresh_due(
+            Some(&cache),
+            "0.160.0",
+            1_001,
+            RefreshMode::Forced
+        ));
     }
 
     #[test]
@@ -1094,6 +1123,11 @@ mod tests {
         let updated = cache_after_not_modified(&cache, "2026-08-16", 2_000);
 
         assert!(codex_cache_matches_version(&updated, "0.155.0"));
-        assert!(!codex_refresh_due(Some(&updated), "0.155.0", 2_001));
+        assert!(!codex_refresh_due(
+            Some(&updated),
+            "0.155.0",
+            2_001,
+            RefreshMode::Normal
+        ));
     }
 }
