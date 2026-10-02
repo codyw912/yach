@@ -9,10 +9,10 @@ use tokio::task::spawn_blocking;
 use yach_backend::{
     ActiveModelTarget, CatalogModelEntry, ConnectionListOutcome, ConnectionMutationFuture,
     ConnectionMutationOutcome, ConnectionReplacementFuture, ConnectionReplacementOutcome,
-    ConnectionRuntimeFailure, ModelDiscoveryFuture, ModelDiscoveryOutcome,
+    ConnectionRuntimeFailure, ForcedRefreshReport, ModelDiscoveryFuture, ModelDiscoveryOutcome,
     ProviderActivationFuture, ProviderActivationOutcome, ProviderConfig, ProviderConnectionRuntime,
-    authorize_managed_chatgpt, login_chatgpt_subscription, logout_chatgpt_subscription,
-    managed_chatgpt_adapter,
+    RefreshMode, authorize_managed_chatgpt, login_chatgpt_subscription,
+    logout_chatgpt_subscription, managed_chatgpt_adapter,
     model_discovery::{ModelDiscoveryError, discover_provider_models},
     reauth_chatgpt_subscription, relogin_chatgpt_subscription,
     rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig},
@@ -28,9 +28,6 @@ const MAX_CONNECTIONS: usize = 64;
 const MAX_SNAPSHOT_ROWS: usize = 4_096;
 const MAX_DISCOVERIES_IN_FLIGHT: usize = 8;
 const CACHE_FRESHNESS_SECONDS: u64 = Duration::from_hours(2).as_secs();
-
-static CODEX_CATALOG_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 type DiscoveryFuture = Pin<
     Box<
@@ -463,7 +460,11 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
         lock_cache(&self.state.cache).snapshot.clone()
     }
 
-    fn refresh_models(&self, active: Option<ActiveModelTarget>) -> ModelDiscoveryFuture {
+    fn refresh_models(
+        &self,
+        active: Option<ActiveModelTarget>,
+        mode: RefreshMode,
+    ) -> ModelDiscoveryFuture {
         let state = self.state.clone();
         let (generation, refresh_generation) = {
             let mut cache = lock_cache(&state.cache);
@@ -482,27 +483,59 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 };
             };
 
-            // Returns immediately unless the check is due; when due, bounded
-            // by the check's own timeout. Soft-fails to the last known version.
-            if state.check_codex_release
-                && resolved.connections.iter().any(|connection| {
-                    matches!(
-                        connection.adapter.provider,
-                        RigProviderConfig::ChatGptSubscription { .. }
-                    )
-                })
-            {
-                let _ = spawn_blocking(|| {
-                    crate::codex_release::check_latest_release(crate::codex_release::CheckMode::Due)
-                })
-                .await;
+            let has_chatgpt = resolved.connections.iter().any(|connection| {
+                matches!(
+                    connection.adapter.provider,
+                    RigProviderConfig::ChatGptSubscription { .. }
+                )
+            });
+            // The Codex steps (release check, catalog refresh) touch GitHub,
+            // chatgpt.com and the host cache, so only the system runtime
+            // runs them; injected-store runtimes stay hermetic.
+            let codex_steps = state.check_codex_release && has_chatgpt;
+            let mut failed_steps = Vec::new();
+            let mut codex_version = None;
+            let mut codex_version_change = None;
+            if codex_steps {
+                // Normal: returns immediately unless the check is due, else
+                // bounded by the check's own timeout. Forced: always checks.
+                // Either way a failure soft-fails to the last known version.
+                let check_mode = match mode {
+                    RefreshMode::Normal => crate::codex_release::CheckMode::Due,
+                    RefreshMode::Forced => crate::codex_release::CheckMode::Forced,
+                };
+                match spawn_blocking(move || crate::codex_release::check_latest_release(check_mode))
+                    .await
+                {
+                    Ok(check) => {
+                        if check.failed {
+                            failed_steps.push(String::from("release check"));
+                        }
+                        if check.before != check.after {
+                            codex_version_change = Some((check.before, check.after.clone()));
+                        }
+                        codex_version = Some(check.after);
+                    }
+                    Err(_) => failed_steps.push(String::from("release check")),
+                }
             }
 
             let mut layers = state.layers.clone();
+            if mode == RefreshMode::Forced && codex_steps {
+                let ok = refresh_codex_catalog(&resolved.connections, RefreshMode::Forced).await;
+                if ok == Some(false) {
+                    failed_steps.push(String::from("Codex catalog"));
+                }
+            }
             if let Some(cache) = super::catalog_refresh::load_codex_cache() {
                 layers.fetched_codex = Some(cache);
             }
-            let _ = spawn_codex_catalog_refresh(&resolved.connections);
+            if mode == RefreshMode::Normal && has_chatgpt {
+                let connections = resolved.connections.clone();
+                tokio::spawn(async move {
+                    refresh_codex_catalog(&connections, RefreshMode::Normal).await
+                });
+            }
             let discoverer = state.discoverer.clone();
             let discovery_cache = state.discovery_cache.clone();
             let active_for_discovery = active.clone();
@@ -514,6 +547,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                         layers.clone(),
                         discoverer.clone(),
                         discovery_cache.clone(),
+                        mode,
                     )
                 })
                 .buffer_unordered(MAX_DISCOVERIES_IN_FLIGHT)
@@ -552,11 +586,21 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 let _ = spawn_blocking(move || persist_discovery_cache(&state)).await;
             }
             let entries = snapshot.as_ref().to_vec();
-            if warnings.is_empty() {
-                ModelDiscoveryOutcome::Available(entries)
-            } else {
-                warnings.truncate(MAX_CONNECTIONS + 2);
-                ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings }
+            if warnings.is_empty() && mode == RefreshMode::Normal {
+                return ModelDiscoveryOutcome::Available(entries);
+            }
+            warnings.truncate(MAX_CONNECTIONS + 2);
+            match mode {
+                RefreshMode::Normal => {
+                    ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings }
+                }
+                RefreshMode::Forced => ModelDiscoveryOutcome::Forced(ForcedRefreshReport {
+                    entries,
+                    warnings,
+                    codex_version_change,
+                    failed_steps,
+                    codex_version,
+                }),
             }
         })
     }
@@ -1261,6 +1305,7 @@ fn rehydrate_cached_snapshot(
     (!entries.is_empty()).then(|| entries.into())
 }
 
+#[derive(Clone)]
 struct ResolvedConnection {
     connection: ProviderConnection,
     display: String,
@@ -1286,6 +1331,7 @@ async fn discover_connection_models(
     layers: super::ModelOverrideLayers,
     discoverer: ModelDiscoverer,
     cache: Arc<Mutex<DiscoveryCache>>,
+    mode: RefreshMode,
 ) -> ConnectionDiscovery {
     let active_model = active
         .as_ref()
@@ -1296,7 +1342,7 @@ async fn discover_connection_models(
         CACHE_FRESHNESS_SECONDS,
     );
     let cached = match cached {
-        Some(cached) if cached.fresh => {
+        Some(cached) if cached.fresh && mode == RefreshMode::Normal => {
             return ConnectionDiscovery {
                 entries: catalog_entries_for_connection(
                     &layers,
@@ -1568,112 +1614,105 @@ fn adapter_for_parts(
     }
 }
 
-/// Returns whether a refresh task was actually spawned, so tests can assert
-/// the no-connection early return without reading the process-global
-/// in-flight flag (which sibling tests legitimately set in parallel).
-fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) -> bool {
-    let Some(auth_file) =
+/// Refreshes the Codex catalog cache. `None`: no ChatGPT connection, not
+/// due, or (Normal only) another refresh already running. `Some(true)`:
+/// fetched or 304. `Some(false)`: the fetch or its response failed.
+async fn refresh_codex_catalog(
+    connections: &[ResolvedConnection],
+    mode: RefreshMode,
+) -> Option<bool> {
+    let (auth_file, timeout) =
         connections
             .iter()
             .find_map(|connection| match &connection.adapter.provider {
-                RigProviderConfig::ChatGptSubscription { auth_file } => Some(auth_file.clone()),
+                RigProviderConfig::ChatGptSubscription { auth_file } => {
+                    Some((auth_file.clone(), connection.adapter.timeout))
+                }
                 _ => None,
-            })
-    else {
-        return false;
-    };
+            })?;
+    let _guard = acquire_codex_refresh(&CODEX_CATALOG_REFRESH, mode).await?;
+    // Re-evaluated under the guard: a refresh that just finished may have
+    // made this one redundant (Normal), and a forced waiter must see its
+    // result in the cache it reads.
     let client_version = crate::codex_release::effective_client_version();
     let existing = super::catalog_refresh::load_codex_cache();
     if !super::catalog_refresh::codex_refresh_due(
         existing.as_ref(),
         &client_version,
         super::catalog_refresh::catalog_date_now().1,
+        mode,
     ) {
-        return false;
+        return None;
     }
-    if CODEX_CATALOG_REFRESH_IN_FLIGHT
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        )
-        .is_err()
-    {
-        return false;
-    }
-    let timeout = connections
-        .iter()
-        .find_map(|connection| match &connection.adapter.provider {
-            RigProviderConfig::ChatGptSubscription { .. } => Some(connection.adapter.timeout),
-            _ => None,
-        })
-        .unwrap_or(std::time::Duration::from_secs(10));
     // An ETag from a listing under another client_version would let the
     // backend answer 304 for a different model set.
     let existing_etag = existing
+        .as_ref()
         .filter(|cache| super::catalog_refresh::codex_cache_matches_version(cache, &client_version))
-        .and_then(|cache| cache.etag);
-    tokio::spawn(async move {
-        let _guard = CodexCatalogRefreshGuard;
-        let existing = super::catalog_refresh::load_codex_cache();
-        match yach_backend::model_discovery::fetch_chatgpt_catalog_document(
-            &auth_file,
-            existing_etag.as_deref(),
-            timeout,
-            Some(client_version.as_str()),
-        )
-        .await
-        {
-            Ok(yach_backend::model_discovery::CodexCatalogDocument::NotModified) => {
-                if let Some(existing) = existing {
-                    let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
-                    super::catalog_refresh::persist_codex_cache(
-                        &super::catalog_refresh::cache_after_not_modified(
-                            &existing, &now_date, checked_at,
-                        ),
-                    );
-                }
+        .and_then(|cache| cache.etag.clone());
+    match yach_backend::model_discovery::fetch_chatgpt_catalog_document(
+        &auth_file,
+        existing_etag.as_deref(),
+        timeout,
+        Some(client_version.as_str()),
+    )
+    .await
+    {
+        Ok(yach_backend::model_discovery::CodexCatalogDocument::NotModified) => {
+            if let Some(existing) = existing {
+                let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
+                super::catalog_refresh::persist_codex_cache(
+                    &super::catalog_refresh::cache_after_not_modified(
+                        &existing, &now_date, checked_at,
+                    ),
+                );
             }
-            Err(_) => {
+            Some(true)
+        }
+        Err(_) => {
+            if let Some(existing) = existing {
+                let checked_at = super::catalog_refresh::catalog_date_now().1;
+                super::catalog_refresh::persist_codex_cache(
+                    &super::catalog_refresh::cache_after_failed_response(&existing, checked_at),
+                );
+            }
+            Some(false)
+        }
+        Ok(yach_backend::model_discovery::CodexCatalogDocument::Modified { body, etag }) => {
+            let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
+            if let Ok(cache) = super::catalog_refresh::apply_codex_catalog_response(
+                &body,
+                &now_date,
+                checked_at,
+                etag,
+                &client_version,
+            ) {
+                super::catalog_refresh::persist_codex_cache(&cache);
+                Some(true)
+            } else {
                 if let Some(existing) = existing {
-                    let checked_at = super::catalog_refresh::catalog_date_now().1;
                     super::catalog_refresh::persist_codex_cache(
                         &super::catalog_refresh::cache_after_failed_response(&existing, checked_at),
                     );
                 }
-            }
-            Ok(yach_backend::model_discovery::CodexCatalogDocument::Modified { body, etag }) => {
-                let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
-                match super::catalog_refresh::apply_codex_catalog_response(
-                    &body,
-                    &now_date,
-                    checked_at,
-                    etag,
-                    &client_version,
-                ) {
-                    Ok(cache) => super::catalog_refresh::persist_codex_cache(&cache),
-                    Err(_) => {
-                        if let Some(existing) = existing {
-                            super::catalog_refresh::persist_codex_cache(
-                                &super::catalog_refresh::cache_after_failed_response(
-                                    &existing, checked_at,
-                                ),
-                            );
-                        }
-                    }
-                }
+                Some(false)
             }
         }
-    });
-    true
+    }
 }
 
-struct CodexCatalogRefreshGuard;
+static CODEX_CATALOG_REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-impl Drop for CodexCatalogRefreshGuard {
-    fn drop(&mut self) {
-        CODEX_CATALOG_REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+/// Normal refreshes skip when another is running; forced ones wait their
+/// turn. The lock is a parameter so tests can stay off the process-global
+/// mutex (sibling tests legitimately hold it during catalog refreshes).
+async fn acquire_codex_refresh(
+    lock: &tokio::sync::Mutex<()>,
+    mode: RefreshMode,
+) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+    match mode {
+        RefreshMode::Normal => lock.try_lock().ok(),
+        RefreshMode::Forced => Some(lock.lock().await),
     }
 }
 
@@ -1787,12 +1826,81 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn refresh_codex_catalog_is_idle_without_chatgpt_connections() {
+        for mode in [RefreshMode::Normal, RefreshMode::Forced] {
+            assert_eq!(
+                refresh_codex_catalog(&[], mode).await,
+                None,
+                "no Codex connection must not start a catalog fetch ({mode:?})"
+            );
+        }
+    }
+
     #[test]
-    fn spawn_codex_catalog_refresh_is_idle_without_chatgpt_connections() {
-        assert!(
-            !spawn_codex_catalog_refresh(&[]),
-            "no Codex connection must not start a catalog fetch"
+    fn forced_refresh_ignores_a_fresh_discovery_cache() {
+        let connection = ready_compatible("Forced", "http://forced.invalid/v1");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
+            Arc::new(FixedMetadata {
+                records: vec![connection],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(move |_, _| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(vec![
+                        yach_backend::model_discovery::DiscoveredProviderModel {
+                            id: String::from("fixture"),
+                            display_name: None,
+                        },
+                    ])
+                })
+            }),
         );
+        let test_runtime = tokio::runtime::Runtime::new().test_unwrap();
+
+        test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal));
+        test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "fresh cache reused");
+
+        let outcome = test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Forced));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "forced bypasses the cache");
+        let ModelDiscoveryOutcome::Forced(report) = outcome else {
+            unreachable!("forced refresh must return a report");
+        };
+        assert_eq!(report.entries[0].info.id, "fixture");
+        assert!(
+            report.codex_version_change.is_none(),
+            "no ChatGPT connection"
+        );
+        assert!(report.failed_steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forced_codex_refresh_waits_for_an_in_flight_refresh() {
+        // Test-local lock: production takes CODEX_CATALOG_REFRESH, and the
+        // policy is identical — a static inside this test keeps sibling
+        // catalog refreshes from racing these assertions on the global.
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let held = acquire_codex_refresh(&LOCK, RefreshMode::Normal)
+            .await
+            .test_unwrap();
+        assert!(
+            acquire_codex_refresh(&LOCK, RefreshMode::Normal)
+                .await
+                .is_none(),
+            "normal skips when busy"
+        );
+        let forced =
+            tokio::spawn(async move { acquire_codex_refresh(&LOCK, RefreshMode::Forced).await });
+        tokio::task::yield_now().await;
+        assert!(!forced.is_finished(), "forced waits");
+        drop(held);
+        assert!(forced.await.test_unwrap().is_some());
     }
 
     trait TestUnwrap {
@@ -2132,7 +2240,7 @@ mod tests {
         );
         let ModelDiscoveryOutcome::Available(entries) = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None))
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal))
         else {
             unreachable!("stale cache refresh must succeed");
         };
@@ -2179,7 +2287,7 @@ mod tests {
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } =
             tokio::runtime::Runtime::new()
                 .test_unwrap()
-                .block_on(runtime.refresh_models(None))
+                .block_on(runtime.refresh_models(None, RefreshMode::Normal))
         else {
             unreachable!("stale cache rows must remain available after discovery failure");
         };
@@ -2367,12 +2475,15 @@ mod tests {
         assert_eq!(list.as_slice().len(), 1);
         assert_eq!(list.as_slice()[0].id, ConnectionId::environment());
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = test_runtime
-            .block_on(runtime.refresh_models(Some(ActiveModelTarget {
-                provider: String::new(),
-                connection_id: ConnectionId::environment(),
-                connection_key: None,
-                model: String::from("environment-model"),
-            })))
+            .block_on(runtime.refresh_models(
+                Some(ActiveModelTarget {
+                    provider: String::new(),
+                    connection_id: ConnectionId::environment(),
+                    connection_key: None,
+                    model: String::from("environment-model"),
+                }),
+                RefreshMode::Normal,
+            ))
         else {
             unreachable!("environment remains discoverable despite malformed registry");
         };
@@ -2573,11 +2684,11 @@ mod tests {
             }),
         );
         let test_runtime = tokio::runtime::Runtime::new().test_unwrap();
-        let first = test_runtime.spawn(runtime.refresh_models(None));
+        let first = test_runtime.spawn(runtime.refresh_models(None, RefreshMode::Normal));
         started_receiver
             .recv_timeout(Duration::from_secs(2))
             .test_unwrap();
-        let second = test_runtime.spawn(runtime.refresh_models(None));
+        let second = test_runtime.spawn(runtime.refresh_models(None, RefreshMode::Normal));
         started_receiver
             .recv_timeout(Duration::from_secs(2))
             .test_unwrap();
@@ -2630,7 +2741,7 @@ mod tests {
                 })
             }),
         );
-        let refresh = runtime.refresh_models(None);
+        let refresh = runtime.refresh_models(None, RefreshMode::Normal);
         CliProviderConnectionRuntime::invalidate(&runtime.state);
 
         assert!(matches!(
@@ -2668,7 +2779,7 @@ mod tests {
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("fixture discovery should succeed");
         };
@@ -2713,7 +2824,7 @@ mod tests {
 
         let ModelDiscoveryOutcome::Available(entries) = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(Some(active)))
+            .block_on(runtime.refresh_models(Some(active), RefreshMode::Normal))
         else {
             unreachable!("active fallback remains available");
         };
@@ -2765,7 +2876,7 @@ mod tests {
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = &outcome else {
             unreachable!(
                 "successful connection must survive its peer failure with a bounded warning"
@@ -2819,12 +2930,15 @@ mod tests {
         let outcome =
             tokio::runtime::Runtime::new()
                 .test_unwrap()
-                .block_on(runtime.refresh_models(Some(ActiveModelTarget {
-                    provider: String::new(),
-                    connection_id: ConnectionId::environment(),
-                    connection_key: None,
-                    model: String::from("gpt-5"),
-                })));
+                .block_on(runtime.refresh_models(
+                    Some(ActiveModelTarget {
+                        provider: String::new(),
+                        connection_id: ConnectionId::environment(),
+                        connection_key: None,
+                        model: String::from("gpt-5"),
+                    }),
+                    RefreshMode::Normal,
+                ));
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("active environment subscription must be visible");
         };
@@ -2878,7 +2992,7 @@ mod tests {
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("managed ChatGPT must list discovered models without activation");
         };
@@ -2937,7 +3051,7 @@ mod tests {
         );
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         assert!(matches!(outcome, ModelDiscoveryOutcome::Available(_)));
         let Some(requested) = requested.lock().test_unwrap().clone() else {
             unreachable!("the ChatGPT discoverer ran once");
@@ -2983,7 +3097,7 @@ mod tests {
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("empty Codex listing must keep baked models selectable");
         };
@@ -3043,7 +3157,7 @@ mod tests {
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = outcome else {
             unreachable!("failed Codex listing must keep baked models selectable");
         };
@@ -3258,12 +3372,15 @@ mod tests {
         let outcome =
             tokio::runtime::Runtime::new()
                 .test_unwrap()
-                .block_on(runtime.refresh_models(Some(ActiveModelTarget {
-                    provider: String::new(),
-                    connection_id: active_connection.clone(),
-                    connection_key: None,
-                    model: String::from("fixture-model-099"),
-                })));
+                .block_on(runtime.refresh_models(
+                    Some(ActiveModelTarget {
+                        provider: String::new(),
+                        connection_id: active_connection.clone(),
+                        connection_key: None,
+                        model: String::from("fixture-model-099"),
+                    }),
+                    RefreshMode::Normal,
+                ));
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = outcome else {
             unreachable!("bounded fixture discovery should complete with truncation warning");
         };
@@ -3660,7 +3777,7 @@ mod tests {
         ));
         let ModelDiscoveryOutcome::Available(rows) = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None))
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal))
         else {
             unreachable!("same runtime refreshes after replacement");
         };
@@ -3708,7 +3825,7 @@ mod tests {
         ));
         let ModelDiscoveryOutcome::Available(rows) = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None))
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal))
         else {
             unreachable!("same runtime refreshes after rename");
         };
@@ -3746,7 +3863,7 @@ mod tests {
             vec![fixture_entry("stale-create", "Fixture")].into(),
         ));
         assert!(matches!(
-            test_runtime.block_on(runtime.refresh_models(None)),
+            test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal)),
             ModelDiscoveryOutcome::Available(rows) if rows.len() == 1
         ));
         let repair_connection = ProviderConnection::stored(
@@ -3779,7 +3896,7 @@ mod tests {
             vec![fixture_entry("stale-repair", "Fixture")].into(),
         ));
         assert!(matches!(
-            test_runtime.block_on(runtime.refresh_models(None)),
+            test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal)),
             ModelDiscoveryOutcome::Available(rows) if rows.len() == 2
         ));
 
@@ -3795,7 +3912,7 @@ mod tests {
             vec![fixture_entry("stale-remove", "Fixture")].into(),
         ));
         assert!(matches!(
-            test_runtime.block_on(runtime.refresh_models(None)),
+            test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal)),
             ModelDiscoveryOutcome::Available(rows) if rows.len() == 1
         ));
         let _ = std::fs::remove_file(path);
@@ -4039,7 +4156,7 @@ mod tests {
             ));
         }
         assert!(matches!(
-            test_runtime.block_on(runtime.refresh_models(None)),
+            test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal)),
             ModelDiscoveryOutcome::Available(_)
         ));
         assert!(matches!(

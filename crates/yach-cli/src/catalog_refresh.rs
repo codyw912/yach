@@ -13,6 +13,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use yach_backend::RefreshMode;
 use yach_catalog::{CachedCatalog, Catalog, transform_codex_models, transform_models_dev};
 
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
@@ -92,14 +93,17 @@ pub fn codex_cache_matches_version(cache: &CachedCatalog, client_version: &str) 
 }
 
 /// [`refresh_due`] for the Codex catalog: also due immediately when the
-/// cache was listed under a different `client_version`.
+/// cache was listed under a different `client_version`, and always due when
+/// the refresh is forced.
 #[must_use]
 pub fn codex_refresh_due(
     existing: Option<&CachedCatalog>,
     client_version: &str,
     now_unix_ms: u64,
+    mode: RefreshMode,
 ) -> bool {
-    existing.is_some_and(|cache| !codex_cache_matches_version(cache, client_version))
+    mode == RefreshMode::Forced
+        || existing.is_some_and(|cache| !codex_cache_matches_version(cache, client_version))
         || refresh_due(existing, now_unix_ms)
 }
 
@@ -1074,21 +1078,41 @@ mod tests {
     fn codex_refresh_is_due_when_the_client_version_changed() {
         let mut cache = cached_fixture_with_checked_at(Some(1_000));
         let inside_interval = 1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS - 1;
+        let due = |cache: Option<&CachedCatalog>, now: u64| {
+            codex_refresh_due(cache, "0.155.0", now, RefreshMode::Normal)
+        };
 
         // Written before versions were recorded: always refetch.
-        assert!(codex_refresh_due(Some(&cache), "0.155.0", inside_interval));
+        assert!(due(Some(&cache), inside_interval));
 
         cache.client_version = Some(String::from("0.144.0"));
-        assert!(codex_refresh_due(Some(&cache), "0.155.0", inside_interval));
+        assert!(due(Some(&cache), inside_interval));
 
         cache.client_version = Some(String::from("0.155.0"));
-        assert!(!codex_refresh_due(Some(&cache), "0.155.0", inside_interval));
-        assert!(codex_refresh_due(
+        assert!(!due(Some(&cache), inside_interval));
+        assert!(due(
             Some(&cache),
-            "0.155.0",
             1_000 + REMOTE_CATALOG_REFRESH_INTERVAL_MS
         ));
-        assert!(codex_refresh_due(None, "0.155.0", 1_000));
+        assert!(due(None, 1_000));
+    }
+
+    #[test]
+    fn forced_codex_catalog_refresh_ignores_the_interval() {
+        let mut cache = cached_fixture_with_checked_at(Some(1_000));
+        cache.client_version = Some(String::from("0.160.0"));
+        assert!(!codex_refresh_due(
+            Some(&cache),
+            "0.160.0",
+            1_001,
+            RefreshMode::Normal
+        ));
+        assert!(codex_refresh_due(
+            Some(&cache),
+            "0.160.0",
+            1_001,
+            RefreshMode::Forced
+        ));
     }
 
     #[test]
@@ -1099,6 +1123,11 @@ mod tests {
         let updated = cache_after_not_modified(&cache, "2026-08-16", 2_000);
 
         assert!(codex_cache_matches_version(&updated, "0.155.0"));
-        assert!(!codex_refresh_due(Some(&updated), "0.155.0", 2_001));
+        assert!(!codex_refresh_due(
+            Some(&updated),
+            "0.155.0",
+            2_001,
+            RefreshMode::Normal
+        ));
     }
 }
