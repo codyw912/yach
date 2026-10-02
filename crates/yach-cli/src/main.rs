@@ -153,6 +153,12 @@ impl CliArgs {
             Some("smoke-responses-compaction") => Command::SmokeResponsesCompaction,
             Some("install") => extension_install_command_from_args(&positional[1..]),
             Some("extension") => extension_command_from_args(&positional[1..]),
+            Some("models") => match positional.get(1).map(String::as_str) {
+                Some("refresh") => Command::ModelsRefresh,
+                other => Command::Unknown {
+                    name: format!("models {}", other.unwrap_or_default()),
+                },
+            },
             Some("preset") => preset_command_from_args(&positional[1..]),
             Some("component") => component_command_from_args(&positional[1..]),
             Some("sessions") => match sessions::sessions_command_from_args(&positional[1..]) {
@@ -239,6 +245,7 @@ enum Command {
     ExtensionInstallBundled {
         id: String,
     },
+    ModelsRefresh,
     PresetList,
     PresetShow,
     PresetUse {
@@ -486,6 +493,7 @@ impl Command {
                 enabled,
             } => run_extension_set_enabled_command(selector, *scope, *enabled),
             Self::ExtensionInstallBundled { id } => run_extension_install_bundled_command(id),
+            Self::ModelsRefresh => run_models_refresh_command(),
             Self::PresetList => run_preset_list_command(),
             Self::PresetShow => run_preset_show_command(),
             Self::PresetUse { preset, reset } => run_preset_use_command(*preset, *reset),
@@ -991,9 +999,12 @@ fn usage_lines() -> Vec<String> {
         String::from("       yach preset list | show | use <minimal|full> [--reset]"),
         String::from("       yach component list | enable <name> | disable <name>"),
         String::from("       yach extension install --bundled <yach.hashline|yach.jev-reviewer>"),
+        String::from("       yach models refresh"),
         String::from("       yach sessions list [--json]"),
         String::from("       yach sessions show <session-id|latest> [--json]"),
-        String::from("commands: run, rpc, extension, install, print-capabilities, sessions"),
+        String::from(
+            "commands: run, rpc, extension, install, models, print-capabilities, sessions",
+        ),
         String::from("options: --resume, --backend fixture, --version, --help"),
         String::from(
             "rpc: protocol server — ClientEvent JSONL on stdin, ServerEvent JSONL on stdout,",
@@ -4553,6 +4564,80 @@ fn cli_user_config() -> io::Result<yach_backend::UserConfigStore> {
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
+/// `yach models refresh`: the non-interactive twin of `/model refresh`. Runs
+/// the forced refresh against stored connections and prints the same status
+/// line the TUI shows.
+fn run_models_refresh_command() -> CommandResult {
+    use yach_backend::ProviderConnectionRuntime as _;
+
+    let layers = ModelOverrideLayers::load_for_project(None);
+    let runtime = provider_connections::CliProviderConnectionRuntime::system(
+        layers,
+        None,
+        provider_connection_timeout(),
+        None,
+    )
+    .filter(|_| provider_connections::has_stored_connections());
+    let Some(runtime) = runtime else {
+        return preset_result(Err(io::Error::other(
+            "no provider connection is configured",
+        )));
+    };
+    let async_runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(async_runtime) => async_runtime,
+        Err(error) => return preset_result(Err(error)),
+    };
+    let previous = runtime.cached_models();
+    let outcome =
+        async_runtime.block_on(runtime.refresh_models(None, yach_backend::RefreshMode::Forced));
+    models_refresh_result(previous.as_deref().unwrap_or_default(), outcome)
+}
+
+/// Renders a forced-refresh outcome. Exits non-zero only when every attempted
+/// step failed and discovery returned no entries.
+fn models_refresh_result(
+    previous: &[CatalogModelEntry],
+    outcome: ModelDiscoveryOutcome,
+) -> CommandResult {
+    match outcome {
+        ModelDiscoveryOutcome::Forced(report) => {
+            // Attempted steps are the Codex steps (when a ChatGPT connection
+            // exists) and discovery. Discovery failed when it yielded no rows
+            // and at least one warning.
+            let codex_attempted = report.codex_version.is_some() || !report.failed_steps.is_empty();
+            let codex_all_failed = report.failed_steps.len() >= 2;
+            let discovery_failed = report.entries.is_empty() && !report.warnings.is_empty();
+            let failed = report.entries.is_empty()
+                && if codex_attempted {
+                    codex_all_failed
+                } else {
+                    discovery_failed
+                };
+            let mut lines = vec![yach_backend::forced_refresh_status(previous, &report)];
+            lines.extend(
+                report
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("warning={warning}")),
+            );
+            CommandResult::Preset { lines, failed }
+        }
+        ModelDiscoveryOutcome::Failed { message } => CommandResult::Preset {
+            lines: vec![format!("error={message}")],
+            failed: true,
+        },
+        ModelDiscoveryOutcome::Available(_)
+        | ModelDiscoveryOutcome::AvailableWithWarnings { .. }
+        | ModelDiscoveryOutcome::Superseded => CommandResult::Preset {
+            lines: vec![String::from("models refreshed")],
+            failed: false,
+        },
+    }
+}
+
 fn run_preset_list_command() -> CommandResult {
     preset_result(Ok(vec![
         String::from("preset=minimal"),
@@ -6150,6 +6235,162 @@ mod tests {
 
     fn parse_command(args: &[&str]) -> Command {
         CliArgs::from_args(args.iter().map(|arg| String::from(*arg))).command
+    }
+    #[test]
+    fn models_refresh_command_parses() {
+        assert_eq!(
+            parse_command(&["models", "refresh"]),
+            Command::ModelsRefresh
+        );
+        assert_eq!(
+            parse_command(&["models", "list"]),
+            Command::Unknown {
+                name: String::from("models list")
+            }
+        );
+        assert_eq!(
+            parse_command(&["models"]),
+            Command::Unknown {
+                name: String::from("models ")
+            }
+        );
+    }
+
+    #[test]
+    fn usage_lists_models_refresh() {
+        let lines = CommandResult::Usage.render_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim() == "yach models refresh")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("commands:") && line.contains("models"))
+        );
+    }
+
+    fn refresh_entry(id: &str) -> yach_backend::CatalogModelEntry {
+        yach_backend::CatalogModelEntry {
+            info: yach_proto::ModelInfo {
+                id: String::from(id),
+                name: String::from(id),
+                provider: String::from("openai"),
+                connection_id: None,
+                connection_display: None,
+            },
+            curated: true,
+            context_window: 1,
+            output_budget: 1,
+            max_tokens_param: yach_backend::rig_adapter::MaxTokensParam::MaxTokens,
+            responses_compact: None,
+        }
+    }
+
+    fn refresh_report(
+        entries: Vec<yach_backend::CatalogModelEntry>,
+        failed_steps: &[&str],
+        codex_attempted: bool,
+    ) -> yach_backend::ModelDiscoveryOutcome {
+        yach_backend::ModelDiscoveryOutcome::Forced(yach_backend::ForcedRefreshReport {
+            entries,
+            warnings: Vec::new(),
+            codex_version_change: None,
+            failed_steps: failed_steps
+                .iter()
+                .map(|step| String::from(*step))
+                .collect(),
+            codex_version: codex_attempted.then(|| String::from("0.160.0")),
+        })
+    }
+
+    #[test]
+    fn models_refresh_prints_the_forced_status_line() {
+        let previous = [refresh_entry("old")];
+        let result = super::models_refresh_result(
+            &previous,
+            refresh_report(vec![refresh_entry("old"), refresh_entry("new")], &[], false),
+        );
+        assert_eq!(result.exit_code(), 0);
+        assert_eq!(
+            result.render_lines(),
+            vec![String::from("models refreshed · +1 models")]
+        );
+    }
+
+    #[test]
+    fn models_refresh_exits_non_zero_only_when_every_attempted_step_failed() {
+        // Both Codex steps failed and nothing was discovered.
+        let all_failed = super::models_refresh_result(
+            &[],
+            refresh_report(Vec::new(), &["release check", "Codex catalog"], true),
+        );
+        assert_eq!(all_failed.exit_code(), 1);
+        assert_eq!(
+            all_failed.render_lines(),
+            vec![String::from(
+                "models refreshed · no changes · release check failed (using 0.160.0) · Codex catalog failed"
+            )]
+        );
+
+        // One step failed but the other worked.
+        let partial =
+            super::models_refresh_result(&[], refresh_report(Vec::new(), &["release check"], true));
+        assert_eq!(partial.exit_code(), 0);
+
+        // Steps failed but discovery still produced rows.
+        let with_rows = super::models_refresh_result(
+            &[],
+            refresh_report(
+                vec![refresh_entry("kept")],
+                &["release check", "Codex catalog"],
+                true,
+            ),
+        );
+        assert_eq!(with_rows.exit_code(), 0);
+
+        // No Codex steps attempted and nothing failed: an empty catalog is not an error.
+        let idle = super::models_refresh_result(&[], refresh_report(Vec::new(), &[], false));
+        assert_eq!(idle.exit_code(), 0);
+    }
+
+    #[test]
+    fn models_refresh_discovery_failure_without_rows_fails() {
+        let outcome =
+            yach_backend::ModelDiscoveryOutcome::Forced(yach_backend::ForcedRefreshReport {
+                entries: Vec::new(),
+                warnings: vec![String::from("provider models unavailable")],
+                codex_version_change: None,
+                failed_steps: Vec::new(),
+                codex_version: None,
+            });
+        let result = super::models_refresh_result(&[], outcome);
+        assert_eq!(result.exit_code(), 1);
+        assert_eq!(
+            result.render_lines(),
+            vec![
+                String::from("models refreshed · no changes"),
+                String::from("warning=provider models unavailable"),
+            ]
+        );
+    }
+
+    #[test]
+    fn models_refresh_reports_a_failed_discovery() {
+        let result = super::models_refresh_result(
+            &[],
+            yach_backend::ModelDiscoveryOutcome::Failed {
+                message: String::from("provider connection discovery is unavailable"),
+            },
+        );
+        assert_eq!(result.exit_code(), 1);
+        assert_eq!(
+            result.render_lines(),
+            vec![String::from(
+                "error=provider connection discovery is unavailable"
+            )]
+        );
     }
 
     #[test]
