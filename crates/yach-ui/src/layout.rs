@@ -5,7 +5,7 @@ use crate::input::{InputComposer, input_metrics};
 use crate::status_bar::StatusBar;
 use crate::theme::Theme;
 use crate::transcript;
-use crate::transcript::{Transcript, TranscriptRenderCache};
+use crate::transcript::{Transcript, TranscriptAlignment, TranscriptRenderCache};
 
 const STATUS_HEIGHT: u16 = 1;
 const COMPOSER_GAP_HEIGHT: u16 = 1;
@@ -13,6 +13,7 @@ pub struct RenderParams<'a> {
     pub transcript: &'a Transcript,
     pub transcript_cache: &'a mut TranscriptRenderCache,
     pub scroll_offset: usize,
+    pub transcript_alignment: TranscriptAlignment,
     pub is_streaming: bool,
     pub input: &'a mut ratatui_textarea::TextArea<'static>,
     pub model: &'a str,
@@ -59,6 +60,7 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
         params.transcript_cache,
         params.scroll_offset,
         params.is_streaming,
+        params.transcript_alignment,
     );
 
     let input_widget = InputComposer {
@@ -93,7 +95,7 @@ mod tests {
 
     use super::{RenderParams, render, transcript_viewport_size};
     use crate::theme::Theme;
-    use crate::transcript::{Transcript, TranscriptRenderCache};
+    use crate::transcript::{Transcript, TranscriptAlignment, TranscriptRenderCache};
 
     #[test]
     fn composer_spans_the_full_pane_width() {
@@ -110,6 +112,7 @@ mod tests {
                     transcript: &transcript,
                     transcript_cache: &mut transcript_cache,
                     scroll_offset: 0,
+                    transcript_alignment: TranscriptAlignment::Bottom,
                     is_streaming: false,
                     input: &mut input,
                     model: "model",
