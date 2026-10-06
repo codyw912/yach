@@ -28,7 +28,7 @@ use crate::slash_commands::{
 };
 use crate::theme::Theme;
 use crate::thinking_level::ThinkingLevel;
-use crate::transcript::{self, Transcript, TranscriptRenderCache};
+use crate::transcript::{self, Transcript, TranscriptAlignment, TranscriptRenderCache};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunTuiOptions {
@@ -716,6 +716,11 @@ pub struct App {
     transcript_cache: TranscriptRenderCache,
     scroll_offset: usize,
     scrollback_archive_count: usize,
+    /// Set once finished turns were moved into terminal scrollback; the live
+    /// transcript then continues directly below that history. `/clear` keeps
+    /// it set (the old rows are still in the terminal above the viewport);
+    /// switching sessions resets it, since that history is not this session's.
+    scrollback_committed: bool,
     prompt: TextArea<'static>,
     prompt_history: PromptHistory,
     active_tools: Vec<ActiveTool>,
@@ -792,6 +797,7 @@ impl App {
             theme,
             scroll_offset: 0,
             scrollback_archive_count: 0,
+            scrollback_committed: false,
             prompt: TextArea::default(),
             prompt_history: PromptHistory::default(),
             active_tools: Vec::new(),
@@ -2114,6 +2120,7 @@ impl App {
         self.transcript.clear();
         self.scroll_offset = 0;
         self.scrollback_archive_count = 0;
+        self.scrollback_committed = false;
 
         for message in messages {
             match message.role.as_str() {
@@ -3616,9 +3623,21 @@ impl App {
             .transcript
             .drain_prefix_lines(count, width, &self.theme);
         if !lines.is_empty() {
+            self.scrollback_committed = true;
             self.scroll_to_bottom();
         }
         lines
+    }
+
+    /// With history already in terminal scrollback the live transcript must
+    /// start right below it; a fresh session keeps the first exchange next to
+    /// the composer.
+    fn transcript_alignment(&self) -> TranscriptAlignment {
+        if self.scrollback_committed {
+            TranscriptAlignment::Top
+        } else {
+            TranscriptAlignment::Bottom
+        }
     }
 
     fn request_session_tree(&mut self) {
@@ -4117,19 +4136,20 @@ impl BenchmarkApp {
     where
         B::Error: std::fmt::Debug,
     {
-        let area = terminal
-            .size()
+        let area = inline_viewport_area(terminal)
             .map_err(|error| io::Error::other(format!("terminal size failed: {error:?}")))?;
         let (viewport_width, viewport_height) =
-            layout::transcript_viewport_size(area.into(), &self.app.prompt);
+            layout::transcript_viewport_size(area, &self.app.prompt);
         self.app
             .set_transcript_viewport(viewport_width, viewport_height);
 
         let compaction_count = self.app.session_compaction_count();
+        let transcript_alignment = self.app.transcript_alignment();
         let render_params = layout::RenderParams {
             transcript: &self.app.transcript,
             transcript_cache: &mut self.app.transcript_cache,
             scroll_offset: self.app.scroll_offset,
+            transcript_alignment,
             is_streaming: self.app.is_streaming,
             input: &mut self.app.prompt,
             model: &self.app.model,
@@ -4303,8 +4323,8 @@ pub async fn run_tui_with_trace_and_options(
             }
         }
 
-        if let Ok(area) = terminal.size() {
-            let (width, height) = layout::transcript_viewport_size(area.into(), &app.prompt);
+        if let Ok(area) = inline_viewport_area(&mut terminal) {
+            let (width, height) = layout::transcript_viewport_size(area, &app.prompt);
             app.set_transcript_viewport(width, height);
         }
         let session_idx = app.session_select_index();
@@ -4331,6 +4351,7 @@ pub async fn run_tui_with_trace_and_options(
         let perf_metrics = app.perf_metrics.clone();
         let show_fork_hint = app.supports(Capability::SessionForking);
         let compaction_count = app.session_compaction_count();
+        let transcript_alignment = app.transcript_alignment();
 
         let render_start = std::time::Instant::now();
         if !first_render_recorded && let Some(trace) = trace.as_ref() {
@@ -4342,6 +4363,7 @@ pub async fn run_tui_with_trace_and_options(
                 transcript: &app.transcript,
                 transcript_cache: &mut app.transcript_cache,
                 scroll_offset: app.scroll_offset,
+                transcript_alignment,
                 is_streaming: app.is_streaming,
                 input: &mut app.prompt,
                 model: &model,
@@ -4507,6 +4529,20 @@ pub async fn run_tui_with_trace_and_options(
     io::stdout().execute(crossterm::cursor::MoveToNextLine(1))?;
 
     Ok(())
+}
+
+/// The area the next frame will actually draw into.
+///
+/// An inline viewport keeps the height it was created with, so after the
+/// terminal grows it is shorter than `terminal.size()`. Sizing the transcript
+/// window from the terminal instead made the scroll position follow rows that
+/// are never drawn, cutting the newest lines (and a pending review's decision
+/// controls) off the bottom while older lines stayed on screen.
+fn inline_viewport_area<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+) -> Result<ratatui::layout::Rect, B::Error> {
+    terminal.autoresize()?;
+    Ok(terminal.get_frame().area())
 }
 
 fn render_dialog_overlay(
@@ -9089,5 +9125,222 @@ mod tests {
             super::StreamState::Desynchronized { .. }
         ));
         assert_eq!(utf8.transcript.entries()[0].content, "café");
+    }
+
+    fn buffer_rows(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        buffer
+            .content
+            .chunks(width)
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn inline_terminal(
+        width: u16,
+        backend_height: u16,
+        viewport_height: u16,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let backend = ratatui::backend::TestBackend::new(width, backend_height);
+        match ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(viewport_height),
+            },
+        ) {
+            Ok(terminal) => terminal,
+            Err(infallible) => match infallible {},
+        }
+    }
+
+    fn request_review(bench: &mut super::BenchmarkApp, diff_lines: usize) {
+        bench.app.handle_server_event(ServerEvent::ToolCallStarted {
+            tool_call_id: Some(String::from("review-1")),
+            tool_name: String::from("create_text_file"),
+            preview: Some(String::from("big.txt")),
+        });
+        let mut preview = local_edit_preview(LocalEditReviewState::NeedsUserApproval);
+        preview.diff_summary = (0..diff_lines)
+            .map(|index| format!("+line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bench
+            .app
+            .handle_server_event(ServerEvent::ToolReviewRequested {
+                request_id: String::from("review-1"),
+                tool_name: String::from("create_text_file"),
+                payload: ToolReviewPayload::LocalEdit { preview },
+            });
+    }
+
+    fn row_index(rows: &[String], needle: &str) -> Option<usize> {
+        rows.iter().position(|row| row.contains(needle))
+    }
+
+    /// Row holding `needle`; fails the test with the whole screen when absent.
+    fn row_of(rows: &[String], needle: &str) -> usize {
+        let found = row_index(rows, needle);
+        assert!(
+            found.is_some(),
+            "`{needle}` is not visible:\n{}",
+            rows.join("\n")
+        );
+        found.unwrap_or_default()
+    }
+
+    fn render_rows(
+        bench: &mut super::BenchmarkApp,
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    ) -> Vec<String> {
+        assert!(bench.render_to_terminal(terminal).is_ok());
+        buffer_rows(terminal)
+    }
+
+    fn assert_latest_context_above(rows: &[String], header: &str, latest: &str) {
+        let call = row_of(rows, header);
+        assert!(
+            rows[..call].iter().any(|row| row.contains(latest)),
+            "the latest transcript lines must stay above the review:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    fn context_bench(count: usize) -> super::BenchmarkApp {
+        let mut bench = super::BenchmarkApp::new();
+        for index in 0..count {
+            bench
+                .app
+                .transcript
+                .append_assistant_message(&format!("context {index}"));
+        }
+        bench
+    }
+
+    #[test]
+    fn short_turn_after_archived_scrollback_follows_it_without_a_gap() {
+        let mut bench = super::BenchmarkApp::new();
+        bench.app.transcript.append_user_message("first question");
+        bench
+            .app
+            .transcript
+            .append_assistant_message("first answer");
+        bench.app.set_prompt_text("second question");
+        bench.app.submit_input();
+        assert!(!bench.app.take_scrollback_lines(80).is_empty());
+
+        let mut terminal = inline_terminal(80, 30, 30);
+        let rows = render_rows(&mut bench, &mut terminal);
+
+        let user_row = row_of(&rows, "second question");
+        assert!(
+            user_row <= 1,
+            "the new turn must start directly below the archived scrollback, \
+             but it begins at row {user_row}:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn fresh_session_keeps_first_exchange_next_to_the_composer() {
+        let mut bench = super::BenchmarkApp::new();
+        bench.app.transcript.append_user_message("hello");
+        let mut terminal = inline_terminal(80, 30, 30);
+        let rows = render_rows(&mut bench, &mut terminal);
+
+        let user_row = row_of(&rows, "hello");
+        let composer_row = row_of(&rows, "enter send");
+        assert!(
+            composer_row - user_row < 6,
+            "first exchange should sit by the composer:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn resumed_session_starts_next_to_the_composer_after_archived_scrollback() {
+        let mut bench = super::BenchmarkApp::new();
+        bench.app.transcript.append_user_message("old question");
+        bench.app.transcript.append_assistant_message("old answer");
+        bench.app.set_prompt_text("follow up");
+        bench.app.submit_input();
+        assert!(!bench.app.take_scrollback_lines(80).is_empty());
+
+        bench
+            .app
+            .hydrate_transcript_from_session_messages(&[session_message(
+                "user",
+                "entry-1",
+                "resumed question",
+            )]);
+        let mut terminal = inline_terminal(80, 30, 30);
+        let rows = render_rows(&mut bench, &mut terminal);
+
+        let user_row = row_of(&rows, "resumed question");
+        let composer_row = row_of(&rows, "enter send");
+        assert!(
+            composer_row - user_row < 6,
+            "a resumed session should sit by the composer, not under stale scrollback:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn pending_review_stays_visible_when_terminal_is_taller_than_the_inline_viewport() {
+        let mut bench = context_bench(60);
+        // The inline viewport was created when the terminal was 30 rows tall;
+        // the terminal has since grown to 50 rows.
+        let mut terminal = inline_terminal(80, 50, 30);
+        render_rows(&mut bench, &mut terminal);
+        request_review(&mut bench, 6);
+        let rows = render_rows(&mut bench, &mut terminal);
+
+        assert!(row_of(&rows, "Approve") < row_of(&rows, "Enter confirm"));
+        assert_latest_context_above(&rows, "create_text_file", "context 59");
+    }
+
+    #[test]
+    fn oversized_review_keeps_controls_and_recent_context_visible() {
+        let mut bench = context_bench(60);
+        let mut terminal = inline_terminal(80, 40, 40);
+        render_rows(&mut bench, &mut terminal);
+        request_review(&mut bench, 300);
+        let rows = render_rows(&mut bench, &mut terminal);
+
+        assert!(row_of(&rows, "more diff lines") < row_of(&rows, "Approve"));
+        assert_latest_context_above(&rows, "create_text_file", "context 59");
+        assert!(
+            row_index(&rows, "+line 250").is_none(),
+            "the full diff must stay collapsed until requested"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_expands_and_recollapses_a_pending_review_diff() {
+        let mut bench = super::BenchmarkApp::new();
+        let mut terminal = inline_terminal(80, 40, 40);
+        request_review(&mut bench, 60);
+        let rows = render_rows(&mut bench, &mut terminal);
+        assert!(row_index(&rows, "more diff lines").is_some());
+
+        bench
+            .app
+            .handle_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let rows = render_rows(&mut bench, &mut terminal);
+        assert!(row_index(&rows, "more diff lines").is_none());
+        row_of(&rows, "+line 59");
+        row_of(&rows, "Enter confirm");
+
+        bench
+            .app
+            .handle_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let rows = render_rows(&mut bench, &mut terminal);
+        assert!(row_index(&rows, "more diff lines").is_some());
     }
 }

@@ -403,7 +403,7 @@ impl Transcript {
                 status: ToolReviewRowStatus::Pending,
                 selected: ToolReviewDecision::Approve,
             });
-            entry.expanded = true;
+            entry.expanded = false;
             self.bump_revision();
         }
     }
@@ -552,17 +552,13 @@ impl Transcript {
     }
 
     pub fn toggle_tool_details(&mut self) {
-        let expand = self.entries.iter().any(|entry| {
-            matches!(entry.kind, EntryKind::ToolResult { .. })
-                && (entry.detail.is_some() || entry.review.is_some())
-                && !entry.expanded
-        });
+        let expand = self
+            .entries
+            .iter()
+            .any(|entry| has_expandable_details(entry) && !entry.expanded);
         let mut changed = false;
         for entry in &mut self.entries {
-            if matches!(entry.kind, EntryKind::ToolResult { .. })
-                && (entry.detail.is_some() || entry.review.is_some())
-                && entry.expanded != expand
-            {
+            if has_expandable_details(entry) && entry.expanded != expand {
                 entry.expanded = expand;
                 changed = true;
             }
@@ -625,6 +621,20 @@ fn review_correlation_ids(payload: &ToolReviewPayload) -> (&str, &str) {
     }
 }
 
+/// Rows whose Ctrl+O state changes what is rendered: finished tool results
+/// with captured detail or review history, and pending reviews (whose full
+/// diff is collapsed by default).
+fn has_expandable_details(entry: &TranscriptEntry) -> bool {
+    match &entry.kind {
+        EntryKind::ToolResult { .. } => entry.detail.is_some() || entry.review.is_some(),
+        EntryKind::ToolCall { .. } => entry
+            .review
+            .as_ref()
+            .is_some_and(|review| matches!(review.status, ToolReviewRowStatus::Pending)),
+        _ => false,
+    }
+}
+
 fn review_status_label(status: ToolReviewRowStatus) -> &'static str {
     match status {
         ToolReviewRowStatus::Pending => "pending",
@@ -639,14 +649,46 @@ fn review_status_label(status: ToolReviewRowStatus) -> &'static str {
     }
 }
 
-fn review_detail(review: &ToolReviewRow) -> String {
+/// Diff lines shown in a pending review row before the rest is collapsed
+/// behind Ctrl+O. Large enough to judge a typical edit, small enough that the
+/// decision controls and the latest transcript context stay on screen.
+const REVIEW_DIFF_PREVIEW_LINES: usize = 12;
+/// Longest collapsed diff line; a single minified line would otherwise wrap
+/// into hundreds of rows and push the controls out of the viewport.
+const REVIEW_DIFF_LINE_MAX_CHARS: usize = 160;
+
+fn review_diff_lines(diff: &str, show_all: bool) -> Vec<String> {
+    let total = diff.lines().count();
+    if show_all || total == 0 {
+        return vec![diff.to_owned()];
+    }
+    let mut lines: Vec<String> = diff
+        .lines()
+        .take(REVIEW_DIFF_PREVIEW_LINES)
+        .map(
+            |line| match line.char_indices().nth(REVIEW_DIFF_LINE_MAX_CHARS) {
+                Some((end, _)) => format!("{}…", &line[..end]),
+                None => line.to_owned(),
+            },
+        )
+        .collect();
+    if total > REVIEW_DIFF_PREVIEW_LINES {
+        lines.push(format!(
+            "… {} more diff lines · Ctrl+O to show all",
+            total - REVIEW_DIFF_PREVIEW_LINES
+        ));
+    }
+    lines
+}
+
+fn review_detail(review: &ToolReviewRow, show_full_diff: bool) -> String {
     let mut lines = vec![format!("Review: {}", review_status_label(review.status))];
     match &review.payload {
         ToolReviewPayload::LocalEdit { preview } => {
             lines.push(format!("Path: {}", preview.path));
             lines.push(format!("Operation: {}", preview.operation));
             lines.push(String::from("Diff:"));
-            lines.push(preview.diff_summary.clone());
+            lines.extend(review_diff_lines(&preview.diff_summary, show_full_diff));
             if preview.diff_summary_truncated {
                 lines.push(String::from("[diff summary truncated]"));
             }
@@ -701,7 +743,7 @@ fn entry_display_text(entry: &TranscriptEntry) -> String {
             }
             if let Some(review) = &entry.review {
                 if matches!(review.status, ToolReviewRowStatus::Pending) {
-                    sections.push(review_detail(review));
+                    sections.push(review_detail(review, entry.expanded));
                 } else {
                     sections.push(format!("Review: {}", review_status_label(review.status)));
                 }
@@ -714,7 +756,7 @@ fn entry_display_text(entry: &TranscriptEntry) -> String {
                 sections.push(format!("Call: {}", entry.call_preview));
             }
             if let Some(review) = &entry.review {
-                sections.push(review_detail(review));
+                sections.push(review_detail(review, true));
             }
             if let Some(detail) = &entry.detail {
                 sections.push(format!("Output:\n{detail}"));
@@ -842,6 +884,7 @@ impl TranscriptRenderCache {
         transcript: &Transcript,
         scroll_offset: usize,
         is_streaming: bool,
+        alignment: TranscriptAlignment,
     ) {
         self.ensure(transcript, area.width);
         render_cached_lines(
@@ -850,9 +893,24 @@ impl TranscriptRenderCache {
             &self.lines,
             scroll_offset,
             is_streaming,
+            alignment,
             &self.theme,
         );
     }
+}
+
+/// Where a transcript shorter than its viewport sits inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptAlignment {
+    /// Pin the content to the composer. Right for a fresh or resumed
+    /// session, where nothing of ours sits above the viewport and the first
+    /// exchange reads best next to the input.
+    Bottom,
+    /// Start at the viewport's first row. Required once earlier turns were
+    /// moved into terminal scrollback with `insert_before`: that history ends
+    /// right above the viewport, so bottom padding would open a blank gap
+    /// between the previous reply and the new turn.
+    Top,
 }
 
 pub fn render(
@@ -862,8 +920,16 @@ pub fn render(
     cache: &mut TranscriptRenderCache,
     scroll_offset: usize,
     is_streaming: bool,
+    alignment: TranscriptAlignment,
 ) {
-    cache.render(area, buf, transcript, scroll_offset, is_streaming);
+    cache.render(
+        area,
+        buf,
+        transcript,
+        scroll_offset,
+        is_streaming,
+        alignment,
+    );
 }
 
 #[cfg(test)]
@@ -881,6 +947,7 @@ fn render_uncached(
         &lines,
         scroll_offset,
         is_streaming,
+        TranscriptAlignment::Bottom,
         &Theme::default(),
     );
 }
@@ -890,6 +957,7 @@ fn render_cached_lines(
     lines: &[Line<'static>],
     scroll_offset: usize,
     is_streaming: bool,
+    alignment: TranscriptAlignment,
     theme: &Theme,
 ) {
     let total_lines = lines.len();
@@ -901,7 +969,12 @@ fn render_cached_lines(
         .cloned()
         .collect();
 
-    let top_padding = bottom_aligned_top_padding(visible.len(), area.height as usize);
+    let top_padding = match alignment {
+        TranscriptAlignment::Bottom => {
+            bottom_aligned_top_padding(visible.len(), area.height as usize)
+        }
+        TranscriptAlignment::Top => 0,
+    };
     if top_padding > 0 {
         let mut padded = Vec::with_capacity(top_padding + visible.len());
         padded.extend(std::iter::repeat_with(|| Line::raw("")).take(top_padding));
@@ -1311,9 +1384,9 @@ fn bottom_aligned_top_padding(visible_lines: usize, viewport_height: usize) -> u
 mod tests {
     use super::{
         EntryKind, HarnessOutcomeKind, STREAM_TAIL_MAX_LINES, ToolReviewRowStatus, Transcript,
-        TranscriptRenderCache, bottom_aligned_top_padding, char_boundary_at_or_before,
-        entry_display_text, harness_outcome_style, render_lines, render_lines_with_theme,
-        render_uncached, wrap_text,
+        TranscriptAlignment, TranscriptRenderCache, bottom_aligned_top_padding,
+        char_boundary_at_or_before, entry_display_text, harness_outcome_style, render_lines,
+        render_lines_with_theme, render_uncached, wrap_text,
     };
     use crate::theme::Theme;
     use ratatui::buffer::Buffer;
@@ -1674,7 +1747,14 @@ mod tests {
 
         let mut cached = Buffer::empty(area);
         let mut cache = TranscriptRenderCache::new();
-        cache.render(area, &mut cached, &transcript, 1, false);
+        cache.render(
+            area,
+            &mut cached,
+            &transcript,
+            1,
+            false,
+            TranscriptAlignment::Bottom,
+        );
 
         assert_eq!(cached, uncached);
     }

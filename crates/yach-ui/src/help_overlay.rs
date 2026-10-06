@@ -62,7 +62,7 @@ impl Widget for HelpOverlay<'_> {
             Line::from("  Ctrl+T      Thinking selector"),
             Line::from("  Ctrl+F      Clone current branch after at least one message"),
             Line::from("  Ctrl+P      Performance overlay"),
-            Line::from("  Ctrl+O      Expand or collapse finished tool rows"),
+            Line::from("  Ctrl+O      Expand or collapse tool rows and review diffs"),
             Line::from("  j/k or ↑/↓ Move in selectors"),
             Line::from("  PageUp/Down Scroll transcript"),
             Line::from("  Mouse wheel Scroll transcript"),
