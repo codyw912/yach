@@ -2470,6 +2470,9 @@ impl App {
         let matches = match_slash_commands(&prefix);
 
         match (key, modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.handle_normal_key(key, modifiers);
+            }
             (KeyCode::Esc, _) => {
                 self.mode = AppMode::Normal;
             }
@@ -8047,6 +8050,66 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(app.backend_busy());
         assert_ne!(app.status_message, "cancelling prompt...");
+    }
+
+    #[test]
+    fn ctrl_c_with_slash_popup_open_cancels_streaming_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(cancellable_native_connected_event());
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: String::from("turn_start"),
+        });
+        for ch in "/sta".chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        assert!(matches!(app.mode, AppMode::SlashComplete { .. }));
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::PromptCancelled {
+                session_id: String::from("default"),
+            })
+        );
+        assert_eq!(app.status_message, "cancelling prompt...");
+        assert_eq!(app.prompt_text(), "/sta");
+    }
+
+    #[test]
+    fn ctrl_c_with_slash_popup_open_cancels_running_reviewed_tool() {
+        let (mut app, mut rx) = busy_app_with_submitted_local_edit_review();
+        for ch in "/sta".chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        assert!(matches!(app.mode, AppMode::SlashComplete { .. }));
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ClientEvent::PromptCancelled {
+                session_id: String::from("default"),
+            })
+        );
+        assert_eq!(app.status_message, "cancelling prompt...");
+        assert_eq!(app.prompt_text(), "/sta");
+    }
+
+    #[test]
+    fn ctrl_c_with_slash_popup_open_quits_when_idle() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        for ch in "/sta".chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        assert!(matches!(app.mode, AppMode::SlashComplete { .. }));
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert!(app.should_quit);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.prompt_text(), "/sta");
     }
 
     #[test]
