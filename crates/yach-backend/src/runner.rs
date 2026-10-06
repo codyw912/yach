@@ -587,11 +587,13 @@ fn start_connection_model_refresh(
     provider: Option<&ProviderConfig>,
     generation: u64,
     mode: RefreshMode,
-    in_flight: &mut Option<u64>,
+    in_flight: &mut Option<(u64, RefreshMode, bool)>,
     updates: &mpsc::UnboundedSender<(u64, ModelDiscoveryOutcome)>,
 ) {
     debug_assert!(in_flight.is_none());
-    *in_flight = Some(generation);
+    // A refresh started here was requested against the current connection,
+    // so its result may publish. A later mutation clears that flag.
+    *in_flight = Some((generation, mode, true));
 
     let future = runtime.refresh_models(current_connection_model_target(flow, provider), mode);
     let updates = updates.clone();
@@ -601,8 +603,12 @@ fn start_connection_model_refresh(
 }
 
 /// Coalesce a refresh request into at most one active and one pending task.
-/// Every request retires the previous accepted generation immediately, so an
-/// in-flight picker result cannot republish rows after a connection mutation.
+///
+/// `in_flight` is `(generation, mode, publishable)`. A picker request retires
+/// the previous generation but leaves a forced result publishable. A
+/// connection mutation (`invalidate`) also retires it, and clears
+/// `publishable` so a forced report started against the old connection cannot
+/// re-advertise that catalog. Forced intent still wins the pending slot.
 #[expect(
     clippy::too_many_arguments,
     reason = "the generation, in-flight, and pending slots are separate runner-loop locals"
@@ -613,17 +619,24 @@ fn request_connection_model_refresh(
     provider: Option<&ProviderConfig>,
     generation: &mut u64,
     mode: RefreshMode,
-    in_flight: &mut Option<u64>,
+    in_flight: &mut Option<(u64, RefreshMode, bool)>,
     pending: &mut Option<RefreshMode>,
     updates: &mpsc::UnboundedSender<(u64, ModelDiscoveryOutcome)>,
+    invalidate: bool,
 ) {
     *generation = generation.wrapping_add(1);
-    if in_flight.is_some() {
-        // A forced request must not be downgraded by a later normal one.
-        *pending = Some(match (*pending, mode) {
-            (Some(RefreshMode::Forced), _) | (_, RefreshMode::Forced) => RefreshMode::Forced,
+    if let Some((_, in_flight_mode, publishable)) = in_flight {
+        // A forced request must not be downgraded by a later normal one,
+        // including one that arrives while the forced refresh is still running.
+        // A connection mutation invalidates the in-flight catalog either way.
+        let mode = match (*pending, *in_flight_mode, mode) {
+            (Some(RefreshMode::Forced), _, _)
+            | (_, RefreshMode::Forced, _)
+            | (_, _, RefreshMode::Forced) => RefreshMode::Forced,
             _ => RefreshMode::Normal,
-        });
+        };
+        *publishable &= !invalidate;
+        *pending = Some(mode);
         return;
     }
     start_connection_model_refresh(
@@ -693,7 +706,7 @@ struct ConnectionFlowEffectContext<'a> {
     connection_updates: &'a mpsc::UnboundedSender<ConnectionRuntimeUpdate>,
     model_refresh_updates: &'a mpsc::UnboundedSender<(u64, ModelDiscoveryOutcome)>,
     model_refresh_generation: &'a mut u64,
-    model_refresh_in_flight: &'a mut Option<u64>,
+    model_refresh_in_flight: &'a mut Option<(u64, RefreshMode, bool)>,
     model_refresh_pending: &'a mut Option<RefreshMode>,
     activation_generation: &'a mut u64,
     activation_in_flight: &'a mut Option<InFlightModelActivation>,
@@ -760,6 +773,7 @@ fn apply_connection_flow_effects(
                         model_refresh_in_flight,
                         model_refresh_pending,
                         model_refresh_updates,
+                        true,
                     );
                 }
             }
@@ -1422,7 +1436,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
     let mut activation_generation = 0_u64;
     let mut activation_in_flight: Option<InFlightModelActivation> = None;
     let mut connection_model_refresh_generation = 0_u64;
-    let mut connection_model_refresh_in_flight = None;
+    let mut connection_model_refresh_in_flight: Option<(u64, RefreshMode, bool)> = None;
     let mut connection_model_refresh_pending: Option<RefreshMode> = None;
     let mut chatgpt_login: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -1625,11 +1639,21 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 generation,
                 outcome,
             } => {
-                if connection_model_refresh_in_flight != Some(generation) {
+                let Some((in_flight, in_flight_mode, publishable)) =
+                    connection_model_refresh_in_flight
+                else {
+                    continue;
+                };
+                if in_flight != generation {
                     continue;
                 }
                 connection_model_refresh_in_flight = None;
-                if generation == connection_model_refresh_generation {
+                // A later picker request retires this generation, but a forced
+                // report stays publishable. A connection mutation clears that
+                // flag, so its catalog cannot come back. The pending slot
+                // (forced, if either side was) starts immediately after.
+                let current = generation == connection_model_refresh_generation;
+                if current || (publishable && in_flight_mode == RefreshMode::Forced) {
                     match outcome {
                         ModelDiscoveryOutcome::Available(entries) => {
                             publish_connection_catalog(
@@ -2026,6 +2050,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         &mut connection_model_refresh_in_flight,
                         &mut connection_model_refresh_pending,
                         &connection_model_refresh_tx,
+                        false,
                     );
                 } else {
                     if let Some(discovery) = model_discovery.take() {
@@ -30431,6 +30456,72 @@ manual anchored summary"
     }
 
     #[tokio::test]
+    async fn forced_model_refresh_report_survives_a_later_normal_request() {
+        // Regression: a normal picker open must not drop an in-flight forced report.
+        let root = temp_native_provider_root("forced-model-refresh-then-normal");
+        let (first_sender, first_receiver) = oneshot::channel();
+        let (second_sender, second_receiver) = oneshot::channel();
+        let runtime = Arc::new(FakeConnectionRuntime {
+            cached_models: Some(vec![catalog_entry("cached", "Cached", "openai")].into()),
+            refresh_outcomes: Mutex::new(VecDeque::from([first_receiver, second_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            forced_refresh_runner_config(&root, Some(runtime.clone())),
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        // Forced refresh in flight, then the picker reopens (normal). The
+        // forced report — version change and failed steps — must still reach
+        // the user; the normal request only queues the follow-up.
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRefreshRequested)
+                .is_ok()
+        );
+        wait_for_refresh_calls(&runtime, 1).await;
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRequested)
+                .is_ok()
+        );
+        assert!(
+            first_sender
+                .send(ModelDiscoveryOutcome::Forced(ForcedRefreshReport {
+                    entries: vec![catalog_entry("cached", "Cached", "openai")],
+                    warnings: Vec::new(),
+                    codex_version_change: Some((String::from("0.160.0"), String::from("0.162.0"),)),
+                    failed_steps: vec![String::from("release check")],
+                    succeeded_steps: 1,
+                    codex_version: Some(String::from("0.160.0")),
+                }))
+                .is_ok()
+        );
+        status_messages_until(
+            &mut backend_rx,
+            "models refreshed · Codex 0.160.0 → 0.162.0 · release check failed (using 0.160.0)",
+        )
+        .await;
+        wait_for_refresh_calls(&runtime, 2).await;
+        assert_eq!(
+            runtime.recorded_refresh_modes(),
+            vec![crate::RefreshMode::Forced, crate::RefreshMode::Forced],
+            "a normal request must not downgrade a forced refresh already in flight"
+        );
+        assert!(
+            second_sender
+                .send(ModelDiscoveryOutcome::Superseded)
+                .is_ok()
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
     async fn forced_model_refresh_outcome_ends_with_the_forced_status_line() {
         let root = temp_native_provider_root("forced-model-refresh-status");
         let (sender, receiver) = oneshot::channel();
@@ -30480,6 +30571,91 @@ manual anchored summary"
             messages.iter().rev().nth(1).map(String::as_str),
             Some("one provider was skipped"),
             "warnings precede the final status line"
+        );
+        drop(client_tx);
+        assert!(handle.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connection_removal_discards_an_in_flight_forced_refresh_report() {
+        let root = temp_native_provider_root("forced-refresh-retired-by-remove");
+        let connection = stored_ready_connection("Removed");
+        assert!(connection.is_some(), "test connection is valid");
+        let Some(connection) = connection else {
+            return;
+        };
+        let connection_id = connection.id.clone();
+        let (forced_sender, forced_receiver) = oneshot::channel();
+        let (follow_sender, follow_receiver) = oneshot::channel();
+        let (remove_sender, remove_receiver) = oneshot::channel();
+        let runtime = Arc::new(FakeConnectionRuntime {
+            connections: vec![connection],
+            cached_models: Some(vec![connection_catalog_entry(&connection_id)].into()),
+            refresh_outcomes: Mutex::new(VecDeque::from([forced_receiver, follow_receiver])),
+            remove_outcomes: Mutex::new(VecDeque::from([remove_receiver])),
+            ..FakeConnectionRuntime::default()
+        });
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_native_loop(
+            client_rx,
+            backend_tx,
+            forced_refresh_runner_config(&root, Some(runtime.clone())),
+        ));
+
+        assert!(client_tx.send(ClientEvent::FirstRenderCompleted).is_ok());
+        assert!(
+            client_tx
+                .send(ClientEvent::AvailableModelsRefreshRequested)
+                .is_ok()
+        );
+        wait_for_refresh_calls(&runtime, 1).await;
+        start_pending_remove(&client_tx, &mut backend_rx, &connection_id).await;
+        expect_call_count(&runtime.remove_calls, 1, "remove should be started").await;
+        assert!(
+            remove_sender
+                .send(crate::ConnectionMutationOutcome::Succeeded)
+                .is_ok()
+        );
+        expect_status(&mut backend_rx, "connection removed").await;
+
+        assert!(
+            forced_sender
+                .send(ModelDiscoveryOutcome::Forced(ForcedRefreshReport {
+                    entries: vec![connection_catalog_entry(&connection_id)],
+                    warnings: Vec::new(),
+                    codex_version_change: Some((String::from("0.160.0"), String::from("0.162.0"),)),
+                    failed_steps: Vec::new(),
+                    succeeded_steps: 1,
+                    codex_version: None,
+                }))
+                .is_ok()
+        );
+        let republished = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+            loop {
+                if let Some(BackendEvent::Server(ServerEvent::StatusUpdated { message })) =
+                    backend_rx.recv().await
+                    && message.contains("Codex 0.160.0 → 0.162.0")
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            republished.is_err(),
+            "a connection removal must discard the pre-mutation forced catalog"
+        );
+        wait_for_refresh_calls(&runtime, 2).await;
+        assert_eq!(
+            runtime.recorded_refresh_modes(),
+            vec![crate::RefreshMode::Forced, crate::RefreshMode::Forced],
+            "the user's forced refresh must still run after the removal"
+        );
+        assert!(
+            follow_sender
+                .send(ModelDiscoveryOutcome::Superseded)
+                .is_ok()
         );
         drop(client_tx);
         assert!(handle.await.is_ok());

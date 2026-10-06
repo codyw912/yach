@@ -212,27 +212,37 @@ fn next_cache(
 /// is re-evaluated after the lock, so a waiter released by a finished check
 /// returns without refetching.
 pub(crate) fn check_latest_release(mode: CheckMode) -> ReleaseCheck {
-    let _guard = CHECK_LOCK.lock();
+    let Ok(mut memory) = CHECK_LOCK.lock() else {
+        let version = effective_client_version();
+        return ReleaseCheck {
+            after: version.clone(),
+            before: version,
+            failed: true,
+        };
+    };
     let path = release_cache_path();
-    let check = run_release_check_at(path.as_deref(), mode, fetch_latest_release);
+    let check = run_release_check_at(path.as_deref(), mode, fetch_latest_release, &mut memory);
     if let Ok(mut effective) = EFFECTIVE.write() {
         effective.clone_from(&check.after);
     }
     check
 }
 
-static CHECK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CHECK_LOCK: std::sync::Mutex<Option<ReleaseCache>> = std::sync::Mutex::new(None);
 
 /// `check_latest_release` with the cache path and the fetch injected, so
 /// tests exercise the due/persist sequence against a temp file without
 /// `$HOME` mutation, a socket, or touching the effective-version global —
 /// `run_release_check_at` never locks and never publishes; only the
 /// `check_latest_release` wrapper holds `CHECK_LOCK` and writes `EFFECTIVE`,
-/// so check + publication stay serialized.
+/// so check + publication stay serialized. `memory` is that lock's process
+/// cache: the last check this process completed, used when the disk write
+/// did not land.
 fn run_release_check_at(
     path: Option<&Path>,
     mode: CheckMode,
     fetch: fn(Option<&str>) -> Fetched,
+    memory: &mut Option<ReleaseCache>,
 ) -> ReleaseCheck {
     let before = effective_client_version();
     let Some(path) = path else {
@@ -242,11 +252,13 @@ fn run_release_check_at(
             failed: true,
         };
     };
-    let existing = load_release_cache_from(path);
+    let on_disk = load_release_cache_from(path);
+    // Disk is the cross-process cache. This process also remembers the last
+    // check, so an unwritable cache still waits out the interval and a failed
+    // write cannot roll the reported version back to an older disk entry.
+    let existing = newer_release_cache(memory.as_ref(), on_disk.as_ref());
     let now = crate::catalog_refresh::catalog_date_now().1;
     if !release_check_due(existing.as_ref(), now, mode) {
-        // Not due: the answer is still the cache's version, not whatever the
-        // process state happens to hold — publication order can't skew this.
         let after = effective_version(
             yach_catalog::baked_codex_release_version(),
             existing.as_ref().map(|cache| cache.version.as_str()),
@@ -261,6 +273,7 @@ fn run_release_check_at(
     let (next, failed) = next_cache(existing.as_ref(), fetched, now);
     if let Some(next) = &next {
         crate::catalog_refresh::write_json_to(path, next);
+        *memory = Some(next.clone());
     }
     let after = effective_version(
         yach_catalog::baked_codex_release_version(),
@@ -273,6 +286,22 @@ fn run_release_check_at(
     }
 }
 
+/// The cache entry a due-check should trust: the one checked more recently.
+/// Equal timestamps keep the in-process entry, which is the one this process
+/// just observed.
+fn newer_release_cache(
+    memory: Option<&ReleaseCache>,
+    disk: Option<&ReleaseCache>,
+) -> Option<ReleaseCache> {
+    match (memory, disk) {
+        (Some(memory), Some(disk)) if disk.checked_at_unix_ms > memory.checked_at_unix_ms => {
+            Some(disk.clone())
+        }
+        (Some(memory), _) => Some(memory.clone()),
+        (None, disk) => disk.cloned(),
+    }
+}
+
 /// Startup trigger: never blocks the caller.
 pub(crate) fn spawn_release_check_if_due() {
     std::thread::spawn(|| {
@@ -282,7 +311,28 @@ pub(crate) fn spawn_release_check_if_due() {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static UNWRITABLE_FETCH_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    trait TestUnwrap {
+        type Output;
+        fn test_unwrap(self) -> Self::Output;
+    }
+
+    impl<T, E> TestUnwrap for Result<T, E> {
+        type Output = T;
+        fn test_unwrap(self) -> Self::Output {
+            assert!(self.is_ok());
+            match self {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            }
+        }
+    }
 
     fn cache(version: &str, checked_at_unix_ms: u64) -> ReleaseCache {
         ReleaseCache {
@@ -444,7 +494,9 @@ mod tests {
             }
         }
         let path = temp_path();
-        let outcome = run_release_check_at(Some(path.as_path()), CheckMode::Due, failed);
+        let mut memory = None;
+        let outcome =
+            run_release_check_at(Some(path.as_path()), CheckMode::Due, failed, &mut memory);
         assert!(outcome.failed);
         assert!(
             load_release_cache_from(&path).is_some_and(|cache| {
@@ -454,14 +506,20 @@ mod tests {
         );
         // The recorded failure makes the immediate re-check not due, so the
         // release fetch below is skipped.
-        let outcome = run_release_check_at(Some(path.as_path()), CheckMode::Due, release);
+        let outcome =
+            run_release_check_at(Some(path.as_path()), CheckMode::Due, release, &mut memory);
         assert!(!outcome.failed);
         assert_eq!(
             load_release_cache_from(&path).map(|cache| cache.version),
             Some(yach_catalog::baked_codex_release_version().to_owned()),
             "the second check was not due and did not refetch"
         );
-        let outcome = run_release_check_at(Some(path.as_path()), CheckMode::Forced, release);
+        let outcome = run_release_check_at(
+            Some(path.as_path()),
+            CheckMode::Forced,
+            release,
+            &mut memory,
+        );
         assert!(!outcome.failed);
         assert_eq!(
             load_release_cache_from(&path).map(|cache| cache.version),
@@ -469,5 +527,63 @@ mod tests {
             "a forced check refetches and persists the release"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unwritable_cache_still_backs_off_and_keeps_the_version_just_learned() {
+        fn release(_: Option<&str>) -> Fetched {
+            Fetched::Release {
+                tag: String::from("rust-v999.999.0"),
+                version: String::from("999.999.0"),
+                etag: Some(String::from("\"learned\"")),
+            }
+        }
+        fn failed(_: Option<&str>) -> Fetched {
+            UNWRITABLE_FETCH_CALLS.fetch_add(1, Ordering::SeqCst);
+            Fetched::Failed
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "yach-codex-release-unwritable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir).test_unwrap();
+        let path = dir.join("codex-release.json");
+        crate::catalog_refresh::write_json_to(&path, &cache("0.161.0", 1));
+        // 0o500: the file stays readable, but a new temp file in this
+        // directory cannot be created, so the atomic write fails.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).test_unwrap();
+
+        let mut memory = None;
+        let learned = run_release_check_at(
+            Some(path.as_path()),
+            CheckMode::Forced,
+            release,
+            &mut memory,
+        );
+        assert_eq!(
+            learned.after, "999.999.0",
+            "a failed write must not hide the version just fetched"
+        );
+        assert_eq!(
+            load_release_cache_from(&path).map(|cache| cache.version),
+            Some(String::from("0.161.0")),
+            "disk stays at the older cache when the write cannot land"
+        );
+
+        UNWRITABLE_FETCH_CALLS.store(0, Ordering::SeqCst);
+        let again = run_release_check_at(Some(path.as_path()), CheckMode::Due, failed, &mut memory);
+        assert_eq!(
+            UNWRITABLE_FETCH_CALLS.load(Ordering::SeqCst),
+            0,
+            "an unpersisted check must still wait out the failure interval"
+        );
+        assert!(!again.failed);
+        assert_eq!(
+            again.after, "999.999.0",
+            "the follow-up reports the version learned in this process, not the older disk cache"
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).test_unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
