@@ -2,7 +2,9 @@
 
 **Outcome:** plane:YACH-20 (kata `yach#vadv`)
 
-Status: draft for owner review, 2026-10-02.
+Status: draft for owner review, 2026-10-02. Open questions 1-7 resolved by the
+owner on 2026-10-02 and 2026-10-06; a survey of theme engines and bundled named
+palettes remains before planning.
 
 Triggered by dogfooding (plane:YACH-19): successful tool results render as a
 dark green band with gray text. Owner direction, 2026-10-02: "a cohesive
@@ -635,20 +637,22 @@ fixture session under `COLORTERM=truecolor` (`session.tape:14`). Add:
 
 1. ~~**Project themes.**~~ Resolved 2026-10-02: no project-scoped themes (see
    Project themes removed).
-2. **Default theme.** `auto` (COLORFGBG, else dark) as recommended; or keep a
-   fixed `dark`; or default to `system`, which is always legible but paints no
-   user-message surface, weakening Wave 3's conversation hierarchy.
-3. **Compact successes.** Neutral panel for every tool row (proposed), or
-   panel only for rows with output, pending, or error and an unpaneled inline
-   row for compact successes (opencode `InlineTool` shape)?
-4. **`NO_COLOR` vs explicit theme.** `NO_COLOR` always wins (proposed), or let
-   an explicit user theme or `YACH_THEME` override it, as no-color.org permits?
-5. **Extension runtime control.** Is declarative contribution plus user
-   selection enough for the owner's "controllable by extensions", or is a
-   runtime `ui.theme.request` with user confirmation needed in this slice?
-6. **Terminal queries.** Add OSC 10/11 detection (with a ~100 ms cap, before
-   `EventStream` starts) in a follow-up, or stay with `COLORFGBG` only?
-7. **Color depth.** Presets use 24-bit RGB; Wave 3 required degrading cleanly
-   without true color (`2026-08-19-wave3-tui-visual-design.md:108`) but nothing
-   implements it. Add a `COLORTERM`-based downgrade, or point limited-terminal
-   users to `system`?
+2. ~~**Default theme.**~~ Resolved 2026-10-06: `auto` (COLORFGBG, else dark).
+3. ~~**Compact successes.**~~ Resolved 2026-10-06: neutral panel for every
+   tool row.
+4. ~~**`NO_COLOR` vs explicit theme.**~~ Resolved 2026-10-06: `NO_COLOR`
+   always wins.
+5. ~~**Extension runtime control.**~~ Resolved 2026-10-06: declarative
+   contribution plus user selection in this slice; runtime theme requests are
+   deferred.
+6. ~~**Terminal queries.**~~ Resolved 2026-10-06: OSC 10/11 detection is a
+   follow-up; this slice uses `COLORFGBG` only.
+7. ~~**Color depth.**~~ Resolved 2026-10-06: limited-color terminals are
+   pointed to `system` in this slice; automatic 24-bit downgrade is not
+   implemented. Revisit if bundled named palettes make it necessary.
+
+Owner direction, 2026-10-06: popular named palettes (Monokai, Catppuccin,
+Rosé Pine and similar) should be available alongside custom themes, while the
+engine stays minimal and fast. A survey of existing theme engines and palette
+formats precedes the implementation plan and may add a bundled-palette and
+import section to this spec.
