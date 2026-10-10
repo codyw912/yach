@@ -1021,18 +1021,42 @@ fn render_lines_with_theme(
     lines
 }
 
+/// Assistant prose: Markdown rendered after parsing, behind the `• ` gutter
+/// (hanging two-column indent on every later row; blank rows stay empty).
+fn render_assistant_markdown_lines(content: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    const GUTTER_WIDTH: usize = 2;
+    let body_width = usize::from(width).saturating_sub(GUTTER_WIDTH).max(1);
+    let mut body = crate::markdown::render(content, body_width, theme);
+    if body.is_empty() {
+        body.push(Line::raw(""));
+    }
+    body.into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if index > 0 && line.spans.is_empty() {
+                return line;
+            }
+            let gutter = if index == 0 {
+                Span::styled("• ", Style::new().fg(theme.colors.accent))
+            } else {
+                Span::raw("  ")
+            };
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(gutter);
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn render_entry_lines(entry: &TranscriptEntry, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let display_text = entry_display_text(entry);
     let colors = theme.colors;
     let (prefix, continuation, content, content_style, prefix_width) = match &entry.kind {
         EntryKind::UserMessage => return render_user_message_lines(&display_text, width, theme),
-        EntryKind::AssistantText => (
-            Span::styled("• ", Style::new().fg(colors.accent)),
-            Span::raw("  "),
-            display_text,
-            Style::new().fg(colors.text),
-            2,
-        ),
+        EntryKind::AssistantText => {
+            return render_assistant_markdown_lines(&display_text, width, theme);
+        }
         EntryKind::Status => (
             Span::styled("i ", Style::new().fg(colors.accent).bold()),
             Span::raw("  "),
@@ -1771,6 +1795,58 @@ mod tests {
         transcript.append_user_message("another line");
         let after_mutation = cache.max_scroll_start(&transcript, 80, 1);
         assert!(after_mutation > wider);
+    }
+
+    #[test]
+    fn assistant_markdown_renders_without_delimiters_and_keeps_raw_content() {
+        let raw = "# Title\n\nsome **bold** and `code`\n\n- one\n- two";
+        let mut transcript = Transcript::new();
+        transcript.append_delta(raw);
+
+        let lines = render_lines(transcript.entries(), 40);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "• Title",
+                "",
+                "  some bold and code",
+                "",
+                "  - one",
+                "  - two"
+            ]
+        );
+        let bold = lines[2].spans.iter().find(|span| span.content == "bold");
+        assert!(bold.is_some_and(|span| {
+            span.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        }));
+        assert_eq!(transcript.entries()[0].content, raw);
+    }
+
+    #[test]
+    fn assistant_markdown_wrapped_lines_keep_hanging_gutter() {
+        let mut transcript = Transcript::new();
+        transcript.append_delta("alpha beta gamma delta");
+        let text: Vec<String> = render_lines(transcript.entries(), 12)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(text, ["• alpha beta", "  gamma", "  delta"]);
     }
 
     #[test]
