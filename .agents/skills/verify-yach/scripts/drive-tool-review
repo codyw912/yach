@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# In review mode a bash request waits for the user. Approving runs it and
+# shows its output; rejecting leaves the workspace untouched and tells the
+# model the user declined.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+ev=$("$tty" evidence-dir yach)
+ws="$state/run/workspace"
+
+# Approve.
+"$tty" stop "$session"
+reset_run
+printf 'one\ntwo\nthree\n' > "$ws/notes.txt"
+write_script "$(bash_round 'wc -l notes.txt')" "$(text_round 'Counted the lines.')"
+start_tui
+"$tty" send "$session" "count the lines"
+"$tty" wait "$session" 'Approve once' 15
+capture "$ev/01-review-pending.txt"
+expect "$ev/01-review-pending.txt" 'Review: pending'
+expect "$ev/01-review-pending.txt" 'Command: wc -l notes\.txt'
+"$tty" keys "$session" Enter
+"$tty" wait "$session" 'Counted the lines\.' 15
+capture "$ev/02-approved.txt"
+expect "$ev/02-approved.txt" 'review approved'
+expect "$ev/02-approved.txt" '3 notes\.txt'
+"$tty" stop "$session"
+
+# Reject: the third option. The file must survive.
+reset_run
+printf 'keep me\n' > "$ws/notes.txt"
+write_script "$(bash_round 'rm notes.txt')" "$(text_round 'Left the file alone.')"
+start_tui
+"$tty" send "$session" "delete the notes"
+"$tty" wait "$session" 'Approve once' 15
+"$tty" keys "$session" Down Down
+"$tty" wait "$session" '› Reject' 5
+"$tty" keys "$session" Enter
+"$tty" wait "$session" 'Left the file alone\.' 15
+capture "$ev/03-rejected.txt"
+expect "$ev/03-rejected.txt" 'review rejected'
+expect "$ev/03-rejected.txt" 'user_rejected'
+[[ -f "$ws/notes.txt" ]] || { echo "drive-tool-review: rejected rm still deleted notes.txt" >&2; exit 1; }
+echo "notes.txt present after reject: $(cat "$ws/notes.txt")" > "$ev/04-workspace.txt"
+
+"$tty" stop "$session"
+echo "$ev"

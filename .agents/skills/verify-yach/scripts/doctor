@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Preflight: every tool and build product launch and the drive scripts need.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+fail=0
+need() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "doctor: missing $1. $2" >&2
+    fail=1
+  fi
+}
+need tmux "Install tmux (the driver runs yach in a private tmux server)."
+need jq "Install jq (reply scripts and headless output are JSON)."
+need just "Install just; builds go through the project's justfile."
+need devenv "Install devenv; 'just dev' enters the project shell."
+[[ $fail -eq 0 ]] || exit 1
+
+if ! (cd "$root" && just dev cargo --version >/dev/null 2>&1); then
+  echo "doctor: 'just dev cargo --version' failed. Fix the devenv shell (run 'devenv shell' in $root and read its error)." >&2
+  exit 1
+fi
+
+if ! build_yach; then
+  echo "doctor: building yach with --features bench failed. Run 'just dev cargo build -p yach --features bench' in $root and fix the error." >&2
+  exit 1
+fi
+bin=$(yach_bin)
+[[ -x "$bin" ]] || { echo "doctor: built binary not found at $bin" >&2; exit 1; }
+echo "doctor: ok ($bin)"
