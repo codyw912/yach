@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
@@ -78,6 +80,16 @@ pub struct TranscriptEntry {
     /// Bounded tail of live output while a tool call runs; cleared when the
     /// call finishes (the result summary replaces it).
     pub stream_tail: String,
+    /// Render identity. Every entry gets a process-unique stamp when created
+    /// and a fresh one on every in-place change, so two entries with equal
+    /// stamps render identically. `TranscriptRenderCache` reuses lines on it.
+    stamp: u64,
+}
+
+static NEXT_ENTRY_STAMP: AtomicU64 = AtomicU64::new(1);
+
+fn next_entry_stamp() -> u64 {
+    NEXT_ENTRY_STAMP.fetch_add(1, Ordering::Relaxed)
 }
 
 impl TranscriptEntry {
@@ -90,7 +102,14 @@ impl TranscriptEntry {
             detail: None,
             expanded: false,
             review: None,
+            stamp: next_entry_stamp(),
         }
+    }
+
+    /// Mark this entry changed. Every in-place mutation must call it, or the
+    /// render cache keeps showing the old lines.
+    fn touch(&mut self) {
+        self.stamp = next_entry_stamp();
     }
 }
 
@@ -104,6 +123,7 @@ impl Transcript {
             && matches!(last.kind, EntryKind::AssistantText)
         {
             last.content.push_str(delta);
+            last.touch();
             self.bump_revision();
             return;
         }
@@ -162,6 +182,7 @@ impl Transcript {
             self.entries.truncate(first_touched);
         } else {
             self.entries[first_touched].content.truncate(keep);
+            self.entries[first_touched].touch();
             self.entries.truncate(first_touched + 1);
         }
         self.bump_revision();
@@ -222,6 +243,7 @@ impl Transcript {
         };
         entry.stream_tail.push_str(chunk);
         trim_to_last_lines(&mut entry.stream_tail, STREAM_TAIL_MAX_LINES);
+        entry.touch();
         self.bump_revision();
     }
 
@@ -367,6 +389,7 @@ impl Transcript {
             is_error,
             outcome_kind,
         };
+        entry.touch();
         self.bump_revision();
         true
     }
@@ -404,6 +427,7 @@ impl Transcript {
                 selected: ToolReviewDecision::Approve,
             });
             entry.expanded = false;
+            entry.touch();
             self.bump_revision();
         }
     }
@@ -425,6 +449,7 @@ impl Transcript {
         };
         review.status = ToolReviewRowStatus::Resolved(resolution);
         entry.expanded = false;
+        entry.touch();
         self.bump_revision();
         true
     }
@@ -480,16 +505,20 @@ impl Transcript {
     }
 
     pub fn select_pending_review(&mut self, decision: ToolReviewDecision) {
-        let Some(review) = self.entries.iter_mut().rev().find_map(|entry| {
+        let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
             entry
                 .review
-                .as_mut()
-                .filter(|review| matches!(review.status, ToolReviewRowStatus::Pending))
+                .as_ref()
+                .is_some_and(|review| matches!(review.status, ToolReviewRowStatus::Pending))
         }) else {
+            return;
+        };
+        let Some(review) = entry.review.as_mut() else {
             return;
         };
         if review.selected != decision {
             review.selected = decision;
+            entry.touch();
             self.bump_revision();
         }
     }
@@ -528,6 +557,7 @@ impl Transcript {
         review.selected = decision;
         review.status = ToolReviewRowStatus::Submitted(decision);
         entry.expanded = false;
+        entry.touch();
         self.bump_revision();
         Some(submission)
     }
@@ -543,6 +573,7 @@ impl Transcript {
             {
                 review.status = ToolReviewRowStatus::Resolved(ToolReviewResolution::Interrupted);
                 entry.expanded = false;
+                entry.touch();
                 changed = true;
             }
         }
@@ -560,6 +591,7 @@ impl Transcript {
         for entry in &mut self.entries {
             if has_expandable_details(entry) && entry.expanded != expand {
                 entry.expanded = expand;
+                entry.touch();
                 changed = true;
             }
         }
@@ -834,13 +866,32 @@ fn collapsed_tool_output(name: &str, summary: &str, detail: Option<&str>) -> Opt
     }
 }
 
+/// Rendered transcript, kept per entry so a change re-renders only the
+/// entries whose stamp changed. Streaming one assistant reply therefore
+/// re-parses that reply's Markdown alone, not the whole history.
 #[derive(Debug, Default)]
 pub struct TranscriptRenderCache {
     width: u16,
     revision: u64,
     entries_len: usize,
     theme: Theme,
+    entries: Vec<CachedEntry>,
+    total_lines: usize,
+}
+
+#[derive(Debug)]
+struct CachedEntry {
+    stamp: u64,
+    /// First row of this entry's leading gap in the flattened transcript.
+    start: usize,
+    gap: usize,
     lines: Vec<Line<'static>>,
+}
+
+impl CachedEntry {
+    fn end(&self) -> usize {
+        self.start + self.gap + self.lines.len()
+    }
 }
 
 impl TranscriptRenderCache {
@@ -859,22 +910,91 @@ impl TranscriptRenderCache {
 
     pub fn ensure(&mut self, transcript: &Transcript, width: u16) {
         let width = width.max(1);
+        let entries = transcript.entries();
         if self.width == width
             && self.revision == transcript.revision()
-            && self.entries_len == transcript.entries().len()
+            && self.entries_len == entries.len()
         {
             return;
         }
-
+        if self.width != width {
+            self.entries.clear();
+        }
         self.width = width;
         self.revision = transcript.revision();
-        self.entries_len = transcript.entries().len();
-        self.lines = render_lines_with_theme(transcript.entries(), width, &self.theme);
+        self.entries_len = entries.len();
+
+        // Transcripts only grow at the end, lose a prefix (`drain_prefix_lines`)
+        // or a suffix, and change entries in place. Aligning on the first
+        // entry's stamp covers all of them; a stamp mismatch re-renders.
+        let dropped = entries
+            .first()
+            .and_then(|first| {
+                self.entries
+                    .iter()
+                    .position(|cached| cached.stamp == first.stamp)
+            })
+            .unwrap_or(0);
+        self.entries.drain(..dropped);
+        self.entries.truncate(entries.len());
+
+        let mut previous_kind: Option<&EntryKind> = None;
+        let mut total = 0;
+        for (index, entry) in entries.iter().enumerate() {
+            let gap = match previous_kind {
+                _ if total == 0 => 0,
+                Some(previous) if is_tool_entry(previous) && is_tool_entry(&entry.kind) => {
+                    usize::from(self.theme.spacing.tool_gap)
+                }
+                _ => 1,
+            };
+            match self.entries.get_mut(index) {
+                Some(cached) if cached.stamp == entry.stamp => {}
+                Some(cached) => {
+                    cached.stamp = entry.stamp;
+                    cached.lines = render_entry_lines(entry, width, &self.theme);
+                }
+                None => self.entries.push(CachedEntry {
+                    stamp: entry.stamp,
+                    start: 0,
+                    gap: 0,
+                    lines: render_entry_lines(entry, width, &self.theme),
+                }),
+            }
+            if let Some(cached) = self.entries.get_mut(index) {
+                cached.start = total;
+                cached.gap = gap;
+                total = cached.end();
+            }
+            previous_kind = Some(&entry.kind);
+        }
+        self.total_lines = total;
     }
 
     pub fn max_scroll_start(&mut self, transcript: &Transcript, width: u16, height: u16) -> usize {
         self.ensure(transcript, width);
-        self.lines.len().saturating_sub(height as usize)
+        self.total_lines.saturating_sub(height as usize)
+    }
+
+    /// Clone rows `start..start + count` of the flattened transcript.
+    fn visible_lines(&self, start: usize, count: usize) -> Vec<Line<'static>> {
+        let end = start.saturating_add(count).min(self.total_lines);
+        let mut visible = Vec::with_capacity(end.saturating_sub(start));
+        let first = self.entries.partition_point(|cached| cached.end() <= start);
+        for cached in self.entries.iter().skip(first) {
+            if cached.start >= end {
+                break;
+            }
+            for row in cached.start.max(start)..cached.end().min(end) {
+                let offset = row - cached.start;
+                if offset < cached.gap {
+                    visible.push(Line::raw(""));
+                } else if let Some(line) = cached.lines.get(offset - cached.gap) {
+                    visible.push(line.clone());
+                }
+            }
+        }
+        visible
     }
 
     pub fn render(
@@ -887,15 +1007,10 @@ impl TranscriptRenderCache {
         alignment: TranscriptAlignment,
     ) {
         self.ensure(transcript, area.width);
-        render_cached_lines(
-            area,
-            buf,
-            &self.lines,
-            scroll_offset,
-            is_streaming,
-            alignment,
-            &self.theme,
-        );
+        let height = area.height as usize;
+        let start = scroll_offset.min(self.total_lines.saturating_sub(height));
+        let visible = self.visible_lines(start, height);
+        paint_lines(area, buf, visible, is_streaming, alignment, &self.theme);
     }
 }
 
@@ -941,34 +1056,27 @@ fn render_uncached(
     is_streaming: bool,
 ) {
     let lines = render_lines(entries, area.width);
-    render_cached_lines(
+    let height = area.height as usize;
+    let start = scroll_offset.min(lines.len().saturating_sub(height));
+    let visible = lines.into_iter().skip(start).take(height).collect();
+    paint_lines(
         area,
         buf,
-        &lines,
-        scroll_offset,
+        visible,
         is_streaming,
         TranscriptAlignment::Bottom,
         &Theme::default(),
     );
 }
-fn render_cached_lines(
+
+fn paint_lines(
     area: ratatui::layout::Rect,
     buf: &mut ratatui::buffer::Buffer,
-    lines: &[Line<'static>],
-    scroll_offset: usize,
+    mut visible: Vec<Line<'static>>,
     is_streaming: bool,
     alignment: TranscriptAlignment,
     theme: &Theme,
 ) {
-    let total_lines = lines.len();
-    let start = scroll_offset.min(total_lines.saturating_sub(area.height as usize));
-    let mut visible: Vec<Line<'_>> = lines
-        .iter()
-        .skip(start)
-        .take(area.height as usize)
-        .cloned()
-        .collect();
-
     let top_padding = match alignment {
         TranscriptAlignment::Bottom => {
             bottom_aligned_top_padding(visible.len(), area.height as usize)
@@ -1795,6 +1903,113 @@ mod tests {
         transcript.append_user_message("another line");
         let after_mutation = cache.max_scroll_start(&transcript, 80, 1);
         assert!(after_mutation > wider);
+    }
+
+    /// One persistent cache must paint exactly what a full render paints
+    /// after every kind of transcript change: in-place edits, suffix
+    /// truncation, prefix drain, width change, and clear. A mutation that
+    /// forgets `touch()` leaves stale lines and fails here.
+    #[test]
+    fn persistent_render_cache_matches_full_render_after_every_mutation() {
+        type Step = fn(&mut Transcript);
+        fn begin_review(t: &mut Transcript, id: &str) {
+            t.begin_tool_review(
+                id,
+                "bash",
+                ToolReviewPayload::Command {
+                    command: CommandReviewSummary {
+                        review_id: format!("review-{id}"),
+                        permission_decision_id: format!("permission-{id}"),
+                        command: String::from("cargo test"),
+                        workdir: None,
+                        timeout_ms: 1_000,
+                        review_origin: None,
+                    },
+                },
+            );
+        }
+        let steps: [(&str, Step); 21] = [
+            ("user", |t| {
+                t.append_user_message("question one wraps across the narrow width");
+            }),
+            ("delta", |t| t.append_delta("# Heading\n\nsome **bold**")),
+            ("delta grows", |t| {
+                t.append_delta(" text and\n\n- item\n- item two");
+            }),
+            ("tool call", |t| {
+                t.append_tool_call(Some("c1"), "bash", Some("cargo test"));
+            }),
+            ("tool output", |t| {
+                t.append_tool_call_output("c1", "line one\nline two\n");
+            }),
+            ("review", |t| begin_review(t, "c1")),
+            ("toggle pending review", Transcript::toggle_tool_details),
+            ("select", |t| {
+                t.select_pending_review(ToolReviewDecision::Reject);
+            }),
+            ("submit", |t| {
+                let _ = t.submit_pending_review();
+            }),
+            ("resolve", |t| {
+                let _ = t.resolve_tool_review("c1", ToolReviewResolution::Rejected);
+            }),
+            ("finish", |t| {
+                let _ = t.finish_tool_call(Some("c1"), "bash", "bash", "exit 0", false);
+            }),
+            ("toggle open", Transcript::toggle_tool_details),
+            ("toggle closed", Transcript::toggle_tool_details),
+            ("tool result", |t| {
+                t.append_tool_result(Some("c2"), "Read", "ok", false);
+            }),
+            ("status", |t| t.append_status("status line")),
+            ("delta again", |t| {
+                t.append_delta("tail reply that is long enough to wrap");
+            }),
+            ("truncate suffix", |t| {
+                let _ = t.truncate_assistant_suffix_bytes(5);
+            }),
+            ("drain prefix", |t| {
+                let _ = t.drain_prefix_lines(2, 30, &Theme::default());
+            }),
+            ("error", |t| t.append_error("boom")),
+            ("second review", |t| begin_review(t, "c3")),
+            ("interrupt review", Transcript::interrupt_pending_reviews),
+        ];
+
+        let mut transcript = Transcript::new();
+        // One cache per width, each kept across every step, so entries are
+        // actually reused. A shared cache would be cleared by each width
+        // switch and never exercise reuse. `resized` alternates widths to
+        // cover the width-change path.
+        let mut caches = [
+            (30, TranscriptRenderCache::new()),
+            (18, TranscriptRenderCache::new()),
+        ];
+        let mut resized = TranscriptRenderCache::new();
+        let mut assert_matches = |transcript: &Transcript, label: &str| {
+            for (width, cache) in &mut caches {
+                let width = *width;
+                let total = render_lines(transcript.entries(), width).len();
+                for scroll in [0, 1, total.saturating_sub(6), usize::MAX] {
+                    let area = Rect::new(0, 0, width, 6);
+                    let mut expected = Buffer::empty(area);
+                    render_uncached(area, &mut expected, transcript.entries(), scroll, false);
+                    let mut actual = Buffer::empty(area);
+                    let bottom = TranscriptAlignment::Bottom;
+                    cache.render(area, &mut actual, transcript, scroll, false, bottom);
+                    assert_eq!(actual, expected, "{label}: width {width}, scroll {scroll}");
+                    let mut after_resize = Buffer::empty(area);
+                    resized.render(area, &mut after_resize, transcript, scroll, false, bottom);
+                    assert_eq!(after_resize, expected, "{label}: resized to {width}");
+                }
+            }
+        };
+        for (label, step) in steps {
+            step(&mut transcript);
+            assert_matches(&transcript, label);
+        }
+        transcript.clear();
+        assert_matches(&transcript, "clear");
     }
 
     #[test]
