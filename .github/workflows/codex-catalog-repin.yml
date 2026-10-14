@@ -1,0 +1,56 @@
+name: Codex catalog re-pin
+
+# Proposes a PR when a newer stable openai/codex release changes the baked
+# Codex catalog. PRs opened with GITHUB_TOKEN do not trigger pull_request
+# workflows; close and reopen the PR to run CI. Requires the repository
+# setting "Allow GitHub Actions to create and approve pull requests".
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  repin:
+    name: Re-pin baked Codex catalog
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install just
+        uses: extractions/setup-just@v3
+
+      - name: Snapshot latest stable release
+        run: just catalog-codex-snapshot
+
+      # Any PR for the branch, open or closed, suppresses a new one: a PR the
+      # owner closed without merging means "not this release", and pushing
+      # to its branch again would be rejected as non-fast-forward.
+      - name: Open PR when the pin changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- crates/yach-catalog/data; then
+            echo "pin unchanged"; exit 0
+          fi
+          tag="$(cut -d' ' -f1 crates/yach-catalog/data/codex-models.pin)"
+          branch="codex-catalog/${tag}"
+          existing="$(gh pr list --head "$branch" --state all --json number --jq 'length')"
+          if [ "$existing" != "0" ]; then
+            echo "PR for $branch already exists"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add crates/yach-catalog/data
+          git commit -m "Re-pin baked Codex catalog to ${tag}"
+          git push --force-with-lease origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Re-pin baked Codex catalog to ${tag}" \
+            --body "Automated by .github/workflows/codex-catalog-repin.yml. Review the codex-models.json diff. Close and reopen this PR to run CI."

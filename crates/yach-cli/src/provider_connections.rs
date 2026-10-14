@@ -9,10 +9,10 @@ use tokio::task::spawn_blocking;
 use yach_backend::{
     ActiveModelTarget, CatalogModelEntry, ConnectionListOutcome, ConnectionMutationFuture,
     ConnectionMutationOutcome, ConnectionReplacementFuture, ConnectionReplacementOutcome,
-    ConnectionRuntimeFailure, ModelDiscoveryFuture, ModelDiscoveryOutcome,
+    ConnectionRuntimeFailure, ForcedRefreshReport, ModelDiscoveryFuture, ModelDiscoveryOutcome,
     ProviderActivationFuture, ProviderActivationOutcome, ProviderConfig, ProviderConnectionRuntime,
-    authorize_managed_chatgpt, login_chatgpt_subscription, logout_chatgpt_subscription,
-    managed_chatgpt_adapter,
+    RefreshMode, authorize_managed_chatgpt, login_chatgpt_subscription,
+    logout_chatgpt_subscription, managed_chatgpt_adapter,
     model_discovery::{ModelDiscoveryError, discover_provider_models},
     reauth_chatgpt_subscription, relogin_chatgpt_subscription,
     rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig},
@@ -29,9 +29,6 @@ const MAX_SNAPSHOT_ROWS: usize = 4_096;
 const MAX_DISCOVERIES_IN_FLIGHT: usize = 8;
 const CACHE_FRESHNESS_SECONDS: u64 = Duration::from_hours(2).as_secs();
 
-static CODEX_CATALOG_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 type DiscoveryFuture = Pin<
     Box<
         dyn Future<
@@ -42,7 +39,8 @@ type DiscoveryFuture = Pin<
             > + Send,
     >,
 >;
-type ModelDiscoverer = Arc<dyn Fn(Arc<RigProviderAdapterConfig>) -> DiscoveryFuture + Send + Sync>;
+type ModelDiscoverer =
+    Arc<dyn Fn(Arc<RigProviderAdapterConfig>, Option<String>) -> DiscoveryFuture + Send + Sync>;
 /// `~/.yach/connections.json`, using the CLI's shared HOME convention.
 #[must_use]
 pub(crate) fn registry_path() -> Option<PathBuf> {
@@ -210,11 +208,16 @@ struct RuntimeState {
     /// Present only when this runtime owns host-user configuration. Fixture
     /// runtimes remain side-effect free unless a test injects a temp store.
     user_config: Option<yach_backend::UserConfigStore>,
+    /// True only for the real system runtime: `/model` refreshes then run a
+    /// due Codex release check against GitHub. Injected-store runtimes never
+    /// touch the network or the host cache for it.
+    check_codex_release: bool,
 }
 
 struct RuntimeStateOptions {
     defaults: AdapterDefaults,
     user_config: Option<yach_backend::UserConfigStore>,
+    check_codex_release: bool,
     cache_path: Option<PathBuf>,
 }
 
@@ -247,12 +250,12 @@ impl CliProviderConnectionRuntime {
             credentials,
             layers,
             environment,
-            Arc::new(|adapter| {
+            Arc::new(|adapter, client_version| {
                 Box::pin(async move {
                     discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
-                        Some(yach_catalog::baked_codex_protocol_version()),
+                        client_version.as_deref(),
                     )
                     .await
                 })
@@ -260,9 +263,32 @@ impl CliProviderConnectionRuntime {
             RuntimeStateOptions {
                 defaults,
                 user_config: yach_backend::UserConfigStore::for_current_user().ok(),
+                check_codex_release: true,
                 cache_path: model_discovery_cache_path(),
             },
         ))
+    }
+
+    /// True when stored metadata holds a ChatGPT subscription connection.
+    /// Reads metadata only; no credential I/O.
+    #[must_use]
+    pub(crate) fn has_chatgpt_subscription(&self) -> bool {
+        self.state.store.list().is_ok_and(|connections| {
+            connections
+                .iter()
+                .any(|connection| connection.provider == ProviderKind::ChatGptSubscription)
+        })
+    }
+
+    /// Startup hook for the real runtime: when a ChatGPT subscription is
+    /// connected, refresh the advertised Codex `client_version` in the
+    /// background. Never blocks.
+    #[must_use]
+    pub(crate) fn with_codex_release_check(self) -> Self {
+        if self.has_chatgpt_subscription() {
+            crate::codex_release::spawn_release_check_if_due();
+        }
+        self
     }
 
     #[must_use]
@@ -277,12 +303,12 @@ impl CliProviderConnectionRuntime {
             credentials,
             layers,
             environment,
-            Arc::new(|adapter| {
+            Arc::new(|adapter, client_version| {
                 Box::pin(async move {
                     discover_provider_models(
                         &adapter.provider,
                         adapter.timeout,
-                        Some(yach_catalog::baked_codex_protocol_version()),
+                        client_version.as_deref(),
                     )
                     .await
                 })
@@ -307,6 +333,7 @@ impl CliProviderConnectionRuntime {
             RuntimeStateOptions {
                 defaults,
                 user_config: None,
+                check_codex_release: false,
                 cache_path: None,
             },
         )
@@ -331,6 +358,7 @@ impl CliProviderConnectionRuntime {
             RuntimeStateOptions {
                 defaults,
                 user_config: None,
+                check_codex_release: false,
                 cache_path,
             },
         )
@@ -347,6 +375,7 @@ impl CliProviderConnectionRuntime {
         let RuntimeStateOptions {
             defaults,
             user_config,
+            check_codex_release,
             cache_path,
         } = options;
         let discovery_cache = cache_path
@@ -376,6 +405,7 @@ impl CliProviderConnectionRuntime {
                 credential_cache: Arc::new(Mutex::new(CredentialCache::default())),
                 discoverer,
                 user_config,
+                check_codex_release,
             },
         }
     }
@@ -430,7 +460,11 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
         lock_cache(&self.state.cache).snapshot.clone()
     }
 
-    fn refresh_models(&self, active: Option<ActiveModelTarget>) -> ModelDiscoveryFuture {
+    fn refresh_models(
+        &self,
+        active: Option<ActiveModelTarget>,
+        mode: RefreshMode,
+    ) -> ModelDiscoveryFuture {
         let state = self.state.clone();
         let (generation, refresh_generation) = {
             let mut cache = lock_cache(&state.cache);
@@ -449,11 +483,65 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 };
             };
 
+            let has_chatgpt = resolved.connections.iter().any(|connection| {
+                matches!(
+                    connection.adapter.provider,
+                    RigProviderConfig::ChatGptSubscription { .. }
+                )
+            });
+            // The Codex steps (release check, catalog refresh) touch GitHub,
+            // chatgpt.com and the host cache, so only the system runtime
+            // runs them; injected-store runtimes stay hermetic.
+            let codex_steps = state.check_codex_release && has_chatgpt;
+            let mut failed_steps = Vec::new();
+            let mut succeeded_steps = 0_usize;
+            let mut codex_version = None;
+            let mut codex_version_change = None;
+            if codex_steps {
+                // Normal: returns immediately unless the check is due, else
+                // bounded by the check's own timeout. Forced: always checks.
+                // Either way a failure soft-fails to the last known version.
+                let check_mode = match mode {
+                    RefreshMode::Normal => crate::codex_release::CheckMode::Due,
+                    RefreshMode::Forced => crate::codex_release::CheckMode::Forced,
+                };
+                match spawn_blocking(move || crate::codex_release::check_latest_release(check_mode))
+                    .await
+                {
+                    Ok(check) => {
+                        if check.failed {
+                            failed_steps.push(String::from("release check"));
+                        } else {
+                            succeeded_steps += 1;
+                        }
+                        if check.before != check.after {
+                            codex_version_change = Some((check.before, check.after.clone()));
+                        }
+                        codex_version = Some(check.after);
+                    }
+                    Err(_) => failed_steps.push(String::from("release check")),
+                }
+            }
+
             let mut layers = state.layers.clone();
+            if mode == RefreshMode::Forced && codex_steps {
+                let ok = refresh_codex_catalog(&resolved.connections, RefreshMode::Forced).await;
+                match ok {
+                    Some(false) => failed_steps.push(String::from("Codex catalog")),
+                    Some(true) => succeeded_steps += 1,
+                    None => {}
+                }
+            }
             if let Some(cache) = super::catalog_refresh::load_codex_cache() {
                 layers.fetched_codex = Some(cache);
             }
-            let _ = spawn_codex_catalog_refresh(&resolved.connections);
+            if mode == RefreshMode::Normal && has_chatgpt {
+                let connections = resolved.connections.clone();
+                tokio::spawn(async move {
+                    refresh_codex_catalog(&connections, RefreshMode::Normal).await
+                });
+            }
+            let discovered_count = resolved.connections.len();
             let discoverer = state.discoverer.clone();
             let discovery_cache = state.discovery_cache.clone();
             let active_for_discovery = active.clone();
@@ -465,6 +553,7 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                         layers.clone(),
                         discoverer.clone(),
                         discovery_cache.clone(),
+                        mode,
                     )
                 })
                 .buffer_unordered(MAX_DISCOVERIES_IN_FLIGHT)
@@ -473,14 +562,27 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
             let mut warnings = resolved.warnings;
             let mut entries = Vec::new();
             let mut cache_updates = Vec::new();
+            let mut discovery_failures = 0_usize;
             for discovery in discovered {
                 entries.extend(discovery.entries);
                 if let Some(update) = discovery.cache_update {
                     cache_updates.push(update);
                 }
                 if let Some(failure) = discovery.failure {
+                    discovery_failures += 1;
                     warnings.push(failure.status_message().to_owned());
                 }
+            }
+            // Discovery is one step. Rows alone prove nothing — a failed
+            // listing keeps cached and baked fallback rows — so it succeeded
+            // only if some connection listed its models. Any connection
+            // failing, or every stored connection being unusable, is
+            // reported as one bounded "discovery" failure.
+            if discovered_count > discovery_failures {
+                succeeded_steps += 1;
+            }
+            if discovery_failures > 0 || (discovered_count == 0 && !warnings.is_empty()) {
+                failed_steps.push(String::from("discovery"));
             }
             entries.sort_by(|left, right| entry_order(left, right, active.as_ref()));
             let truncated = entries.len() > MAX_SNAPSHOT_ROWS;
@@ -503,11 +605,22 @@ impl ProviderConnectionRuntime for CliProviderConnectionRuntime {
                 let _ = spawn_blocking(move || persist_discovery_cache(&state)).await;
             }
             let entries = snapshot.as_ref().to_vec();
-            if warnings.is_empty() {
-                ModelDiscoveryOutcome::Available(entries)
-            } else {
-                warnings.truncate(MAX_CONNECTIONS + 2);
-                ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings }
+            if warnings.is_empty() && mode == RefreshMode::Normal {
+                return ModelDiscoveryOutcome::Available(entries);
+            }
+            warnings.truncate(MAX_CONNECTIONS + 2);
+            match mode {
+                RefreshMode::Normal => {
+                    ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings }
+                }
+                RefreshMode::Forced => ModelDiscoveryOutcome::Forced(ForcedRefreshReport {
+                    entries,
+                    warnings,
+                    codex_version_change,
+                    failed_steps,
+                    succeeded_steps,
+                    codex_version,
+                }),
             }
         })
     }
@@ -1054,6 +1167,7 @@ fn publish_snapshot_and_cache_updates(
     snapshot: Arc<[CatalogModelEntry]>,
     updates: Vec<(
         ProviderConnection,
+        Option<String>,
         Vec<yach_backend::model_discovery::DiscoveredProviderModel>,
     )>,
 ) -> bool {
@@ -1064,8 +1178,13 @@ fn publish_snapshot_and_cache_updates(
         return false;
     }
     let mut discovery_cache = lock_discovery_cache(&state.discovery_cache);
-    for (connection, models) in updates {
-        discovery_cache.update(&connection, unix_timestamp_seconds(), models);
+    for (connection, client_version, models) in updates {
+        discovery_cache.update(
+            &connection,
+            unix_timestamp_seconds(),
+            client_version,
+            models,
+        );
     }
     availability.snapshot = Some(snapshot);
     true
@@ -1206,6 +1325,7 @@ fn rehydrate_cached_snapshot(
     (!entries.is_empty()).then(|| entries.into())
 }
 
+#[derive(Clone)]
 struct ResolvedConnection {
     connection: ProviderConnection,
     display: String,
@@ -1214,8 +1334,12 @@ struct ResolvedConnection {
 
 struct ConnectionDiscovery {
     entries: Vec<CatalogModelEntry>,
+    /// The discovered rows plus the `client_version` their request sent, so
+    /// publication stamps the request's version rather than a possibly
+    /// advanced effective version.
     cache_update: Option<(
         ProviderConnection,
+        Option<String>,
         Vec<yach_backend::model_discovery::DiscoveredProviderModel>,
     )>,
     failure: Option<ConnectionRuntimeFailure>,
@@ -1227,6 +1351,7 @@ async fn discover_connection_models(
     layers: super::ModelOverrideLayers,
     discoverer: ModelDiscoverer,
     cache: Arc<Mutex<DiscoveryCache>>,
+    mode: RefreshMode,
 ) -> ConnectionDiscovery {
     let active_model = active
         .as_ref()
@@ -1237,7 +1362,7 @@ async fn discover_connection_models(
         CACHE_FRESHNESS_SECONDS,
     );
     let cached = match cached {
-        Some(cached) if cached.fresh => {
+        Some(cached) if cached.fresh && mode == RefreshMode::Normal => {
             return ConnectionDiscovery {
                 entries: catalog_entries_for_connection(
                     &layers,
@@ -1251,32 +1376,35 @@ async fn discover_connection_models(
         }
         cached => cached,
     };
-    let discovered = match discoverer(connection.adapter.clone()).await {
-        Ok(discovered) => discovered,
-        Err(error) => {
-            let mut entries = catalog_entries_for_connection(
-                &layers,
-                &connection.connection,
-                &connection.display,
-                cached.map(|cached| cached.models),
-            );
-            if let Some(active) = active_model
-                && !entries.iter().any(|entry| entry.info.id == active.model)
-            {
-                entries.push(catalog_entry_for_model(
+    let request_client_version =
+        super::model_discovery_cache::listing_client_version(connection.connection.provider);
+    let discovered =
+        match discoverer(connection.adapter.clone(), request_client_version.clone()).await {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                let mut entries = catalog_entries_for_connection(
                     &layers,
                     &connection.connection,
                     &connection.display,
-                    &active.model,
-                ));
+                    cached.map(|cached| cached.models),
+                );
+                if let Some(active) = active_model
+                    && !entries.iter().any(|entry| entry.info.id == active.model)
+                {
+                    entries.push(catalog_entry_for_model(
+                        &layers,
+                        &connection.connection,
+                        &connection.display,
+                        &active.model,
+                    ));
+                }
+                return ConnectionDiscovery {
+                    entries,
+                    cache_update: None,
+                    failure: Some(discovery_failure(error)),
+                };
             }
-            return ConnectionDiscovery {
-                entries,
-                cache_update: None,
-                failure: Some(discovery_failure(error)),
-            };
-        }
-    };
+        };
     let mut entries = catalog_entries_for_connection(
         &layers,
         &connection.connection,
@@ -1296,7 +1424,7 @@ async fn discover_connection_models(
     entries.sort_by(|left, right| left.info.id.cmp(&right.info.id));
     ConnectionDiscovery {
         entries,
-        cache_update: Some((connection.connection, discovered)),
+        cache_update: Some((connection.connection, request_client_version, discovered)),
         failure: None,
     }
 }
@@ -1506,112 +1634,105 @@ fn adapter_for_parts(
     }
 }
 
-/// Returns whether a refresh task was actually spawned, so tests can assert
-/// the no-connection early return without reading the process-global
-/// in-flight flag (which sibling tests legitimately set in parallel).
-fn spawn_codex_catalog_refresh(connections: &[ResolvedConnection]) -> bool {
-    let Some(auth_file) =
+/// Refreshes the Codex catalog cache. `None`: no ChatGPT connection, not
+/// due, or (Normal only) another refresh already running. `Some(true)`:
+/// fetched or 304. `Some(false)`: the fetch or its response failed.
+async fn refresh_codex_catalog(
+    connections: &[ResolvedConnection],
+    mode: RefreshMode,
+) -> Option<bool> {
+    let (auth_file, timeout) =
         connections
             .iter()
             .find_map(|connection| match &connection.adapter.provider {
-                RigProviderConfig::ChatGptSubscription { auth_file } => Some(auth_file.clone()),
+                RigProviderConfig::ChatGptSubscription { auth_file } => {
+                    Some((auth_file.clone(), connection.adapter.timeout))
+                }
                 _ => None,
-            })
-    else {
-        return false;
-    };
-    let client_version = yach_catalog::baked_codex_protocol_version();
+            })?;
+    let _guard = acquire_codex_refresh(&CODEX_CATALOG_REFRESH, mode).await?;
+    // Re-evaluated under the guard: a refresh that just finished may have
+    // made this one redundant (Normal), and a forced waiter must see its
+    // result in the cache it reads.
+    let client_version = crate::codex_release::effective_client_version();
     let existing = super::catalog_refresh::load_codex_cache();
     if !super::catalog_refresh::codex_refresh_due(
         existing.as_ref(),
-        client_version,
+        &client_version,
         super::catalog_refresh::catalog_date_now().1,
+        mode,
     ) {
-        return false;
+        return None;
     }
-    if CODEX_CATALOG_REFRESH_IN_FLIGHT
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        )
-        .is_err()
-    {
-        return false;
-    }
-    let timeout = connections
-        .iter()
-        .find_map(|connection| match &connection.adapter.provider {
-            RigProviderConfig::ChatGptSubscription { .. } => Some(connection.adapter.timeout),
-            _ => None,
-        })
-        .unwrap_or(std::time::Duration::from_secs(10));
     // An ETag from a listing under another client_version would let the
     // backend answer 304 for a different model set.
     let existing_etag = existing
-        .filter(|cache| super::catalog_refresh::codex_cache_matches_version(cache, client_version))
-        .and_then(|cache| cache.etag);
-    tokio::spawn(async move {
-        let _guard = CodexCatalogRefreshGuard;
-        let existing = super::catalog_refresh::load_codex_cache();
-        match yach_backend::model_discovery::fetch_chatgpt_catalog_document(
-            &auth_file,
-            existing_etag.as_deref(),
-            timeout,
-            Some(client_version),
-        )
-        .await
-        {
-            Ok(yach_backend::model_discovery::CodexCatalogDocument::NotModified) => {
-                if let Some(existing) = existing {
-                    let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
-                    super::catalog_refresh::persist_codex_cache(
-                        &super::catalog_refresh::cache_after_not_modified(
-                            &existing, &now_date, checked_at,
-                        ),
-                    );
-                }
+        .as_ref()
+        .filter(|cache| super::catalog_refresh::codex_cache_matches_version(cache, &client_version))
+        .and_then(|cache| cache.etag.clone());
+    match yach_backend::model_discovery::fetch_chatgpt_catalog_document(
+        &auth_file,
+        existing_etag.as_deref(),
+        timeout,
+        Some(client_version.as_str()),
+    )
+    .await
+    {
+        Ok(yach_backend::model_discovery::CodexCatalogDocument::NotModified) => {
+            if let Some(existing) = existing {
+                let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
+                super::catalog_refresh::persist_codex_cache(
+                    &super::catalog_refresh::cache_after_not_modified(
+                        &existing, &now_date, checked_at,
+                    ),
+                );
             }
-            Err(_) => {
+            Some(true)
+        }
+        Err(_) => {
+            if let Some(existing) = existing {
+                let checked_at = super::catalog_refresh::catalog_date_now().1;
+                super::catalog_refresh::persist_codex_cache(
+                    &super::catalog_refresh::cache_after_failed_response(&existing, checked_at),
+                );
+            }
+            Some(false)
+        }
+        Ok(yach_backend::model_discovery::CodexCatalogDocument::Modified { body, etag }) => {
+            let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
+            if let Ok(cache) = super::catalog_refresh::apply_codex_catalog_response(
+                &body,
+                &now_date,
+                checked_at,
+                etag,
+                &client_version,
+            ) {
+                super::catalog_refresh::persist_codex_cache(&cache);
+                Some(true)
+            } else {
                 if let Some(existing) = existing {
-                    let checked_at = super::catalog_refresh::catalog_date_now().1;
                     super::catalog_refresh::persist_codex_cache(
                         &super::catalog_refresh::cache_after_failed_response(&existing, checked_at),
                     );
                 }
-            }
-            Ok(yach_backend::model_discovery::CodexCatalogDocument::Modified { body, etag }) => {
-                let (now_date, checked_at) = super::catalog_refresh::catalog_date_now();
-                match super::catalog_refresh::apply_codex_catalog_response(
-                    &body,
-                    &now_date,
-                    checked_at,
-                    etag,
-                    client_version,
-                ) {
-                    Ok(cache) => super::catalog_refresh::persist_codex_cache(&cache),
-                    Err(_) => {
-                        if let Some(existing) = existing {
-                            super::catalog_refresh::persist_codex_cache(
-                                &super::catalog_refresh::cache_after_failed_response(
-                                    &existing, checked_at,
-                                ),
-                            );
-                        }
-                    }
-                }
+                Some(false)
             }
         }
-    });
-    true
+    }
 }
 
-struct CodexCatalogRefreshGuard;
+static CODEX_CATALOG_REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-impl Drop for CodexCatalogRefreshGuard {
-    fn drop(&mut self) {
-        CODEX_CATALOG_REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+/// Normal refreshes skip when another is running; forced ones wait their
+/// turn. The lock is a parameter so tests can stay off the process-global
+/// mutex (sibling tests legitimately hold it during catalog refreshes).
+async fn acquire_codex_refresh(
+    lock: &tokio::sync::Mutex<()>,
+    mode: RefreshMode,
+) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+    match mode {
+        RefreshMode::Normal => lock.try_lock().ok(),
+        RefreshMode::Forced => Some(lock.lock().await),
     }
 }
 
@@ -1660,7 +1781,16 @@ async fn validate_adapter(
     state: &RuntimeState,
     adapter: Arc<RigProviderAdapterConfig>,
 ) -> Result<(), ModelDiscoveryError> {
-    (state.discoverer)(adapter).await.map(|_| ())
+    let client_version =
+        super::model_discovery_cache::listing_client_version(match &adapter.provider {
+            RigProviderConfig::ChatGptSubscription { .. } => ProviderKind::ChatGptSubscription,
+            RigProviderConfig::Anthropic { .. } => ProviderKind::Anthropic,
+            RigProviderConfig::OpenAi { .. } => ProviderKind::OpenAi,
+            RigProviderConfig::OpenAiCompatible { .. } => ProviderKind::OpenAiCompatible,
+        });
+    (state.discoverer)(adapter, client_version)
+        .await
+        .map(|_| ())
 }
 
 fn secret_ref(adapter: &RigProviderAdapterConfig) -> &ProviderSecret {
@@ -1716,12 +1846,81 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn refresh_codex_catalog_is_idle_without_chatgpt_connections() {
+        for mode in [RefreshMode::Normal, RefreshMode::Forced] {
+            assert_eq!(
+                refresh_codex_catalog(&[], mode).await,
+                None,
+                "no Codex connection must not start a catalog fetch ({mode:?})"
+            );
+        }
+    }
+
     #[test]
-    fn spawn_codex_catalog_refresh_is_idle_without_chatgpt_connections() {
-        assert!(
-            !spawn_codex_catalog_refresh(&[]),
-            "no Codex connection must not start a catalog fetch"
+    fn forced_refresh_ignores_a_fresh_discovery_cache() {
+        let connection = ready_compatible("Forced", "http://forced.invalid/v1");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
+            Arc::new(FixedMetadata {
+                records: vec![connection],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(move |_, _| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(vec![
+                        yach_backend::model_discovery::DiscoveredProviderModel {
+                            id: String::from("fixture"),
+                            display_name: None,
+                        },
+                    ])
+                })
+            }),
         );
+        let test_runtime = tokio::runtime::Runtime::new().test_unwrap();
+
+        test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal));
+        test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "fresh cache reused");
+
+        let outcome = test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Forced));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "forced bypasses the cache");
+        let ModelDiscoveryOutcome::Forced(report) = outcome else {
+            unreachable!("forced refresh must return a report");
+        };
+        assert_eq!(report.entries[0].info.id, "fixture");
+        assert!(
+            report.codex_version_change.is_none(),
+            "no ChatGPT connection"
+        );
+        assert!(report.failed_steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forced_codex_refresh_waits_for_an_in_flight_refresh() {
+        // Test-local lock: production takes CODEX_CATALOG_REFRESH, and the
+        // policy is identical — a static inside this test keeps sibling
+        // catalog refreshes from racing these assertions on the global.
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let held = acquire_codex_refresh(&LOCK, RefreshMode::Normal)
+            .await
+            .test_unwrap();
+        assert!(
+            acquire_codex_refresh(&LOCK, RefreshMode::Normal)
+                .await
+                .is_none(),
+            "normal skips when busy"
+        );
+        let forced =
+            tokio::spawn(async move { acquire_codex_refresh(&LOCK, RefreshMode::Forced).await });
+        tokio::task::yield_now().await;
+        assert!(!forced.is_finished(), "forced waits");
+        drop(held);
+        assert!(forced.await.test_unwrap().is_some());
     }
 
     trait TestUnwrap {
@@ -1954,7 +2153,7 @@ mod tests {
             None,
             {
                 let discoveries = discoveries.clone();
-                Arc::new(move |_| {
+                Arc::new(move |_, _| {
                     discoveries.fetch_add(1, Ordering::SeqCst);
                     Box::pin(async { unreachable!("bootstrap must not invoke discovery") })
                 })
@@ -1980,6 +2179,7 @@ mod tests {
         cache.update(
             &connection,
             unix_timestamp_seconds(),
+            None,
             vec![yach_backend::model_discovery::DiscoveredProviderModel {
                 id: String::from("cached-model"),
                 display_name: Some(String::from("Cached model")),
@@ -1996,7 +2196,7 @@ mod tests {
             None,
             {
                 let discoveries = discoveries.clone();
-                Arc::new(move |_| {
+                Arc::new(move |_, _| {
                     discoveries.fetch_add(1, Ordering::SeqCst);
                     Box::pin(async { unreachable!("fresh cache must avoid discovery") })
                 })
@@ -2022,6 +2222,7 @@ mod tests {
         cache.update(
             &connection,
             unix_timestamp_seconds() - CACHE_FRESHNESS_SECONDS - 1,
+            None,
             vec![yach_backend::model_discovery::DiscoveredProviderModel {
                 id: String::from("stale-model"),
                 display_name: None,
@@ -2038,7 +2239,7 @@ mod tests {
             None,
             {
                 let discoveries = discoveries.clone();
-                Arc::new(move |_| {
+                Arc::new(move |_, _| {
                     discoveries.fetch_add(1, Ordering::SeqCst);
                     Box::pin(async {
                         Ok(vec![
@@ -2059,7 +2260,7 @@ mod tests {
         );
         let ModelDiscoveryOutcome::Available(entries) = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None))
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal))
         else {
             unreachable!("stale cache refresh must succeed");
         };
@@ -2076,6 +2277,7 @@ mod tests {
         cache.update(
             &connection,
             unix_timestamp_seconds() - CACHE_FRESHNESS_SECONDS - 1,
+            None,
             vec![yach_backend::model_discovery::DiscoveredProviderModel {
                 id: String::from("stale-model"),
                 display_name: None,
@@ -2089,7 +2291,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| {
+            Arc::new(|_, _| {
                 Box::pin(async {
                     Err(ModelDiscoveryError::Provider(yach_backend::ProviderError {
                         kind: yach_backend::ProviderErrorKind::Authentication,
@@ -2105,7 +2307,7 @@ mod tests {
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } =
             tokio::runtime::Runtime::new()
                 .test_unwrap()
-                .block_on(runtime.refresh_models(None))
+                .block_on(runtime.refresh_models(None, RefreshMode::Normal))
         else {
             unreachable!("stale cache rows must remain available after discovery failure");
         };
@@ -2119,6 +2321,91 @@ mod tests {
         );
         let _ = std::fs::remove_file(cache_path);
     }
+
+    fn forced_report_with_discoverer(
+        connection: &ProviderConnection,
+        cache_path: &std::path::Path,
+        discoverer: ModelDiscoverer,
+    ) -> ForcedRefreshReport {
+        let mut cache = DiscoveryCache::default();
+        cache.update(
+            connection,
+            unix_timestamp_seconds() - CACHE_FRESHNESS_SECONDS - 1,
+            None,
+            vec![yach_backend::model_discovery::DiscoveredProviderModel {
+                id: String::from("stale-model"),
+                display_name: None,
+            }],
+        );
+        cache.persist(cache_path).test_unwrap();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
+            Arc::new(FixedMetadata {
+                records: vec![connection.clone()],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            discoverer,
+            Some(cache_path.to_path_buf()),
+        );
+        let ModelDiscoveryOutcome::Forced(report) = tokio::runtime::Runtime::new()
+            .test_unwrap()
+            .block_on(runtime.refresh_models(None, RefreshMode::Forced))
+        else {
+            unreachable!("forced refresh must return a report");
+        };
+        report
+    }
+
+    #[test]
+    fn forced_report_records_failed_discovery_even_when_fallback_rows_remain() {
+        let connection = ready_compatible("Cached", "http://cache.invalid/v1");
+        let cache_path = registry_fixture_path();
+        let report = forced_report_with_discoverer(
+            &connection,
+            &cache_path,
+            Arc::new(|_, _| {
+                Box::pin(async {
+                    Err(ModelDiscoveryError::Provider(yach_backend::ProviderError {
+                        kind: yach_backend::ProviderErrorKind::Authentication,
+                        message: String::from("redacted"),
+                        redacted_debug: None,
+                        metadata: yach_backend::ProviderErrorMetadata::default(),
+                    }))
+                })
+            }),
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.info.id == "stale-model"),
+            "the cached rows stay as the fallback"
+        );
+        assert_eq!(report.failed_steps, vec![String::from("discovery")]);
+        assert_eq!(report.succeeded_steps, 0);
+        assert_eq!(
+            yach_backend::forced_refresh_status(&report.entries, &report),
+            "models refreshed · no changes · discovery failed",
+            "the single final status line carries the failure"
+        );
+        let _ = std::fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn forced_report_treats_an_empty_successful_listing_as_success() {
+        let connection = ready_compatible("Empty", "http://empty.invalid/v1");
+        let cache_path = registry_fixture_path();
+        let report = forced_report_with_discoverer(
+            &connection,
+            &cache_path,
+            Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
+        );
+        assert!(report.failed_steps.is_empty());
+        assert_eq!(report.succeeded_steps, 1);
+        let _ = std::fs::remove_file(cache_path);
+    }
+
     #[test]
     fn runtime_environment_uses_a_distinct_adapter_arc_from_the_runner() {
         let runner_adapter = Arc::new(RigProviderAdapterConfig {
@@ -2158,7 +2445,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             Some(environment),
-            Arc::new(|_| Box::pin(async { unreachable!("bootstrap is I/O-free") })),
+            Arc::new(|_, _| Box::pin(async { unreachable!("bootstrap is I/O-free") })),
             Some(cache_path.clone()),
         );
 
@@ -2188,7 +2475,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             Some(environment),
-            Arc::new(|_| Box::pin(async { unreachable!("bootstrap is I/O-free") })),
+            Arc::new(|_, _| Box::pin(async { unreachable!("bootstrap is I/O-free") })),
         );
 
         let cached = runtime.cached_models().test_unwrap();
@@ -2274,7 +2561,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             Some(environment),
-            Arc::new(|_| {
+            Arc::new(|_, _| {
                 Box::pin(async {
                     Ok(vec![
                         yach_backend::model_discovery::DiscoveredProviderModel {
@@ -2293,12 +2580,15 @@ mod tests {
         assert_eq!(list.as_slice().len(), 1);
         assert_eq!(list.as_slice()[0].id, ConnectionId::environment());
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = test_runtime
-            .block_on(runtime.refresh_models(Some(ActiveModelTarget {
-                provider: String::new(),
-                connection_id: ConnectionId::environment(),
-                connection_key: None,
-                model: String::from("environment-model"),
-            })))
+            .block_on(runtime.refresh_models(
+                Some(ActiveModelTarget {
+                    provider: String::new(),
+                    connection_id: ConnectionId::environment(),
+                    connection_key: None,
+                    model: String::from("environment-model"),
+                }),
+                RefreshMode::Normal,
+            ))
         else {
             unreachable!("environment remains discoverable despite malformed registry");
         };
@@ -2384,7 +2674,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
             Some(registry_fixture_path()),
         );
 
@@ -2401,6 +2691,7 @@ mod tests {
             vec![fixture_entry("fresh", "Cached")].into(),
             vec![(
                 connection.clone(),
+                None,
                 vec![yach_backend::model_discovery::DiscoveredProviderModel {
                     id: String::from("fresh"),
                     display_name: None,
@@ -2428,13 +2719,14 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
             Some(cache_path.clone()),
         );
         {
             lock_discovery_cache(&runtime.state.discovery_cache).update(
                 &connection,
                 unix_timestamp_seconds(),
+                None,
                 vec![yach_backend::model_discovery::DiscoveredProviderModel {
                     id: String::from("first"),
                     display_name: None,
@@ -2446,6 +2738,7 @@ mod tests {
             lock_discovery_cache(&runtime.state.discovery_cache).update(
                 &connection,
                 unix_timestamp_seconds(),
+                None,
                 vec![yach_backend::model_discovery::DiscoveredProviderModel {
                     id: String::from("second"),
                     display_name: None,
@@ -2486,7 +2779,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 // Take the reply channel before signaling. Signaling first let
                 // the second refresh pop the first channel in the gap, so each
                 // refresh waited on the other's reply and the test hung.
@@ -2496,11 +2789,11 @@ mod tests {
             }),
         );
         let test_runtime = tokio::runtime::Runtime::new().test_unwrap();
-        let first = test_runtime.spawn(runtime.refresh_models(None));
+        let first = test_runtime.spawn(runtime.refresh_models(None, RefreshMode::Normal));
         started_receiver
             .recv_timeout(Duration::from_secs(2))
             .test_unwrap();
-        let second = test_runtime.spawn(runtime.refresh_models(None));
+        let second = test_runtime.spawn(runtime.refresh_models(None, RefreshMode::Normal));
         started_receiver
             .recv_timeout(Duration::from_secs(2))
             .test_unwrap();
@@ -2542,7 +2835,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| {
+            Arc::new(|_, _| {
                 Box::pin(async {
                     Ok(vec![
                         yach_backend::model_discovery::DiscoveredProviderModel {
@@ -2553,7 +2846,7 @@ mod tests {
                 })
             }),
         );
-        let refresh = runtime.refresh_models(None);
+        let refresh = runtime.refresh_models(None, RefreshMode::Normal);
         CliProviderConnectionRuntime::invalidate(&runtime.state);
 
         assert!(matches!(
@@ -2568,7 +2861,7 @@ mod tests {
     fn refresh_keeps_same_model_from_two_connections_as_exact_rows() {
         let first = ready_compatible("First", "http://one.invalid/v1");
         let second = ready_compatible("Second", "http://two.invalid/v1");
-        let discoverer: ModelDiscoverer = Arc::new(|_| {
+        let discoverer: ModelDiscoverer = Arc::new(|_, _| {
             Box::pin(async {
                 Ok(vec![
                     yach_backend::model_discovery::DiscoveredProviderModel {
@@ -2591,7 +2884,7 @@ mod tests {
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("fixture discovery should succeed");
         };
@@ -2622,7 +2915,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| {
+            Arc::new(|_, _| {
                 Box::pin(async {
                     Ok(vec![
                         yach_backend::model_discovery::DiscoveredProviderModel {
@@ -2636,7 +2929,7 @@ mod tests {
 
         let ModelDiscoveryOutcome::Available(entries) = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(Some(active)))
+            .block_on(runtime.refresh_models(Some(active), RefreshMode::Normal))
         else {
             unreachable!("active fallback remains available");
         };
@@ -2652,7 +2945,7 @@ mod tests {
     fn refresh_isolates_auth_failure_without_exposing_provider_body_or_key() {
         let successful = ready_compatible("Successful", "http://success.invalid/v1");
         let failing = ready_compatible("Failing", "http://failure.invalid/v1");
-        let discoverer: ModelDiscoverer = Arc::new(|adapter| {
+        let discoverer: ModelDiscoverer = Arc::new(|adapter, _| {
             let fails = matches!(
                 &adapter.provider,
                 RigProviderConfig::OpenAiCompatible { base_url, .. }
@@ -2688,7 +2981,7 @@ mod tests {
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = &outcome else {
             unreachable!(
                 "successful connection must survive its peer failure with a bounded warning"
@@ -2727,7 +3020,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             Some(environment),
-            Arc::new(|_| {
+            Arc::new(|_, _| {
                 Box::pin(async {
                     Ok(vec![
                         yach_backend::model_discovery::DiscoveredProviderModel {
@@ -2742,12 +3035,15 @@ mod tests {
         let outcome =
             tokio::runtime::Runtime::new()
                 .test_unwrap()
-                .block_on(runtime.refresh_models(Some(ActiveModelTarget {
-                    provider: String::new(),
-                    connection_id: ConnectionId::environment(),
-                    connection_key: None,
-                    model: String::from("gpt-5"),
-                })));
+                .block_on(runtime.refresh_models(
+                    Some(ActiveModelTarget {
+                        provider: String::new(),
+                        connection_id: ConnectionId::environment(),
+                        connection_key: None,
+                        model: String::from("gpt-5"),
+                    }),
+                    RefreshMode::Normal,
+                ));
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("active environment subscription must be visible");
         };
@@ -2783,7 +3079,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| {
+            Arc::new(|_, _| {
                 Box::pin(async {
                     Ok(vec![
                         yach_backend::model_discovery::DiscoveredProviderModel {
@@ -2801,7 +3097,7 @@ mod tests {
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("managed ChatGPT must list discovered models without activation");
         };
@@ -2819,6 +3115,66 @@ mod tests {
                 )
         );
     }
+    #[test]
+    fn refresh_stamps_codex_rows_with_the_request_time_client_version() {
+        let connection = ProviderConnection {
+            id: ConnectionId::new_stored(),
+            provider: ProviderKind::ChatGptSubscription,
+            label: Some(String::from("Codex")),
+            key: None,
+            base_url: None,
+            authentication: ConnectionAuth::ChatGptSubscriptionManaged {
+                auth_file: PathBuf::from("/tmp/chatgpt-subscription.json"),
+                account_id: String::from("acct_123"),
+            },
+            state: ConnectionState::Ready,
+        };
+        // The discoverer records the client_version the request actually
+        // carried; the cache row must carry that same version even if the
+        // advertised effective version has since advanced.
+        let requested = Arc::new(std::sync::Mutex::new(None::<String>));
+        let requested_in_discoverer = requested.clone();
+        let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer(
+            Arc::new(FixedMetadata {
+                records: vec![connection.clone()],
+            }),
+            Arc::new(ReadyCredentials),
+            super::super::model_layers_fixture(),
+            None,
+            Arc::new(move |_, client_version| {
+                let requested_in_discoverer = requested_in_discoverer.clone();
+                Box::pin(async move {
+                    *requested_in_discoverer.lock().test_unwrap() = client_version;
+                    Ok(vec![
+                        yach_backend::model_discovery::DiscoveredProviderModel {
+                            id: String::from("gpt-test"),
+                            display_name: None,
+                        },
+                    ])
+                })
+            }),
+        );
+        let outcome = tokio::runtime::Runtime::new()
+            .test_unwrap()
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
+        assert!(matches!(outcome, ModelDiscoveryOutcome::Available(_)));
+        let Some(requested) = requested.lock().test_unwrap().clone() else {
+            unreachable!("the ChatGPT discoverer ran once");
+        };
+        let path = registry_fixture_path();
+        lock_discovery_cache(&runtime.state.discovery_cache)
+            .persist(&path)
+            .test_unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).test_unwrap()).test_unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            document["connections"][0]["client_version"].as_str(),
+            Some(requested.as_str()),
+            "the cache row carries the version the discovery request sent"
+        );
+    }
+
     #[test]
     fn empty_chatgpt_discovery_bootstraps_known_openai_tool_models() {
         let connection = ProviderConnection {
@@ -2841,12 +3197,12 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
         );
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         let ModelDiscoveryOutcome::Available(entries) = outcome else {
             unreachable!("empty Codex listing must keep baked models selectable");
         };
@@ -2892,7 +3248,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| {
+            Arc::new(|_, _| {
                 Box::pin(async {
                     Err(ModelDiscoveryError::Provider(yach_backend::ProviderError {
                         kind: yach_backend::ProviderErrorKind::Authentication,
@@ -2906,7 +3262,7 @@ mod tests {
 
         let outcome = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None));
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal));
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = outcome else {
             unreachable!("failed Codex listing must keep baked models selectable");
         };
@@ -3080,7 +3436,7 @@ mod tests {
         let discoverer: ModelDiscoverer = {
             let in_flight = in_flight.clone();
             let peak = peak.clone();
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 let in_flight = in_flight.clone();
                 let peak = peak.clone();
                 Box::pin(async move {
@@ -3121,12 +3477,15 @@ mod tests {
         let outcome =
             tokio::runtime::Runtime::new()
                 .test_unwrap()
-                .block_on(runtime.refresh_models(Some(ActiveModelTarget {
-                    provider: String::new(),
-                    connection_id: active_connection.clone(),
-                    connection_key: None,
-                    model: String::from("fixture-model-099"),
-                })));
+                .block_on(runtime.refresh_models(
+                    Some(ActiveModelTarget {
+                        provider: String::new(),
+                        connection_id: active_connection.clone(),
+                        connection_key: None,
+                        model: String::from("fixture-model-099"),
+                    }),
+                    RefreshMode::Normal,
+                ));
         let ModelDiscoveryOutcome::AvailableWithWarnings { entries, warnings } = outcome else {
             unreachable!("bounded fixture discovery should complete with truncation warning");
         };
@@ -3154,7 +3513,7 @@ mod tests {
             Arc::new(CountingCredentials::default()),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| {
+            Arc::new(|_, _| {
                 Box::pin(async {
                     Err(ModelDiscoveryError::Provider(yach_backend::ProviderError {
                         kind: yach_backend::ProviderErrorKind::Authentication,
@@ -3267,6 +3626,7 @@ mod tests {
             cache.update(
                 connection,
                 unix_timestamp_seconds(),
+                None,
                 vec![yach_backend::model_discovery::DiscoveredProviderModel {
                     id: format!("{}-model", connection.id.as_str()),
                     display_name: None,
@@ -3279,7 +3639,7 @@ mod tests {
             credentials,
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
             Some(cache_path.clone()),
         );
         assert!(
@@ -3339,12 +3699,13 @@ mod tests {
             credentials.clone(),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
             Some(cache_path),
         );
         lock_discovery_cache(&runtime.state.discovery_cache).update(
             &connection,
             unix_timestamp_seconds(),
+            None,
             vec![yach_backend::model_discovery::DiscoveredProviderModel {
                 id: String::from("cached-model"),
                 display_name: None,
@@ -3398,19 +3759,21 @@ mod tests {
             cache.update(
                 connection,
                 unix_timestamp_seconds(),
+                None,
                 vec![yach_backend::model_discovery::DiscoveredProviderModel {
                     id: format!("{}-model", connection.id.as_str()),
                     display_name: None,
                 }],
             );
         }
+
         cache.persist(&cache_path).test_unwrap();
         let runtime = CliProviderConnectionRuntime::with_stores_and_discoverer_and_cache_path(
             metadata,
             credentials,
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| Box::pin(async { Ok(Vec::new()) })),
+            Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
             Some(cache_path.clone()),
         );
 
@@ -3519,7 +3882,7 @@ mod tests {
         ));
         let ModelDiscoveryOutcome::Available(rows) = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None))
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal))
         else {
             unreachable!("same runtime refreshes after replacement");
         };
@@ -3567,7 +3930,7 @@ mod tests {
         ));
         let ModelDiscoveryOutcome::Available(rows) = tokio::runtime::Runtime::new()
             .test_unwrap()
-            .block_on(runtime.refresh_models(None))
+            .block_on(runtime.refresh_models(None, RefreshMode::Normal))
         else {
             unreachable!("same runtime refreshes after rename");
         };
@@ -3605,7 +3968,7 @@ mod tests {
             vec![fixture_entry("stale-create", "Fixture")].into(),
         ));
         assert!(matches!(
-            test_runtime.block_on(runtime.refresh_models(None)),
+            test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal)),
             ModelDiscoveryOutcome::Available(rows) if rows.len() == 1
         ));
         let repair_connection = ProviderConnection::stored(
@@ -3638,7 +4001,7 @@ mod tests {
             vec![fixture_entry("stale-repair", "Fixture")].into(),
         ));
         assert!(matches!(
-            test_runtime.block_on(runtime.refresh_models(None)),
+            test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal)),
             ModelDiscoveryOutcome::Available(rows) if rows.len() == 2
         ));
 
@@ -3654,7 +4017,7 @@ mod tests {
             vec![fixture_entry("stale-remove", "Fixture")].into(),
         ));
         assert!(matches!(
-            test_runtime.block_on(runtime.refresh_models(None)),
+            test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal)),
             ModelDiscoveryOutcome::Available(rows) if rows.len() == 1
         ));
         let _ = std::fs::remove_file(path);
@@ -3669,7 +4032,7 @@ mod tests {
             Arc::new(ReadyCredentials),
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| Box::pin(async { unreachable!("migration does not discover models") })),
+            Arc::new(|_, _| Box::pin(async { unreachable!("migration does not discover models") })),
         );
         runtime.state.user_config = Some(config);
         runtime
@@ -3898,7 +4261,7 @@ mod tests {
             ));
         }
         assert!(matches!(
-            test_runtime.block_on(runtime.refresh_models(None)),
+            test_runtime.block_on(runtime.refresh_models(None, RefreshMode::Normal)),
             ModelDiscoveryOutcome::Available(_)
         ));
         assert!(matches!(
@@ -4086,7 +4449,7 @@ mod tests {
             credentials,
             super::super::model_layers_fixture(),
             None,
-            Arc::new(|_| {
+            Arc::new(|_, _| {
                 Box::pin(async {
                     Ok(vec![
                         yach_backend::model_discovery::DiscoveredProviderModel {

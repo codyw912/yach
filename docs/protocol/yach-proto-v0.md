@@ -55,6 +55,7 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - prompt cancelled
 - session selected
 - available models requested
+- available models refresh requested (forced: release check, catalog, and discovery bypass their freshness windows)
 - fork messages requested
 - session messages requested
 - session stats requested

@@ -253,31 +253,60 @@ pub fn baked_catalog() -> &'static Catalog {
     })
 }
 
-/// Highest `minimal_client_version` among listed, API-supported models in
-/// the pinned Codex snapshot. Used as the `/models?client_version=` value.
-/// Parsed from the baked snapshot once per process.
+/// One release of openai/codex the baked snapshot was taken from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexPin {
+    pub tag: String,
+    pub version: String,
+    pub commit: String,
+}
+
+/// The `X.Y.Z` of a stable `rust-vX.Y.Z` release tag; `None` for
+/// prereleases and any other shape.
 #[must_use]
-pub fn baked_codex_protocol_version() -> &'static str {
+pub fn release_tag_version(tag: &str) -> Option<&str> {
+    let version = tag.strip_prefix("rust-v")?;
+    let mut parts = version.split('.');
+    let valid = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    }) && parts.next().is_none();
+    valid.then_some(version)
+}
+
+/// Parses `codex-models.pin`: `<rust-vX.Y.Z> <40-hex commit>`.
+#[must_use]
+pub fn parse_codex_pin(raw: &str) -> Option<CodexPin> {
+    let mut fields = raw.split_whitespace();
+    let (tag, commit) = (fields.next()?, fields.next()?);
+    if fields.next().is_some()
+        || commit.len() != 40
+        || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(CodexPin {
+        tag: tag.to_owned(),
+        version: release_tag_version(tag)?.to_owned(),
+        commit: commit.to_owned(),
+    })
+}
+
+/// The Codex release the baked snapshot was taken from, used as the floor
+/// for the `/models?client_version=` value. Parsed once per process.
+#[must_use]
+pub fn baked_codex_release_version() -> &'static str {
     static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        max_listed_codex_protocol_version(include_str!("../data/codex-models.json"))
-            .unwrap_or_else(|| String::from("0.0.1"))
+        parse_codex_pin(include_str!("../data/codex-models.pin"))
+            .map_or_else(|| String::from("0.0.1"), |pin| pin.version)
     });
     VERSION.as_str()
 }
 
-fn max_listed_codex_protocol_version(raw: &str) -> Option<String> {
-    let document: CodexModelsDocument = serde_json::from_str(raw).ok()?;
-    document
-        .models
-        .into_iter()
-        .filter(|model| {
-            model.visibility.as_deref() == Some("list") && model.supported_in_api != Some(false)
-        })
-        .filter_map(|model| model.minimal_client_version)
-        .max_by(|left, right| compare_dotted_versions(left, right))
-}
-
-fn compare_dotted_versions(left: &str, right: &str) -> std::cmp::Ordering {
+/// Numeric dotted-version order; non-numeric parts compare as 0.
+#[must_use]
+pub fn compare_dotted_versions(left: &str, right: &str) -> std::cmp::Ordering {
     let parse = |value: &str| {
         value
             .split('.')
@@ -852,8 +881,6 @@ struct CodexCatalogModel {
     visibility: Option<String>,
     #[serde(default)]
     supported_in_api: Option<bool>,
-    #[serde(default)]
-    minimal_client_version: Option<String>,
     context_window: Option<u64>,
     max_context_window: Option<u64>,
 }
@@ -2085,43 +2112,48 @@ mod tests {
                 .is_none()
         );
         assert!(catalog.entry("openai-codex", "codex-auto-review").is_none());
-        assert_eq!(baked_codex_protocol_version(), "0.155.0");
     }
 
     #[test]
-    fn protocol_version_selects_highest_listed_5_6_minimum() {
-        let raw = r#"{
-            "models": [
-                {
-                    "slug": "gpt-5.5",
-                    "visibility": "list",
-                    "supported_in_api": true,
-                    "minimal_client_version": "0.124.0"
-                },
-                {
-                    "slug": "gpt-5.6-sol",
-                    "visibility": "list",
-                    "supported_in_api": true,
-                    "minimal_client_version": "0.144.0"
-                },
-                {
-                    "slug": "gpt-5.6-terra",
-                    "visibility": "list",
-                    "supported_in_api": true,
-                    "minimal_client_version": "0.144.0"
-                },
-                {
-                    "slug": "gpt-5.4",
-                    "visibility": "hide",
-                    "supported_in_api": true,
-                    "minimal_client_version": "0.200.0"
-                }
-            ]
-        }"#;
-        assert_eq!(
-            max_listed_codex_protocol_version(raw).as_deref(),
-            Some("0.144.0")
-        );
+    fn codex_pin_parses_a_release_tag_and_commit() {
+        let Some(pin) = parse_codex_pin("rust-v0.160.0 a956835d020762cb2b570053af06f643a11c0ecc\n")
+        else {
+            unreachable!("valid pin must parse");
+        };
+        assert_eq!(pin.tag, "rust-v0.160.0");
+        assert_eq!(pin.version, "0.160.0");
+        assert_eq!(pin.commit, "a956835d020762cb2b570053af06f643a11c0ecc");
+    }
+
+    #[test]
+    fn codex_pin_rejects_non_release_shapes() {
+        for raw in [
+            "e7ea5f4a8658ebe49e879be933effed2340fa276",
+            "rust-v0.162.0-alpha.7 a956835d020762cb2b570053af06f643a11c0ecc",
+            "v0.160.0 a956835d020762cb2b570053af06f643a11c0ecc",
+            "rust-v0.160.0",
+            "rust-v0.160.0 not-a-sha",
+            "rust-v0.160.0 a956835d a956835d",
+        ] {
+            assert!(parse_codex_pin(raw).is_none(), "{raw} must be rejected");
+        }
+    }
+
+    #[test]
+    fn release_tag_version_accepts_only_stable_tags() {
+        assert_eq!(release_tag_version("rust-v0.160.0"), Some("0.160.0"));
+        assert_eq!(release_tag_version("rust-v0.162.0-alpha.7"), None);
+        assert_eq!(release_tag_version("rust-v0.160"), None);
+        assert_eq!(release_tag_version("codex-v0.160.0"), None);
+    }
+
+    #[test]
+    fn committed_pin_is_a_release_and_drives_the_baked_version() {
+        let Some(pin) = parse_codex_pin(include_str!("../data/codex-models.pin")) else {
+            unreachable!("committed pin must parse");
+        };
+        assert_eq!(baked_codex_release_version(), pin.version);
+        assert_eq!(release_tag_version(&pin.tag), Some(pin.version.as_str()));
     }
 
     #[test]

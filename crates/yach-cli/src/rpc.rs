@@ -358,6 +358,7 @@ async fn run_rpc(options: RpcOptions) -> io::Result<()> {
             runtime_timeout,
             provider_test_delay_ms(),
         )
+        .map(super::provider_connections::CliProviderConnectionRuntime::with_codex_release_check)
         .map(|runtime| Arc::new(runtime) as Arc<dyn yach_backend::ProviderConnectionRuntime>),
     };
     let backend_handshake = native_backend_handshake(&setup, provider_connections.is_some());

@@ -142,16 +142,22 @@ impl DiscoveryCache {
         Some(CachedModels {
             models: entry.models.clone(),
             fresh: !entry.truncated
-                && entry.client_version.as_deref() == listing_client_version(connection.provider)
+                && entry.client_version.as_deref()
+                    == listing_client_version(connection.provider).as_deref()
                 && entry.refreshed_at <= now
                 && now - entry.refreshed_at < freshness_seconds,
         })
     }
 
+    /// `client_version` is the version the discovery request actually sent,
+    /// not [`listing_client_version`] re-sampled at publish time — the
+    /// release check can advance the effective version while a request is in
+    /// flight, and the row must stay stale against the newer version.
     pub(crate) fn update(
         &mut self,
         connection: &ProviderConnection,
         refreshed_at: u64,
+        client_version: Option<String>,
         models: Vec<DiscoveredProviderModel>,
     ) {
         let mut bounded_models = Vec::with_capacity(models.len().min(MAX_ROWS_PER_CONNECTION));
@@ -179,7 +185,7 @@ impl DiscoveryCache {
             CachedConnectionDiscovery {
                 provider: connection.provider,
                 endpoint: connection.base_url.clone(),
-                client_version: listing_client_version(connection.provider).map(String::from),
+                client_version,
                 refreshed_at,
                 models: bounded_models,
                 truncated,
@@ -328,8 +334,9 @@ impl DiscoveryCache {
 /// Codex backend only lists models whose minimum client version the request
 /// meets, so a cached listing from a different binary describes a different
 /// model set and must be refetched. Other providers ignore the version.
-fn listing_client_version(provider: ProviderKind) -> Option<&'static str> {
-    (provider == ProviderKind::ChatGptSubscription).then(yach_catalog::baked_codex_protocol_version)
+pub(crate) fn listing_client_version(provider: ProviderKind) -> Option<String> {
+    (provider == ProviderKind::ChatGptSubscription)
+        .then(crate::codex_release::effective_client_version)
 }
 
 #[must_use]
@@ -436,6 +443,7 @@ mod tests {
         cache.update(
             &connection,
             1,
+            listing_client_version(connection.provider),
             vec![DiscoveredProviderModel {
                 id: String::from("cached-model"),
                 display_name: None,
@@ -460,6 +468,7 @@ mod tests {
         cache.update(
             &connection,
             100,
+            listing_client_version(connection.provider),
             vec![DiscoveredProviderModel {
                 id: String::from("fixture"),
                 display_name: None,
@@ -498,6 +507,7 @@ mod tests {
         cache.update(
             &connection,
             100,
+            listing_client_version(connection.provider),
             vec![DiscoveredProviderModel {
                 id: String::from("environment-model"),
                 display_name: None,
@@ -528,6 +538,7 @@ mod tests {
         cache.update(
             &connection,
             100,
+            listing_client_version(connection.provider),
             vec![DiscoveredProviderModel {
                 id: String::from("gpt-5.5"),
                 display_name: None,
@@ -567,6 +578,7 @@ mod tests {
         cache.update(
             &connection,
             100,
+            listing_client_version(connection.provider),
             vec![DiscoveredProviderModel {
                 id: String::from("model-with-long-name"),
                 display_name: Some("x".repeat(MAX_DISPLAY_NAME_BYTES + 1)),
@@ -588,6 +600,7 @@ mod tests {
         cache.update(
             &connection,
             100,
+            listing_client_version(connection.provider),
             (0..=MAX_ROWS_PER_CONNECTION)
                 .map(|index| DiscoveredProviderModel {
                     id: format!("model-{index}"),
@@ -618,6 +631,7 @@ mod tests {
             cache.update(
                 &connection,
                 1,
+                listing_client_version(connection.provider),
                 (0..MAX_ROWS_PER_CONNECTION)
                     .map(|model| DiscoveredProviderModel {
                         id: format!("{model:04}-{}", "x".repeat(MAX_MODEL_ID_BYTES - 5)),
