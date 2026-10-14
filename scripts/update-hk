@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Re-pin hk: the release binary hashes in nix/hk.nix and the hk Config
+# package version in .hk/base/*.pkl, together, so the binary always
+# evaluates the Config package of its own version.
+#
+# Usage: bash scripts/update-hk [vX.Y.Z]   (default: the latest release)
+#
+# Needs curl, jq and nix. Review and commit the result; nix/hk.nix,
+# .hk/** and this script are protected paths for verifying-by-risk.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+nixfile="$root/nix/hk.nix"
+
+tag=${1:-}
+if [[ -z "$tag" ]]; then
+  tag=$(curl -fsSL https://api.github.com/repos/jdx/hk/releases/latest | jq -r .tag_name)
+fi
+[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "update-hk: not a release tag: $tag" >&2; exit 2; }
+version=${tag#v}
+
+current=$(sed -n 's/^  version = "\(.*\)";$/\1/p' "$nixfile")
+[[ -n "$current" ]] || { echo "update-hk: no version line in $nixfile" >&2; exit 2; }
+
+# One hash per release asset nix/hk.nix lists. Fails before writing
+# anything if an asset is missing from the release.
+targets=$(sed -n 's/^ *target = "\(.*\)";$/\1/p' "$nixfile")
+declare -A hashes
+for target in $targets; do
+  url="https://github.com/jdx/hk/releases/download/$tag/hk-$target.tar.gz"
+  hash=$(nix store prefetch-file --json "$url" | jq -r .hash) || {
+    echo "update-hk: cannot fetch $url" >&2
+    exit 1
+  }
+  hashes[$target]=$hash
+done
+
+# The Config package must exist for this tag too.
+curl -fsSL -o /dev/null "https://github.com/jdx/hk/releases/download/$tag/hk@$version" || {
+  echo "update-hk: release $tag has no hk@$version Pkl package" >&2
+  exit 1
+}
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+awk -v version="$version" -v pairs="$(for t in $targets; do printf '%s=%s\n' "$t" "${hashes[$t]}"; done)" '
+  BEGIN { n = split(pairs, lines, "\n"); for (i = 1; i <= n; i++) { split(lines[i], kv, "="); h[kv[1]] = substr(lines[i], length(kv[1]) + 2) } }
+  /^  version = "/ { print "  version = \"" version "\";"; next }
+  /^ *target = "/ { match($0, /"[^"]*"/); target = substr($0, RSTART + 1, RLENGTH - 2) }
+  /^ *hash = "/ && target != "" { sub(/"[^"]*"/, "\"" h[target] "\""); target = "" }
+  { print }
+' "$nixfile" > "$tmp"
+cat "$tmp" > "$nixfile"
+
+for pkl in "$root"/.hk/base/*.pkl; do
+  sed -i -E "s#(github\.com/jdx/hk/releases/download/)v[0-9]+\.[0-9]+\.[0-9]+/hk@[0-9]+\.[0-9]+\.[0-9]+#\1$tag/hk@$version#g" "$pkl"
+done
+
+echo "update-hk: $current -> $version"
+echo "Rebuild the shell (direnv reload or devenv shell), run 'hk --version', then the hk-check, and commit."
