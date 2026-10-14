@@ -2,7 +2,9 @@
 
 **Outcome:** plane:YACH-20 (kata `yach#vadv`)
 
-Status: draft for owner review, 2026-10-02.
+Status: approved by the owner, 2026-10-06. Open questions 1-8 resolved on
+2026-10-02 and 2026-10-06. Bundled named palettes added 2026-10-06 from
+`docs/project/records/2026-10-06-theme-engine-survey.md`.
 
 Triggered by dogfooding (plane:YACH-19): successful tool results render as a
 dark green band with gray text. Owner direction, 2026-10-02: "a cohesive
@@ -298,7 +300,7 @@ A theme is data: the existing strict JSON schema (`deny_unknown_fields`,
 `theme.rs:192-201`) with one added optional top-level key:
 
 ```json
-{ "base": "dark" | "light" | "system" | "auto" | "<extension-id>:<theme-id>",
+{ "base": "dark" | "light" | "system" | "auto" | "<palette>" | "<extension-id>:<theme-id>",
   "vars": { }, "colors": { }, "spacing": { } }
 ```
 
@@ -306,7 +308,8 @@ A theme is data: the existing strict JSON schema (`deny_unknown_fields`,
 every existing theme file keeps its meaning (`from_json` today always starts
 from the dark default, `theme.rs:88-97`). A file wanting detection writes
 `"base": "auto"`. An extension theme's own `base` may name only a built-in
-preset, never another extension theme; this removes cycles.
+preset or a bundled palette, never another extension theme; this removes
+cycles.
 
 Built-in presets:
 
@@ -317,11 +320,14 @@ Built-in presets:
 | `system` | none (`Reset`) | `Reset` fg/bg; ANSI colors for status; rules and glyphs separate rows |
 | `auto` | per resolved | Resolves to `dark` or `light` (see Light/dark) |
 
+Bundled palettes (next section) are also built-in names.
+
 Selection is a single winner, as today. Highest first:
 
-1. `YACH_THEME`. If its value is exactly `dark`, `light`, `system`, or `auto`
-   it names a preset; otherwise it is a file path, as today
-   (`main.rs:426,439-441`). Those four names are therefore reserved.
+1. `YACH_THEME`. If its value is exactly a preset name (`dark`, `light`,
+   `system`, `auto`) or a bundled palette name, it names that theme; otherwise
+   it is a file path, as today (`main.rs:426,439-441`). Those names are
+   therefore reserved; a file with a reserved name is reachable as `./<name>`.
 2. User `~/.yach/theme.json`.
 3. Default: `auto`.
 
@@ -333,6 +339,130 @@ installed_extensions) -> (Theme, Vec<Diagnostic>)` function so the whole order
 is unit-testable and the TUI path (`main.rs:3762-3772`) stays one call. The
 resolver never sees the project root; the legacy-file notice below comes from
 the TUI startup path, which already has it.
+
+### Bundled named palettes
+
+Owner direction, 2026-10-06: popular named palettes should be available
+alongside custom themes while the engine stays minimal and fast. Evidence for
+the choices below, including licenses, is in
+`docs/project/records/2026-10-06-theme-engine-survey.md`.
+
+**Set.** Eighteen palettes, each a Base16 scheme from Tinted Theming
+(https://github.com/tinted-theming/schemes, pinned at `a70da1da`, MIT):
+
+| Family | Names |
+|---|---|
+| Catppuccin | `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` |
+| Rosé Pine | `rose-pine`, `rose-pine-moon`, `rose-pine-dawn` |
+| Gruvbox | `gruvbox-dark`, `gruvbox-light` |
+| Tokyo Night | `tokyo-night-dark`, `tokyo-night-storm`, `tokyo-night-moon`, `tokyo-night-light` |
+| Solarized | `solarized-dark`, `solarized-light` |
+| Single | `dracula`, `nord`, `monokai` |
+
+Names match the upstream scheme file names, so a later importer and the
+bundled set agree.
+
+**Format: ordinary yach theme files.** Each palette is a theme file in the
+existing schema, checked in under `crates/yach-ui/themes/<name>.json`:
+
+- `base` is `dark` or `light` from the scheme's `variant`, so any token the
+  file does not set falls back to the matching preset, and `auto` pairing (Open
+  question 8) knows each palette's appearance without new metadata.
+- `vars` holds the scheme's sixteen slots verbatim as `base00`..`base0F`,
+  plus any extra upstream color a mapping needs (named after its upstream
+  role, e.g. Catppuccin `subtext0`).
+- `colors` maps every one of the 22 tokens to a var or hex value. Derived
+  values such as the error panel tint are precomputed hex, since the theme
+  format has no color math (Non-goals).
+
+There is no new schema, parser, or color syntax, and no build-time generator:
+updating a palette means editing sixteen hex values in one file. A
+`yach theme import <scheme.yaml>` command is deferred; it would emit the same
+file shape.
+
+**Default mapping.** The starting point for every file; Base16 slots are
+standardized (base00-07 a ramp from background to foreground, base08-0F
+accents). Light schemes keep their light background in `base00` too.
+
+| Token(s) | Slot |
+|---|---|
+| `toolPendingBackground`, `toolSuccessBackground`, `userMessageBackground` | `base01` |
+| `selectedBackground` | `base02` |
+| `dim` | `base03` |
+| `muted`, `diffContext`, `border` | `base04` |
+| `text`, `selectedText`, `userMessageText` | `base05` |
+| `toolOutput` | `base04` if it reaches 4.5:1 on the panel, else `base05` |
+| `toolTitle` | `base06` |
+| `error`, `diffRemoved` | `base08` |
+| `warning` | `base0A` |
+| `success`, `diffAdded` | `base0B` |
+| `harness` | `base0C` |
+| `accent`, `diffHunk` | `base0D` |
+| `toolErrorBackground` | `base01` blended 15% toward `base08`, precomputed |
+
+**Per-palette deviations are expected and visible.** The `dark`/`light`
+contrast invariants apply to every bundled palette (Testing): body text on
+every painted surface at least 4.5:1; `muted`, `success`, `warning`, `error`
+and `harness` at least 3:1 against the tool panel. The default mapping does
+not meet them everywhere, so each file is authored with one fixed adjustment
+rule:
+
+1. Surface text (`text`, `selectedText`, `userMessageText`, `toolTitle`, and
+   text on the error panel): if the mapped slot is below 4.5:1 on its
+   surface, use the first of `base05`, `base06`, `base07` that passes.
+2. Accent roles (`muted`, `success`, `warning`, `error`, `harness`): if below
+   3:1 against the tool panel, blend the mapped slot toward `base05` in 5%
+   steps and take the first step that passes.
+
+Blends are precomputed hex, because the format has no color math. Every
+deviation is a line in that palette's `colors`, reviewable without tooling.
+Measured from the pinned schemes with WCAG relative luminance, 2026-10-06:
+11 of the 18 palettes need at least one adjustment, and the rule makes all
+18 pass:
+
+| Failure under the default mapping | Palettes (measured) | Rule result |
+|---|---|---|
+| `muted` below 3:1 (`base04` is a surface shade) | all four Catppuccin (1.8-2.6) | blend 10-45% |
+| `text` on panel below 4.5:1 | `solarized-light` (4.4) | `base06` (10.6) |
+| `selectedText` below 4.5:1 | `solarized-dark`, `solarized-light` (2.0), `tokyo-night-moon` (3.0) | `base07` (5.0); `base06` (4.9, 4.9) |
+| Text on the error panel below 4.5:1 | `solarized-light` (3.6), `tokyo-night-moon` (3.8) | `base06` (8.7, 6.2) |
+| `toolTitle` (`base06`) below 4.5:1 | `catppuccin-latte` (2.2) | `base05` (6.6) |
+| `error` below 3:1 | `gruvbox-dark` (2.1), `nord` (2.5), `solarized-dark` (2.8) | blend 20-35% |
+| `warning`, `success`, `harness` below 3:1 | `catppuccin-latte`, `rose-pine-dawn`, `gruvbox-light`, `solarized-light` (1.8-2.7) | blend 15-40% |
+
+Light palettes fail most, because their accents were designed for editor
+backgrounds, not tinted panels.
+
+**Why core data, not a bundled extension.** First-party features normally
+dogfood public contracts (posture owner decision 1), and a bundled extension
+contributing `themes` was considered. Palettes are core data instead because
+they are built-in names: `YACH_THEME` and an extension theme's `base` must be
+able to name them, and an extension theme's `base` may name only a built-in
+(Theme sources and precedence). As an extension they could be disabled, which
+would break every theme built on them. This is the bootstrap exception the
+posture allows.
+
+**Runtime cost.** Files are embedded with `include_str!` in a static name
+table, following existing data embedding (`crates/yach-catalog/src/lib.rs:238`).
+Startup parses only the selected file, through the same `from_json` path as a
+user file, into the existing `Copy` `Theme`; rendering stays field reads.
+Embedded JSON is about 1-1.5 KiB per palette, roughly 25 KiB in total
+`[INFERENCE: estimated, measure against the binary size gate, plane:YACH-13]`.
+
+**Attribution.** `crates/yach-ui/themes/NOTICE.md` lists, per palette, the
+scheme author, upstream project and URL, upstream license, and the pinned
+Tinted Theming commit. Two upstreams have no clean license: classic Monokai
+states none, and Gruvbox's README claims MIT/X11 without a LICENSE file. They
+ship on the basis that color values are generally not copyrightable, and
+NOTICE says so rather than claiming a license. Monokai Pro is a separate
+commercial product; only classic Monokai ships, under that name.
+
+**Interaction with other rules.** `NO_COLOR` overrides a palette like any
+theme. Palettes are 24-bit; limited-color terminals use `system` (question
+7). Palettes paint surfaces, so the pairing rule (explicit fg on every painted
+bg) holds for every file. An unknown `base` or `YACH_THEME` name that is not a
+readable path produces a diagnostic listing the built-in names and falls back
+to `auto`.
 
 ### Project themes removed
 
@@ -560,13 +690,16 @@ Concrete layout (a panel is one row of rule plus the existing padded surface):
    work; land this step after those changes merge to avoid conflicts.
 4. CLI: `resolve_theme`, `NO_COLOR`, presets, `COLORFGBG` (`main.rs:425-450`,
    `3762-3772`); extend the existing precedence test (`main.rs:6019-6043`).
-5. Manifest: `contributes.themes` parsing and index plumbing
+5. Bundled palettes: the eighteen files, the name table, NOTICE, and the
+   per-palette contrast test. Independent of step 3 once steps 1 and 4 land.
+6. Manifest: `contributes.themes` parsing and index plumbing
    (`extension.rs:1662-1673`).
-6. Docs: theme file format and `base`, presets, `NO_COLOR`, extension themes
-   (`docs/extensions.md`), and a supersession note on the Wave 3 spec.
+7. Docs: theme file format and `base`, presets, bundled palettes, `NO_COLOR`,
+   extension themes (`docs/extensions.md`), and a supersession note on the
+   Wave 3 spec.
 
 Order: 1, 2, 4 first (no visible change except `NO_COLOR` and `YACH_THEME`
-names), then 3 (the owner-visible fix), then 5.
+names), then 3 (the owner-visible fix), then 5, then 6; docs (7) last.
 
 ### JSON token compatibility
 
@@ -574,13 +707,13 @@ names), then 3 (the owner-visible fix), then 5.
 |---|---|
 | 22 color tokens, 5 spacing tokens, `vars` | Unchanged names and parsing |
 | `deny_unknown_fields`, unknown token error | Unchanged |
-| New top-level `base` | Optional; default `dark` = today's behavior |
+| New top-level `base` | Optional; default `dark` = today's behavior; accepts presets, bundled palettes, extension themes |
 | Defaults: `toolSuccessBackground` | Green to neutral (= `toolPendingBackground`) |
 | Defaults: `toolOutput` | Gray 128 to a readable step below `text` |
 | Files that set the above explicitly | Unaffected; their values still win |
 | Files that did not | Pick up the new defaults (the intended fix) |
 | Project `<root>/.yach/theme.json` | No longer applied; startup diagnostic (Project themes removed) |
-| `YACH_THEME=<path>` | Unchanged, except four reserved preset names |
+| `YACH_THEME=<path>` | Unchanged, except reserved preset and bundled palette names |
 
 ## Testing
 
@@ -589,17 +722,23 @@ names), then 3 (the owner-visible fix), then 5.
 - Legacy file with all 22 tokens round-trips to the same values as before
   (regression for compatibility); file without `base` equals the `dark`
   preset plus its overrides.
-- Preset invariants: in `dark` and `light`, every surface helper returns an
-  explicit non-`Reset` fg and bg, and its text/panel contrast is at least
-  4.5:1 (WCAG relative luminance over `Rgb` values); `muted` is at least 3:1.
-  In `system`, every `bg` is `Reset`.
+- Preset invariants: in `dark`, `light` and every bundled palette, every
+  surface helper returns an explicit non-`Reset` fg and bg, and its text/panel
+  contrast is at least 4.5:1 (WCAG relative luminance over `Rgb` values);
+  `muted` is at least 3:1. In `system`, every `bg` is `Reset`.
 - Monochrome: no color field is anything but `Reset`; each helper in the
   table above returns the stated modifier.
 - Tool success surface equals the pending surface and is not the previous
   green; error and harness differ from both.
 - `COLORFGBG` parsing: `15;0`, `0;default;15`, `default;7`, empty, garbage.
-- `base` parsing: presets, `<ext>:<theme>`, extension theme naming a
-  non-preset base is rejected, reserved names rejected.
+- `base` parsing: presets, bundled palettes, `<ext>:<theme>`, extension theme
+  naming a non-built-in base is rejected, reserved names rejected.
+- Bundled palettes, for each embedded file: parses with no diagnostic; `base`
+  agrees with the scheme variant; `vars` contains `base00`..`base0F`; every
+  one of the 22 tokens is set explicitly; the `dark`/`light` contrast
+  invariants hold; `success`, `warning`, `error` and `harness` are at least
+  3:1 against the tool panel; the name table and the files on disk agree; each
+  name has a NOTICE entry.
 
 **Unit (`yach-ui` `transcript.rs`, `BenchmarkApp` + `TestBackend`):**
 
@@ -635,20 +774,21 @@ fixture session under `COLORTERM=truecolor` (`session.tape:14`). Add:
 
 1. ~~**Project themes.**~~ Resolved 2026-10-02: no project-scoped themes (see
    Project themes removed).
-2. **Default theme.** `auto` (COLORFGBG, else dark) as recommended; or keep a
-   fixed `dark`; or default to `system`, which is always legible but paints no
-   user-message surface, weakening Wave 3's conversation hierarchy.
-3. **Compact successes.** Neutral panel for every tool row (proposed), or
-   panel only for rows with output, pending, or error and an unpaneled inline
-   row for compact successes (opencode `InlineTool` shape)?
-4. **`NO_COLOR` vs explicit theme.** `NO_COLOR` always wins (proposed), or let
-   an explicit user theme or `YACH_THEME` override it, as no-color.org permits?
-5. **Extension runtime control.** Is declarative contribution plus user
-   selection enough for the owner's "controllable by extensions", or is a
-   runtime `ui.theme.request` with user confirmation needed in this slice?
-6. **Terminal queries.** Add OSC 10/11 detection (with a ~100 ms cap, before
-   `EventStream` starts) in a follow-up, or stay with `COLORFGBG` only?
-7. **Color depth.** Presets use 24-bit RGB; Wave 3 required degrading cleanly
-   without true color (`2026-08-19-wave3-tui-visual-design.md:108`) but nothing
-   implements it. Add a `COLORTERM`-based downgrade, or point limited-terminal
-   users to `system`?
+2. ~~**Default theme.**~~ Resolved 2026-10-06: `auto` (COLORFGBG, else dark).
+3. ~~**Compact successes.**~~ Resolved 2026-10-06: neutral panel for every
+   tool row.
+4. ~~**`NO_COLOR` vs explicit theme.**~~ Resolved 2026-10-06: `NO_COLOR`
+   always wins.
+5. ~~**Extension runtime control.**~~ Resolved 2026-10-06: declarative
+   contribution plus user selection in this slice; runtime theme requests are
+   deferred.
+6. ~~**Terminal queries.**~~ Resolved 2026-10-06: OSC 10/11 detection is a
+   follow-up; this slice uses `COLORFGBG` only.
+7. ~~**Color depth.**~~ Resolved 2026-10-06: limited-color terminals are
+   pointed to `system` in this slice; automatic 24-bit downgrade is not
+   implemented. Revisit if bundled named palettes make it necessary.
+
+8. ~~**Light/dark pairing for `auto`.**~~ Resolved 2026-10-06: deferred. The
+   direction is Zed/Ghostty/Pi-style pairing, where the user names one light
+   and one dark theme for `auto` to choose between; it lands with OSC 11
+   detection, since `COLORFGBG` is unreliable (Light and dark selection).
