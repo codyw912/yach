@@ -36,8 +36,10 @@ result-*
 # Local agent worktrees
 .worktrees/
 
-# Local planning-tracker configuration
-.sjujperpowers/
+# Local planning-tracker configuration and agent workspaces; the committed
+# verification risk policy is the one tracked file.
+.sjujperpowers/*
+!.sjujperpowers/risk.toml
 
 # env files
 .env*
