@@ -53,6 +53,16 @@ id = "*#alloc_bytes"
 count = 0
 
 [[workload]]
+id = "viewport/huge_transcript_scroll_headless/10000#alloc_bytes"
+count = 76706134
+comment = "assistant Markdown rendering (PR #290): measured 15928723 -> 92634857 (+76706134 bytes) against main 3031a214. The workload builds a fresh app per sample and renders a 10000-entry transcript cold, so it parses all ~3333 assistant entries once; the per-entry render cache in the same PR cannot reduce this row by design. Its gain, streaming onto a long history (local: ~11 ms -> ~0.13 ms per delta on 10k entries), has no CI row yet (yach#c139, yach#mpag). Cause: pulldown-cmark 0.13 preallocates per parse (node tree of max(128, len/32), 128-slot link table), measured in isolation at 3 allocations / 16416 bytes for a one-line message, freed when the parse ends. Transient, not retained. Budgeted at the measured delta exactly: the base side measured 15928723 both locally and on the CI runner (run 37076830178), and three local runs of the current side were identical."
+
+[[workload]]
+id = "viewport/huge_transcript_scroll_headless/10000#alloc_count"
+count = 83323
+comment = "assistant Markdown rendering (PR #290): measured 140277 -> 223600 (+83323) against main 3031a214. Same cold-render cause as the alloc_bytes row, ~25 allocations per assistant entry: 3 from the parser (measured in isolation), the rest inferred to be the renderer's per-line Line, Span and String construction. Budgeted at the measured delta exactly."
+
+[[workload]]
 id = "turn/scripted/text_only#alloc_bytes"
 count = 1144
 comment = "session diagnostics (PR #283): measured 333406 -> 334550 (+1144 bytes) against main. Inferred, not isolated: each provider attempt now builds an AttemptLabel and a ProviderAttemptFinished event (owned session, turn, and model strings) and appends it directly to the store as one serialized line. Budgeted at the measured delta exactly, so any further growth fails. Earlier rows: intent-aware auto-review (PR #278) +1536; session approval grants +128."
