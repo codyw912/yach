@@ -220,10 +220,9 @@ impl Theme {
         )
     }
 
-    /// Pending and Success share a background only when the preset says so.
-    /// `dark` still has a distinct success green until Task 5. Error and
-    /// Harness share the error background, matching today's harness outcome
-    /// (`transcript.rs:1254-1263`).
+    /// Dark and light presets share a neutral pending/success background;
+    /// custom themes may override either state independently. Error and
+    /// harness outcomes share the error background.
     #[must_use]
     pub fn tool_surface(&self, state: ToolState) -> Style {
         self.surface(self.colors.text, self.tool_background(state))
@@ -570,10 +569,10 @@ mod tests {
         assert_eq!(theme.colors.user_message_background, Color::Rgb(52, 53, 65));
         assert_eq!(theme.colors.user_message_text, Color::White);
         assert_eq!(theme.colors.tool_pending_background, Color::Rgb(40, 40, 50));
-        assert_eq!(theme.colors.tool_success_background, Color::Rgb(40, 50, 40));
+        assert_eq!(theme.colors.tool_success_background, Color::Rgb(40, 40, 50));
         assert_eq!(theme.colors.tool_error_background, Color::Rgb(60, 40, 40));
         assert_eq!(theme.colors.tool_title, Color::White);
-        assert_eq!(theme.colors.tool_output, Color::Rgb(128, 128, 128));
+        assert_eq!(theme.colors.tool_output, Color::Rgb(192, 192, 192));
         assert_eq!(theme.colors.diff_added, Color::Rgb(181, 189, 104));
         assert_eq!(theme.colors.diff_removed, Color::Rgb(204, 102, 102));
         assert_eq!(theme.colors.diff_context, Color::Rgb(128, 128, 128));
@@ -585,12 +584,10 @@ mod tests {
         assert_eq!(theme.spacing.tool_vertical_padding, 1);
         assert_eq!(theme.spacing.tool_gap, 1);
 
-        // The two values Task 5 will change are still the old ones here.
-        assert_ne!(
+        assert_eq!(
             theme.colors.tool_success_background,
             theme.colors.tool_pending_background
         );
-        assert_eq!(theme.colors.tool_output, Color::Rgb(128, 128, 128));
     }
 
     #[test]
@@ -893,16 +890,17 @@ mod tests {
     }
 
     #[test]
-    fn light_and_system_share_pending_and_success_surfaces() {
-        let theme = Theme::light();
-        assert_eq!(
-            theme.tool_surface(ToolState::Pending),
-            theme.tool_surface(ToolState::Success),
-        );
-        assert_ne!(
-            theme.tool_surface(ToolState::Error),
-            theme.tool_surface(ToolState::Pending),
-        );
+    fn painted_and_system_share_pending_and_success_surfaces() {
+        for theme in [Theme::light(), Theme::dark()] {
+            assert_eq!(
+                theme.tool_surface(ToolState::Pending),
+                theme.tool_surface(ToolState::Success),
+            );
+            assert_ne!(
+                theme.tool_surface(ToolState::Error),
+                theme.tool_surface(ToolState::Pending),
+            );
+        }
         // `system` paints no panel in any state; the rule carries the state.
         let system = Theme::system();
         for state in [
@@ -913,12 +911,6 @@ mod tests {
         ] {
             assert_eq!(system.tool_surface(state).bg, Some(Color::Reset));
         }
-        // dark is deliberately NOT asserted here. Its success surface is
-        // still the green Rgb(40, 50, 40); Task 5 changes that default.
-        assert_ne!(
-            Theme::dark().tool_surface(ToolState::Pending),
-            Theme::dark().tool_surface(ToolState::Success),
-        );
     }
 
     #[test]

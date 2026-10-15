@@ -1161,6 +1161,9 @@ fn render_assistant_markdown_lines(content: &str, width: u16, theme: &Theme) -> 
 }
 
 fn render_entry_lines(entry: &TranscriptEntry, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    if is_tool_entry(&entry.kind) {
+        return render_tool_entry_lines(entry, width, theme);
+    }
     let display_text = entry_display_text(entry);
     let (prefix, continuation, content, content_style, prefix_width) = match &entry.kind {
         EntryKind::UserMessage => return render_user_message_lines(&display_text, width, theme),
@@ -1174,48 +1177,7 @@ fn render_entry_lines(entry: &TranscriptEntry, width: u16, theme: &Theme) -> Vec
             theme.muted(),
             2,
         ),
-        EntryKind::ToolCall { name, .. } => (
-            Span::styled("⚙ ", theme.warning().add_modifier(Modifier::BOLD)),
-            Span::styled("│ ", theme.dim()),
-            name_and_detail(name, &display_text),
-            // F3: tool_title() is bold, but today's ToolCall title is not.
-            // Task 5 owns that visible change; this task keeps the fg only.
-            Style::new().fg(theme.tool_title().fg.unwrap_or(Color::Reset)),
-            2,
-        ),
-        EntryKind::ToolResult {
-            name,
-            outcome_kind: Some(kind),
-            ..
-        } => {
-            let (label, style) = harness_outcome_style(*kind, theme);
-            (
-                Span::styled("! ", style),
-                Span::styled("│ ", theme.dim()),
-                name_and_detail(&format!("{label} {name}"), &display_text),
-                style,
-                2,
-            )
-        }
-        EntryKind::ToolResult { name, is_error, .. } => {
-            let state = tool_state(entry);
-            let (marker, marker_style, content_style) = if *is_error {
-                (
-                    "✗ ",
-                    theme.error().add_modifier(Modifier::BOLD),
-                    theme.error(),
-                )
-            } else {
-                ("✓ ", theme.success(), theme.tool_output(state))
-            };
-            (
-                Span::styled(marker, marker_style),
-                Span::styled("│ ", theme.dim()),
-                name_and_detail(name, &display_text),
-                content_style,
-                2,
-            )
-        }
+        EntryKind::ToolCall { .. } | EntryKind::ToolResult { .. } => unreachable!(),
         EntryKind::HarnessOutcome { kind } => {
             let (label, style) = harness_outcome_style(*kind, theme);
             (
@@ -1242,16 +1204,7 @@ fn render_entry_lines(entry: &TranscriptEntry, width: u16, theme: &Theme) -> Vec
         ),
     };
 
-    let is_tool = is_tool_entry(&entry.kind);
-    let horizontal_padding = if is_tool {
-        usize::from(theme.spacing.tool_horizontal_padding)
-    } else {
-        0
-    };
-    let available_width = usize::from(width)
-        .saturating_sub(horizontal_padding.saturating_mul(2))
-        .saturating_sub(prefix_width)
-        .max(1);
+    let available_width = usize::from(width).saturating_sub(prefix_width).max(1);
     let wrapped = wrap_text(&content, available_width);
     let mut result = Vec::with_capacity(wrapped.len() + entry.stream_tail.lines().count());
     for (index, line) in wrapped.into_iter().enumerate() {
@@ -1267,20 +1220,7 @@ fn render_entry_lines(entry: &TranscriptEntry, width: u16, theme: &Theme) -> Vec
             ),
         ]));
     }
-    if !entry.stream_tail.is_empty() {
-        let tail_style = theme.dim();
-        for line in wrap_text(&entry.stream_tail, available_width) {
-            result.push(Line::from(vec![
-                continuation.clone(),
-                Span::styled(line, tail_style),
-            ]));
-        }
-    }
-    if is_tool {
-        render_tool_surface(result, width, tool_background(entry, theme), theme)
-    } else {
-        result
-    }
+    result
 }
 
 fn render_user_message_lines(display_text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
@@ -1339,29 +1279,162 @@ fn render_user_message_lines(display_text: &str, width: u16, theme: &Theme) -> V
     lines
 }
 
+const TOOL_RULE_WIDTH: usize = 1;
+
+fn tool_horizontal_padding(width: usize, theme: &Theme) -> usize {
+    usize::from(theme.spacing.tool_horizontal_padding)
+        .min(width.saturating_sub(TOOL_RULE_WIDTH) / 2)
+}
+
+fn render_tool_entry_lines(
+    entry: &TranscriptEntry,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let state = tool_state(entry);
+    let (marker, title) = match &entry.kind {
+        EntryKind::ToolCall { name, .. } => (
+            Span::styled("⚙ ", theme.warning().add_modifier(Modifier::BOLD)),
+            std::borrow::Cow::Borrowed(name.as_str()),
+        ),
+        EntryKind::ToolResult {
+            name,
+            outcome_kind: Some(kind),
+            ..
+        } => {
+            let (label, style) = harness_outcome_style(*kind, theme);
+            (
+                Span::styled("! ", style),
+                std::borrow::Cow::Owned(format!("{label} {name}")),
+            )
+        }
+        EntryKind::ToolResult { name, is_error, .. } => {
+            let marker = if *is_error {
+                Span::styled("✗ ", theme.error().add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled("✓ ", theme.success())
+            };
+            (marker, std::borrow::Cow::Borrowed(name.as_str()))
+        }
+        _ => unreachable!(),
+    };
+    let display_text = entry_display_text(entry);
+    let content = name_and_detail(&title, &display_text);
+    let width_usize = usize::from(width.max(1));
+    let available_width = width_usize
+        .saturating_sub(TOOL_RULE_WIDTH)
+        .saturating_sub(tool_horizontal_padding(width_usize, theme).saturating_mul(2))
+        .saturating_sub(marker.width())
+        .max(1);
+    let wrapped: Vec<_> = content
+        .lines()
+        .chain(content.is_empty().then_some(""))
+        .enumerate()
+        .flat_map(|(source_index, source_line)| {
+            wrap_text(source_line, available_width)
+                .into_iter()
+                .map(move |line| (source_index, line))
+        })
+        .collect();
+    let mut result = Vec::with_capacity(wrapped.len() + entry.stream_tail.lines().count());
+    let mut title_remaining = title.len();
+    for (index, (source_index, mut line)) in wrapped.into_iter().enumerate() {
+        let mut spans = vec![if index == 0 {
+            marker.clone()
+        } else {
+            Span::raw("  ")
+        }];
+        let title_len = title_remaining.min(line.len());
+        title_remaining -= title_len;
+        let default = if source_index == 0 && !entry.expanded {
+            theme.muted()
+        } else {
+            theme.tool_output(state)
+        };
+        let style = transcript_line_style(entry, &line, default, theme);
+        if title_len == 0 {
+            spans.push(Span::styled(line, style));
+        } else if title_len == line.len() {
+            spans.push(Span::styled(line, theme.tool_title()));
+        } else {
+            let detail = line.split_off(title_len);
+            spans.push(Span::styled(line, theme.tool_title()));
+            spans.push(Span::styled(detail, style));
+        }
+        result.push(Line::from(spans));
+    }
+    if !entry.stream_tail.is_empty() {
+        for line in wrap_text(&entry.stream_tail, available_width) {
+            result.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, theme.tool_output(state)),
+            ]));
+        }
+    }
+    render_tool_surface(result, width, state, theme)
+}
+
+/// Only tiny viewports need clipping: normal rows already wrap inside the body.
+fn clip_tool_line(line: &mut Line<'static>, width: usize) {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    if line.width() <= width {
+        return;
+    }
+    let mut remaining = width;
+    line.spans.retain_mut(|span| {
+        let mut end = 0;
+        for (offset, grapheme) in span.content.grapheme_indices(true) {
+            let cells = grapheme.width();
+            if cells > remaining {
+                break;
+            }
+            remaining -= cells;
+            end = offset + grapheme.len();
+        }
+        if end < span.content.len() {
+            span.content.to_mut().truncate(end);
+            remaining = 0;
+        }
+        !span.content.is_empty()
+    });
+}
+
 fn render_tool_surface(
     lines: Vec<Line<'static>>,
     width: u16,
-    background: Color,
+    state: crate::theme::ToolState,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
-    let horizontal_padding =
-        usize::from(theme.spacing.tool_horizontal_padding).min(width.saturating_sub(1) / 2);
-    let inner_width = width.saturating_sub(horizontal_padding.saturating_mul(2));
-    let background_style = Style::new().bg(background);
+    let surface = theme.tool_surface(state);
+    let rule = Span::styled("┃", theme.tool_rule(state));
+    let horizontal_padding = tool_horizontal_padding(width, theme);
+    let inner_width = width
+        .saturating_sub(TOOL_RULE_WIDTH)
+        .saturating_sub(horizontal_padding.saturating_mul(2));
+    let background_style = Style::new().bg(surface.bg.unwrap_or(Color::Reset));
     let vertical_padding = usize::from(theme.spacing.tool_vertical_padding);
+    let padding_row = || {
+        Line::from(vec![
+            rule.clone(),
+            Span::styled(
+                " ".repeat(width.saturating_sub(TOOL_RULE_WIDTH)),
+                background_style,
+            ),
+        ])
+    };
     let mut rendered = Vec::with_capacity(lines.len() + vertical_padding.saturating_mul(2));
-    rendered.extend(
-        std::iter::repeat_with(|| Line::from(Span::styled(" ".repeat(width), background_style)))
-            .take(vertical_padding),
-    );
+    rendered.extend(std::iter::repeat_with(padding_row).take(vertical_padding));
     for mut line in lines {
+        clip_tool_line(&mut line, inner_width);
         let line_width = line.width().min(inner_width);
         for span in &mut line.spans {
-            span.style = span.style.bg(background);
+            span.style.bg = surface.bg;
         }
-        let mut spans = Vec::with_capacity(line.spans.len() + 2);
+        let mut spans = Vec::with_capacity(line.spans.len() + 3);
+        spans.push(rule.clone());
         spans.push(Span::styled(
             " ".repeat(horizontal_padding),
             background_style,
@@ -1377,30 +1450,20 @@ fn render_tool_surface(
         ));
         rendered.push(Line::from(spans));
     }
-    rendered.extend(
-        std::iter::repeat_with(|| Line::from(Span::styled(" ".repeat(width), background_style)))
-            .take(vertical_padding),
-    );
+    rendered.extend(std::iter::repeat_with(padding_row).take(vertical_padding));
     rendered
 }
 
 fn tool_state(entry: &TranscriptEntry) -> crate::theme::ToolState {
     match entry.kind {
-        EntryKind::ToolResult { is_error: true, .. }
-        | EntryKind::ToolResult {
+        EntryKind::ToolResult {
             outcome_kind: Some(_),
             ..
-        } => crate::theme::ToolState::Error,
+        } => crate::theme::ToolState::Harness,
+        EntryKind::ToolResult { is_error: true, .. } => crate::theme::ToolState::Error,
         EntryKind::ToolResult { .. } => crate::theme::ToolState::Success,
         _ => crate::theme::ToolState::Pending,
     }
-}
-
-fn tool_background(entry: &TranscriptEntry, theme: &Theme) -> Color {
-    theme
-        .tool_surface(tool_state(entry))
-        .bg
-        .unwrap_or(Color::Reset)
 }
 
 fn transcript_line_style(
@@ -1528,7 +1591,7 @@ fn bottom_aligned_top_padding(visible_lines: usize, viewport_height: usize) -> u
 mod tests {
     use super::{
         EntryKind, HarnessOutcomeKind, STREAM_TAIL_MAX_LINES, ToolReviewRowStatus, Transcript,
-        TranscriptAlignment, TranscriptRenderCache, bottom_aligned_top_padding,
+        TranscriptAlignment, TranscriptEntry, TranscriptRenderCache, bottom_aligned_top_padding,
         char_boundary_at_or_before, entry_display_text, harness_outcome_style, render_lines,
         render_lines_with_theme, render_uncached, wrap_text,
     };
@@ -1540,6 +1603,288 @@ mod tests {
         PromptAttemptResetError, ToolReviewDecision, ToolReviewHistory, ToolReviewPayload,
         ToolReviewResolution,
     };
+    /// Column zero belongs to the rule, not the painted body.
+    fn panel_rows<'a>(
+        lines: &'a [ratatui::text::Line<'static>],
+    ) -> Vec<&'a ratatui::text::Line<'static>> {
+        lines
+            .iter()
+            .filter(|line| line.spans.first().is_some_and(|span| span.content == "┃"))
+            .collect()
+    }
+
+    #[test]
+    fn tool_panel_draws_one_rule_on_every_row_including_padding() {
+        let mut transcript = Transcript::new();
+        transcript.append_tool_call(Some("call-1"), "bash", Some("cargo test"));
+        transcript.append_tool_call_output("call-1", "line one\nline two\n");
+        let lines = render_lines_with_theme(transcript.entries(), 40, &Theme::dark());
+        assert_eq!(lines.len(), 5);
+        assert_eq!(
+            panel_rows(&lines).len(),
+            5,
+            "every panel row must carry a rule, including padding"
+        );
+        let text: Vec<_> = lines
+            .iter()
+            .map(|line| {
+                assert_eq!(line.width(), 40);
+                assert_eq!(line.spans[0].content, "┃");
+                let text = line.to_string();
+                assert!(!text.contains("│ "));
+                text.trim_end().to_owned()
+            })
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "┃",
+                "┃ ⚙ bash cargo test",
+                "┃   line one",
+                "┃   line two",
+                "┃"
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_rule_color_and_marker_follow_every_state() {
+        let theme = Theme::dark();
+        for (is_error, outcome_kind, marker, state) in [
+            (false, None, "✓ read completed", ToolState::Success),
+            (true, None, "✗ read completed", ToolState::Error),
+            (
+                false,
+                Some(HarnessOutcomeKind::Denied),
+                "! denied read completed",
+                ToolState::Harness,
+            ),
+            (
+                true,
+                Some(HarnessOutcomeKind::Denied),
+                "! denied read completed",
+                ToolState::Harness,
+            ),
+        ] {
+            let mut transcript = Transcript::new();
+            transcript.append_tool_result_with_kind(
+                None,
+                "read",
+                "completed",
+                is_error,
+                outcome_kind,
+            );
+            let lines = render_lines_with_theme(transcript.entries(), 40, &theme);
+            assert_eq!(lines.len(), 3);
+            assert_eq!(panel_rows(&lines).len(), 3);
+            assert_eq!(lines[1].to_string().trim_end(), format!("┃ {marker}"));
+            for line in &lines {
+                assert_eq!(line.width(), 40);
+                assert_eq!(line.spans[0].style, theme.tool_rule(state));
+                assert!(
+                    line.spans[1..]
+                        .iter()
+                        .all(|span| span.style.bg == theme.tool_surface(state).bg)
+                );
+            }
+        }
+        let mut pending = Transcript::new();
+        pending.append_tool_call(None, "read", Some("src/lib.rs"));
+        let lines = render_lines_with_theme(pending.entries(), 40, &theme);
+        assert_eq!(lines[1].to_string().trim_end(), "┃ ⚙ read src/lib.rs");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.spans[0].style == theme.tool_rule(ToolState::Pending))
+        );
+    }
+
+    #[test]
+    fn tool_header_summary_and_body_have_distinct_roles() {
+        let theme = Theme::dark();
+        let mut transcript = Transcript::new();
+        transcript.append_tool_result_record(None, "bash", "summary", "body", false, None, None);
+        let lines = render_lines_with_theme(transcript.entries(), 40, &theme);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        for (text, style) in [
+            ("bash", theme.tool_title()),
+            (" summary", theme.muted()),
+            ("body", theme.tool_output(ToolState::Success)),
+        ] {
+            let span = spans.iter().find(|span| span.content == text);
+            assert!(span.is_some(), "missing role span {text:?}: {spans:?}");
+            let Some(span) = span else { return };
+            assert_eq!(span.style.fg, style.fg, "{text}");
+            assert_eq!(span.style.add_modifier, style.add_modifier, "{text}");
+        }
+    }
+
+    #[test]
+    fn tool_body_role_follows_crlf_summary_and_wrapped_lines() {
+        let theme = Theme::dark();
+        for newline in ["\n", "\r\n"] {
+            for width in [12, 40] {
+                let mut transcript = Transcript::new();
+                transcript.append_tool_result(
+                    None,
+                    "bash",
+                    &format!("summary{newline}body{newline}{newline}tail"),
+                    false,
+                );
+                let lines = render_lines_with_theme(transcript.entries(), width, &theme);
+                for text in ["body", "tail"] {
+                    let span = lines
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .find(|span| span.content == text);
+                    assert!(
+                        span.is_some(),
+                        "missing {text:?} at width {width} with {newline:?}"
+                    );
+                    let Some(span) = span else { return };
+                    assert_eq!(
+                        span.style,
+                        theme.tool_output(ToolState::Success),
+                        "{text:?} at width {width} with {newline:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_wrap_reserves_exactly_one_rule_column() {
+        let mut transcript = Transcript::new();
+        transcript.append_tool_call(
+            Some("call-1"),
+            "read_text_file",
+            Some("abcdefghijklmnopqrstuv"),
+        );
+        transcript.append_tool_call_output("call-1", "0123456789abcdefghijkl");
+        let lines = render_lines_with_theme(transcript.entries(), 20, &Theme::dark());
+        assert_eq!(lines.len(), 7);
+        assert_eq!(panel_rows(&lines).len(), 7);
+        for line in &lines {
+            assert_eq!(line.width(), 20);
+        }
+        let text: Vec<_> = lines
+            .iter()
+            .map(|line| line.to_string().trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "┃",
+                "┃ ⚙ read_text_file ",
+                "┃   abcdefghijklmno",
+                "┃   pqrstuv",
+                "┃   0123456789abcde",
+                "┃   fghijkl",
+                "┃"
+            ]
+            .map(|line| line.trim_end().to_owned())
+        );
+    }
+
+    #[test]
+    fn tool_wrap_keeps_full_unicode_text_and_display_width() {
+        let mut transcript = Transcript::new();
+        transcript.append_tool_call(None, "read", Some("界界界abc界界"));
+        let lines = render_lines_with_theme(transcript.entries(), 12, &Theme::dark());
+        assert_eq!(lines.len(), 5);
+        for line in &lines {
+            assert_eq!(line.width(), 12);
+            assert_eq!(line.spans[0].content, "┃");
+            assert!(!line.to_string().contains("│ "));
+        }
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.to_string().trim_end().to_owned())
+                .collect::<Vec<_>>(),
+            ["┃", "┃ ⚙ read 界", "┃   界界abc", "┃   界界", "┃"]
+        );
+    }
+
+    #[test]
+    fn narrow_tool_rows_fit_and_never_disappear() {
+        use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
+        for width in 0..10 {
+            let mut transcript = Transcript::new();
+            transcript.append_tool_result(
+                None,
+                "read_text_file",
+                "completed: 界 wide output",
+                false,
+            );
+            let lines = render_lines_with_theme(transcript.entries(), width, &Theme::dark());
+            let width = width.max(1);
+            assert!(!lines.is_empty());
+            let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+            for line in &lines {
+                assert_eq!(line.spans[0].content, "┃");
+                assert_eq!(line.width(), usize::from(width), "width {width}: {line:?}");
+            }
+            let mut terminal = match Terminal::new(TestBackend::new(width, height)) {
+                Ok(terminal) => terminal,
+                Err(infallible) => match infallible {},
+            };
+            assert!(
+                terminal
+                    .draw(|frame| frame.render_widget(Paragraph::new(lines), frame.area()))
+                    .is_ok()
+            );
+            for row in 0..height {
+                assert_eq!(terminal.backend().buffer()[(0, row)].symbol(), "┃");
+            }
+        }
+    }
+
+    #[test]
+    fn monochrome_user_tool_and_review_cells_have_no_colors() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut transcript = theme_migration_fixture();
+        transcript.append_tool_result_with_kind(
+            None,
+            "read",
+            "blocked",
+            true,
+            Some(HarnessOutcomeKind::Denied),
+        );
+        let lines = render_lines_with_theme(transcript.entries(), 80, &Theme::monochrome());
+        let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let mut terminal = match Terminal::new(TestBackend::new(80, height)) {
+            Ok(terminal) => terminal,
+            Err(infallible) => match infallible {},
+        };
+        let mut cache = TranscriptRenderCache::with_theme(Theme::monochrome());
+        assert!(
+            terminal
+                .draw(|frame| cache.render(
+                    frame.area(),
+                    frame.buffer_mut(),
+                    &transcript,
+                    0,
+                    false,
+                    TranscriptAlignment::Top
+                ))
+                .is_ok()
+        );
+        let buffer = terminal.backend().buffer();
+        let mut symbols = String::new();
+        for y in 0..height {
+            for x in 0..80 {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.fg, ratatui::style::Color::Reset, "({x},{y})");
+                assert_eq!(cell.bg, ratatui::style::Color::Reset, "({x},{y})");
+                symbols.push_str(cell.symbol());
+            }
+        }
+        for marker in ["›", "⚙", "✓", "✗", "!", "+new line", "-old line", "┃"] {
+            assert!(symbols.contains(marker), "missing {marker}");
+        }
+    }
+
     #[test]
     fn transcript_accumulates_deltas_into_single_entry() {
         let mut transcript = Transcript::new();
@@ -1757,8 +2102,14 @@ mod tests {
         assert!(rendered.contains("› Approve"));
         assert!(rendered.contains("  Reject"));
         assert!(rendered.contains("↑/↓ or j/k select · Enter confirm"));
+        for line in &lines {
+            assert_eq!(
+                line.spans[0].style,
+                Theme::dark().tool_rule(ToolState::Pending)
+            );
+        }
         assert!(lines.iter().all(|line| {
-            line.spans
+            line.spans[1..]
                 .iter()
                 .all(|span| span.style.bg == Theme::dark().tool_surface(ToolState::Pending).bg)
         }));
@@ -2214,9 +2565,9 @@ mod tests {
         assert_eq!(lines[4].spans[0].content, "• ");
         assert_eq!(lines[4].spans[1].style.fg, theme.text().fg);
         assert!(lines[5].spans.is_empty());
+        assert_eq!(lines[6].spans[0].style, theme.tool_rule(ToolState::Pending));
         assert!(
-            lines[6]
-                .spans
+            lines[6].spans[1..]
                 .iter()
                 .all(|span| span.style.bg == theme.tool_surface(ToolState::Pending).bg)
         );
@@ -2276,9 +2627,12 @@ mod tests {
                 .iter()
                 .any(|span| span.style.fg == theme.user_message().fg)
         );
+        assert_eq!(
+            tool_line.spans[0].style,
+            theme.tool_rule(ToolState::Pending)
+        );
         assert!(
-            tool_line
-                .spans
+            tool_line.spans[1..]
                 .iter()
                 .all(|span| span.style.bg == theme.tool_surface(ToolState::Pending).bg)
         );
@@ -2311,16 +2665,22 @@ mod tests {
         assert_eq!(lines.len(), 11);
         assert!(lines[3].spans.is_empty());
         assert!(lines[7].spans.is_empty());
-        assert!(
-            lines[4..=6]
+        for line in lines[4..=6].iter().chain(&lines[8..=10]) {
+            assert_eq!(
+                line.spans[0].style,
+                Theme::dark().tool_rule(ToolState::Success)
+            );
+        }
+        assert!(lines[4..=6].iter().all(|line| {
+            line.spans[1..]
                 .iter()
-                .all(|line| { line.spans.iter().all(|span| span.style.bg == background) })
-        );
-        assert!(
-            lines[8..=10]
+                .all(|span| span.style.bg == background)
+        }));
+        assert!(lines[8..=10].iter().all(|line| {
+            line.spans[1..]
                 .iter()
-                .all(|line| { line.spans.iter().all(|span| span.style.bg == background) })
-        );
+                .all(|span| span.style.bg == background)
+        }));
     }
 
     #[test]
@@ -2352,7 +2712,7 @@ mod tests {
         );
 
         let mut transcript = Transcript::new();
-        transcript.entries.push(super::TranscriptEntry::new(
+        transcript.entries.push(TranscriptEntry::new(
             String::from("turn stopped"),
             EntryKind::HarnessOutcome {
                 kind: HarnessOutcomeKind::Limit,
@@ -2521,7 +2881,7 @@ mod tests {
                 }
                 if cell.symbol() == "✓" {
                     assert_eq!(cell.fg, theme.success().fg.unwrap_or(Color::Reset));
-                    assert_eq!(cell.bg, success, "success row must keep today's green band");
+                    assert_eq!(cell.bg, success, "success row must use the neutral panel");
                     saw_success = true;
                 }
                 if cell.symbol() == "✗" {
@@ -2564,7 +2924,7 @@ mod tests {
     }
 
     #[test]
-    fn dark_transcript_buffer_is_stable_across_helper_migration() {
+    fn dark_transcript_buffer_pins_tool_treatment() {
         let transcript = theme_migration_fixture();
         let buffer = draw_theme_migration_fixture(&transcript);
         let theme = Theme::dark();
@@ -2579,7 +2939,7 @@ mod tests {
         let pinned = std::fs::read_to_string(&pin_path).unwrap_or_default();
         assert_eq!(
             dumped, pinned,
-            "dark transcript buffer changed; this task must not change it"
+            "dark transcript buffer changed; review visible deltas before updating the pin"
         );
     }
 }
