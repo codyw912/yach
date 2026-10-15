@@ -1523,7 +1523,7 @@ mod tests {
         char_boundary_at_or_before, entry_display_text, harness_outcome_style, render_lines,
         render_lines_with_theme, render_uncached, wrap_text,
     };
-    use crate::theme::Theme;
+    use crate::theme::{Theme, ThemeDocument};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use yach_proto::{
@@ -2216,7 +2216,7 @@ mod tests {
 
     #[test]
     fn custom_theme_colors_user_and_tool_surfaces() {
-        let parsed = Theme::from_json(
+        let parsed = ThemeDocument::parse(
             r##"{
                 "colors": {
                     "userMessageBackground": "#010203",
@@ -2230,7 +2230,12 @@ mod tests {
             }"##,
         );
         assert!(parsed.is_ok());
-        let Ok(theme) = parsed else {
+        let Ok(document) = parsed else {
+            return;
+        };
+        let theme = document.apply(Theme::dark());
+        assert!(theme.is_ok());
+        let Ok(theme) = theme else {
             return;
         };
         let mut transcript = Transcript::new();

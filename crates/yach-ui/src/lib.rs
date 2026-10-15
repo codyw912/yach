@@ -23,7 +23,9 @@ pub use app::{
     BenchmarkApp, RunTuiOptions, run_tui, run_tui_with_trace, run_tui_with_trace_and_options,
 };
 
-pub use theme::{Theme, ThemeColors, ThemeLoadError, ThemeSpacing};
+pub use theme::{
+    DiffKind, Theme, ThemeColors, ThemeDocument, ThemeLoadError, ThemeMode, ThemeSpacing, ToolState,
+};
 pub use transcript::Transcript;
 
 use yach_proto::{Capability, Handshake, NegotiatedCapabilities, default_ui_handshake};

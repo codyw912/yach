@@ -41,8 +41,8 @@ use yach_proto::{
     NegotiatedCapabilities, PromptOutcome, ServerEvent, ThinkingLevel,
 };
 use yach_ui::{
-    RunTuiOptions, Theme, alpha_handshake, negotiate_with as negotiate_with_ui, run_tui,
-    run_tui_with_trace_and_options,
+    RunTuiOptions, Theme, ThemeDocument, alpha_handshake, negotiate_with as negotiate_with_ui,
+    run_tui, run_tui_with_trace_and_options,
 };
 mod bundled;
 mod codex_release;
@@ -436,7 +436,13 @@ fn load_tui_theme(project_root: Option<&Path>) -> Result<Theme, String> {
     let Some(path) = tui_theme_path(project_root, explicit.as_deref(), home.as_deref()) else {
         return Ok(Theme::default());
     };
-    Theme::load(&path).map_err(|error| format!("failed to load theme {}: {error}", path.display()))
+    let json = std::fs::read_to_string(&path)
+        .map_err(|error| format!("failed to load theme {}: {error}", path.display()))?;
+    let document = ThemeDocument::parse(&json)
+        .map_err(|error| format!("failed to load theme {}: {error}", path.display()))?;
+    document
+        .apply(Theme::dark())
+        .map_err(|error| format!("failed to load theme {}: {error}", path.display()))
 }
 
 fn tui_theme_path(
