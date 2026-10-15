@@ -414,6 +414,8 @@ pub(super) fn send_native_session_stats_with_estimate(
             tool_message_count,
             total_tokens,
             context_window: context_budget.map(|budget| budget.context_window),
+            context_window_assumed: context_budget
+                .is_some_and(|budget| budget.context_window_assumed),
             context_used_percent,
             compaction_count,
         },

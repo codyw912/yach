@@ -72,7 +72,8 @@ pub struct StatusBar<'a> {
     /// a warning while the auto-compaction threshold approaches.
     pub context_used_percent: Option<u8>,
     /// Configured model context window before output and compaction reserves.
-    pub context_window: Option<u64>,
+    /// The bool is `true` when the number is the catalog floor, not a listed value.
+    pub context_window: Option<(u64, bool)>,
     pub theme: &'a Theme,
 }
 
@@ -247,11 +248,16 @@ fn segment_style(
     }
 }
 
-pub(crate) fn format_context_meter(percent: u8, context_window: Option<u64>) -> String {
+pub(crate) fn format_context_meter(percent: u8, context_window: Option<(u64, bool)>) -> String {
     let overflow_marker = if percent > 100 { "+" } else { "" };
     let mut text = format!("ctx:{}%{overflow_marker}", percent.min(100));
-    if let Some(context_window) = context_window {
+    if let Some((context_window, assumed)) = context_window {
         text.push('/');
+        // A leading tilde is the smallest marker that fits the meter's
+        // `ctx:N%/Nk` shape and still reads as "not a measured window".
+        if assumed {
+            text.push('~');
+        }
         text.push_str(&format_token_capacity(context_window));
     }
     text
@@ -318,7 +324,7 @@ mod tests {
                     compaction_count: 0,
                     total_tokens: Some(554),
                     context_used_percent: Some(42),
-                    context_window: Some(200_000),
+                    context_window: Some((200_000, false)),
                     theme: &theme,
                 };
                 let fitted = fit_segments(bar.segments(), width);
@@ -348,7 +354,7 @@ mod tests {
             compaction_count: 3,
             total_tokens: Some(554),
             context_used_percent: Some(42),
-            context_window: Some(200_000),
+            context_window: Some((200_000, false)),
             theme: &theme,
         };
 
@@ -401,7 +407,7 @@ mod tests {
                 compaction_count: 0,
                 total_tokens: None,
                 context_used_percent: Some(42),
-                context_window: Some(200_000),
+                context_window: Some((200_000, false)),
                 theme: &Theme::default(),
             },
             area,
@@ -426,9 +432,28 @@ mod tests {
     #[test]
     fn context_meter_shows_usage_and_configured_window() {
         assert_eq!(format_context_meter(125, None), "ctx:100%+");
-        assert_eq!(format_context_meter(42, Some(200_000)), "ctx:42%/200k");
-        assert_eq!(format_context_meter(125, Some(1_048_576)), "ctx:100%+/1.1m");
+        assert_eq!(
+            format_context_meter(42, Some((200_000, false))),
+            "ctx:42%/200k"
+        );
+        assert_eq!(
+            format_context_meter(125, Some((1_048_576, false))),
+            "ctx:100%+/1.1m"
+        );
         assert_eq!(format_token_capacity(999), "999");
+    }
+
+    #[test]
+    fn context_meter_marks_an_assumed_window_and_leaves_a_known_window_plain() {
+        assert_eq!(
+            format_context_meter(42, Some((200_000, false))),
+            "ctx:42%/200k"
+        );
+        assert_eq!(
+            format_context_meter(42, Some((200_000, true))),
+            "ctx:42%/~200k"
+        );
+        assert_eq!(format_context_meter(125, None), "ctx:100%+");
     }
 
     #[test]

@@ -1494,6 +1494,10 @@ fn catalog_entry_for_model(
         },
         curated: true,
         context_window: profile.context_window.value,
+        context_window_assumed: matches!(
+            profile.context_window.source,
+            yach_catalog::CatalogSource::Default
+        ),
         output_budget: output_budget.value,
         max_tokens_param: super::max_tokens_param_from_catalog(profile.output_tokens_param.value),
         responses_compact: profile.responses_compact.map(|capability| capability.value),
@@ -1629,6 +1633,7 @@ fn adapter_for_parts(
         timeout: state.defaults.timeout,
         max_tokens: state.defaults.max_tokens,
         context_window: state.defaults.context_window,
+        context_window_assumed: false,
         max_tokens_param: state.defaults.max_tokens_param,
         error_dialect,
     }
@@ -1773,6 +1778,10 @@ fn apply_profile(
         yach_catalog::effective_output_budget(&profile, state.layers.env.max_tokens);
     adapter.max_tokens = output_budget.value;
     adapter.context_window = profile.context_window.value;
+    adapter.context_window_assumed = matches!(
+        profile.context_window.source,
+        yach_catalog::CatalogSource::Default
+    );
     adapter.max_tokens_param =
         super::max_tokens_param_from_catalog(profile.output_tokens_param.value);
     profile.responses_compact.map(|capability| capability.value)
@@ -2416,6 +2425,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         });
@@ -2436,6 +2446,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         }));
@@ -2467,6 +2478,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         }));
@@ -2515,6 +2527,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         }));
@@ -2553,6 +2566,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         }));
@@ -3010,6 +3024,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         }));
@@ -3388,6 +3403,7 @@ mod tests {
             timeout: Duration::from_secs(7),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         });
@@ -3463,6 +3479,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         }));
@@ -4388,6 +4405,7 @@ mod tests {
             },
             curated: true,
             context_window: 1,
+            context_window_assumed: false,
             responses_compact: None,
             output_budget: 1,
             max_tokens_param: MaxTokensParam::MaxTokens,

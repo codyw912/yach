@@ -388,6 +388,9 @@ pub fn estimate_events_tokens(events: &[SessionEvent]) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextBudget {
     pub context_window: u64,
+    /// Display-only. Compaction accounting ignores it; the meter and
+    /// `/status` use it to mark a catalog floor as assumed.
+    pub context_window_assumed: bool,
     pub max_output_tokens: u64,
     pub reserve_tokens: u64,
 }
@@ -1499,6 +1502,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     max_tokens: 1,
                     context_window: 1,
+                    context_window_assumed: false,
                     max_tokens_param: MaxTokensParam::MaxTokens,
                     error_dialect: crate::DialectSelection::Missing,
                 }),
@@ -1540,6 +1544,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     max_tokens: 1,
                     context_window: 1,
+                    context_window_assumed: false,
                     max_tokens_param: MaxTokensParam::MaxTokens,
                     error_dialect: crate::DialectSelection::Missing,
                 }),
@@ -1895,6 +1900,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 max_tokens: 1,
                 context_window: 1,
+                context_window_assumed: false,
                 max_tokens_param: MaxTokensParam::MaxTokens,
                 error_dialect: crate::DialectSelection::Missing,
             }),
@@ -2008,6 +2014,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     max_tokens: 1,
                     context_window: 1,
+                    context_window_assumed: false,
                     max_tokens_param: MaxTokensParam::MaxTokens,
                     error_dialect: crate::DialectSelection::Missing,
                 }),

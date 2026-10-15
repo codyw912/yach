@@ -265,6 +265,10 @@ pub struct CatalogModelEntry {
     /// The complete stream still includes every selectable discovered row.
     pub curated: bool,
     pub context_window: u64,
+    /// `true` when `context_window` is the catalog floor for a model no
+    /// catalog or discovery source lists. Carried so a later selection can
+    /// mark the meter without re-resolving the catalog.
+    pub context_window_assumed: bool,
     pub output_budget: u64,
     pub max_tokens_param: MaxTokensParam,
     /// Resolved `/responses/compact` support. `None` means unknown and must
@@ -419,6 +423,36 @@ struct InFlightModelActivation {
     source: crate::SessionModelSource,
     persist_event: bool,
     save_default: bool,
+}
+
+fn assumed_context_window_warning(provider: &str, model: &str) -> String {
+    format!(
+        "{provider}/{model} is not in the catalog; context window assumed (set it in ~/.yach/models.toml)"
+    )
+}
+
+fn model_is_listed(provider: &ProviderConfig) -> bool {
+    provider.catalog_models.iter().any(|entry| {
+        entry.info.id == provider.model
+            && entry.info.provider == provider.provider_label()
+            && !entry.context_window_assumed
+    })
+}
+
+fn warn_assumed_context_window(
+    tx: &mpsc::UnboundedSender<BackendEvent>,
+    provider: Option<&ProviderConfig>,
+) {
+    let Some(provider) = provider else {
+        return;
+    };
+    // A discovery row can carry the floor and still be a listed model.
+    // Warn only when neither a catalog layer nor the discovery list knows it.
+    if provider.adapter.context_window_assumed && !model_is_listed(provider) {
+        let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
+            message: assumed_context_window_warning(provider.provider_label(), &provider.model),
+        }));
+    }
 }
 
 fn send_model_change_failed(
@@ -1397,6 +1431,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
         &session_log,
         context_budget(provider.as_ref(), project_root.as_deref()),
     );
+    warn_assumed_context_window(&tx, provider.as_ref());
     let mut turn_index = session_log.next_turn_index();
     let mut local_edit_index = turn_index;
     let mut active_provider_turn: Option<ActiveProviderTurn> = None;
@@ -1579,6 +1614,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         connection_flow.set_active_target(Some(activated_target.clone()));
                         provider = Some(candidate);
                         provider_setup_error = None;
+                        warn_assumed_context_window(&tx, provider.as_ref());
                         let mut status = format!("model changed to {model}");
                         let default_update = if activation.save_default
                             && let Some(runtime) = provider_connections.as_ref()
@@ -2160,6 +2196,7 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                         tokens_before,
                         usable_tokens: crate::ContextBudget {
                             context_window: provider.adapter.context_window,
+                            context_window_assumed: provider.adapter.context_window_assumed,
                             max_output_tokens: provider.adapter.max_tokens,
                             reserve_tokens: compaction_config.reserve_tokens,
                         }
@@ -3253,6 +3290,7 @@ fn prepare_native_model_selection(
         .find(|entry| entry.info.id == target.model_id)
     {
         adapter.context_window = entry.context_window;
+        adapter.context_window_assumed = entry.context_window_assumed;
         adapter.max_tokens = entry.output_budget;
         adapter.max_tokens_param = entry.max_tokens_param;
         responses_compact = entry.responses_compact;
@@ -5963,6 +6001,7 @@ narrow the request or start a fresh session",
             log,
             Some(crate::ContextBudget {
                 context_window,
+                context_window_assumed: provider.adapter.context_window_assumed,
                 max_output_tokens,
                 reserve_tokens: compaction_config.reserve_tokens,
             }),
@@ -6655,6 +6694,7 @@ impl CompactionBudget<'_> {
     fn usable_tokens(&self) -> u64 {
         crate::ContextBudget {
             context_window: self.context_window,
+            context_window_assumed: false,
             max_output_tokens: self.max_output_tokens,
             reserve_tokens: self.config.reserve_tokens,
         }
@@ -6687,6 +6727,7 @@ fn context_budget(
     let config = crate::CompactionConfig::load_for_project(project_root);
     Some(crate::ContextBudget {
         context_window: provider.adapter.context_window,
+        context_window_assumed: provider.adapter.context_window_assumed,
         max_output_tokens: provider.adapter.max_tokens,
         reserve_tokens: config.reserve_tokens,
     })
@@ -11154,11 +11195,11 @@ mod tests {
         ProviderToolLoopBudget, ProviderToolLoopPolicy, ProviderToolRoundContext, RunnerConfig,
         SENSITIVE_PATH_DENIED_GUIDANCE, SessionSwitchState, ThinkingLevel,
         UnconfiguredProviderPrompt, active_model, apply_active_connection_rename,
-        apply_connection_flow_effects, apply_native_model_selection, backend_status_message,
-        cancel_active_provider_turn, clear_connection_catalog, collect_native_provider_first_round,
-        edit_permission_mode, execute_native_provider_agent_tool_batch, finish_native_prompt,
-        fixture_outcome, forced_refresh_status,
-        handle_native_extension_diagnostic_snapshot_request,
+        apply_connection_flow_effects, apply_native_model_selection,
+        assumed_context_window_warning, backend_status_message, cancel_active_provider_turn,
+        clear_connection_catalog, collect_native_provider_first_round, edit_permission_mode,
+        execute_native_provider_agent_tool_batch, finish_native_prompt, fixture_outcome,
+        forced_refresh_status, handle_native_extension_diagnostic_snapshot_request,
         handle_native_extension_lifecycle_request, handle_native_prompt,
         handle_native_prompt_unconfigured_provider, launch_project_context,
         launch_project_context_from_root, load_native_session_log_for_runner,
@@ -11175,6 +11216,7 @@ mod tests {
         send_native_model_state, send_native_models, send_native_models_with_catalog,
         send_native_session_messages_from_log, send_native_session_stats_from_log,
         switch_native_session, turn_permission_policy, wait_for_command_review_decision,
+        warn_assumed_context_window,
     };
 
     fn model_activation(
@@ -15254,6 +15296,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 32,
             context_window: 1_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         };
@@ -15397,6 +15440,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 64,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -15523,6 +15567,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 64,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -15603,6 +15648,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 max_tokens: 64,
                 context_window: 200_000,
+                context_window_assumed: false,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
                 error_dialect: crate::DialectSelection::Missing,
             });
@@ -15708,6 +15754,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 64,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -15801,6 +15848,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     max_tokens: 32,
                     context_window: 1_000,
+                    context_window_assumed: false,
                     max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
                     error_dialect: crate::DialectSelection::Missing,
                 }),
@@ -15832,6 +15880,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 64,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -15910,6 +15959,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             max_tokens: 64,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -16103,6 +16153,7 @@ mod tests {
                 },
                 curated: true,
                 context_window: 200_000,
+                context_window_assumed: false,
                 output_budget: 64,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
                 responses_compact: Some(true),
@@ -16117,6 +16168,7 @@ mod tests {
                 },
                 curated: true,
                 context_window: 200_000,
+                context_window_assumed: false,
                 output_budget: 64,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
                 responses_compact: None,
@@ -16130,6 +16182,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             max_tokens: 64,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -16350,6 +16403,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 64,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -16621,6 +16675,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 max_tokens: 64,
                 context_window: 200_000,
+                context_window_assumed: false,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
                 error_dialect: crate::DialectSelection::Missing,
             });
@@ -16700,6 +16755,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 64,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -17834,6 +17890,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 64,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -17928,6 +17985,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_tokens: 64,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -24022,7 +24080,7 @@ mod tests {
             configured_provider.adapter = Arc::new(RigProviderAdapterConfig { provider: RigProviderConfig::OpenAi {
                 api_key: ProviderSecret::new(String::from("test-key")),
                 base_url: Some(base_url),
-            }, timeout: std::time::Duration::from_secs(1), max_tokens: 1_000, context_window: 200_000, max_tokens_param: crate::rig_adapter::MaxTokensParam::default(), error_dialect: crate::DialectSelection::Missing });
+            }, timeout: std::time::Duration::from_secs(1), max_tokens: 1_000, context_window: 200_000, context_window_assumed: false, max_tokens_param: crate::rig_adapter::MaxTokensParam::default(), error_dialect: crate::DialectSelection::Missing });
             let (requester, requests) = RecordingProviderRequester::with_responses([
                 Ok(provider_text_response("manual anchored summary")),
                 Ok(vec![
@@ -25975,6 +26033,7 @@ manual anchored summary"
                 timeout: std::time::Duration::from_secs(30),
                 max_tokens: 1000,
                 context_window: 200_000,
+                context_window_assumed: false,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
                 error_dialect: crate::DialectSelection::Missing,
             }),
@@ -26002,6 +26061,7 @@ manual anchored summary"
             },
             curated: true,
             context_window: 111_111,
+            context_window_assumed: false,
             output_budget: 22_222,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxCompletionTokens,
             responses_compact: Some(false),
@@ -26121,6 +26181,28 @@ manual anchored summary"
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn selecting_an_unlisted_model_warns_once_and_a_listed_model_does_not() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut unlisted = provider_test_config();
+        unlisted.adapter = Arc::new(crate::rig_adapter::RigProviderAdapterConfig {
+            context_window_assumed: true,
+            ..(*unlisted.adapter).clone()
+        });
+        unlisted.model = String::from("gpt-6.1-sol");
+        warn_assumed_context_window(&tx, Some(&unlisted));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::Server(ServerEvent::StatusUpdated { message }))
+                if message == assumed_context_window_warning("anthropic", "gpt-6.1-sol")
+        ));
+
+        let mut listed = provider_test_config();
+        listed.catalog_models = vec![catalog_entry("fixture-model", "Fixture", "anthropic")].into();
+        warn_assumed_context_window(&tx, Some(&listed));
+        assert!(rx.try_recv().is_err(), "a listed model must not warn");
     }
 
     #[test]
@@ -26581,6 +26663,7 @@ manual anchored summary"
                 },
                 curated: true,
                 context_window: 120_000,
+                context_window_assumed: false,
                 output_budget: 8_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
                 responses_compact: None,
@@ -26595,6 +26678,7 @@ manual anchored summary"
                 },
                 curated: true,
                 context_window: 240_000,
+                context_window_assumed: false,
                 output_budget: 16_000,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxCompletionTokens,
                 responses_compact: None,
@@ -28923,6 +29007,7 @@ manual anchored summary"
                     },
                     curated: true,
                     context_window: 8_192,
+                    context_window_assumed: false,
                     output_budget: 512,
                     max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
                     responses_compact: None,
@@ -29011,6 +29096,7 @@ manual anchored summary"
                     },
                     curated: true,
                     context_window: 8_192,
+                    context_window_assumed: false,
                     output_budget: 512,
                     max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
                     responses_compact: None,
@@ -29336,6 +29422,7 @@ manual anchored summary"
             },
             curated: true,
             context_window: 8_192,
+            context_window_assumed: false,
             output_budget: 512,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             responses_compact: None,
@@ -29452,6 +29539,7 @@ manual anchored summary"
             },
             curated: true,
             context_window: 8_192,
+            context_window_assumed: false,
             output_budget: 512,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             responses_compact: None,
@@ -29737,6 +29825,7 @@ manual anchored summary"
             },
             curated: true,
             context_window: 8_192,
+            context_window_assumed: false,
             output_budget: 512,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::MaxTokens,
             responses_compact: None,
@@ -30990,6 +31079,7 @@ manual anchored summary"
                 timeout: std::time::Duration::from_secs(1),
                 max_tokens: 1,
                 context_window: 1,
+                context_window_assumed: false,
                 max_tokens_param: super::MaxTokensParam::MaxTokens,
                 error_dialect: crate::DialectSelection::Missing,
             }),
@@ -31142,6 +31232,7 @@ manual anchored summary"
                 timeout: std::time::Duration::from_secs(1),
                 max_tokens: 1_000,
                 context_window: 200_000,
+                context_window_assumed: false,
                 max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
                 error_dialect: crate::DialectSelection::Missing,
             }),
@@ -31173,6 +31264,7 @@ manual anchored summary"
             timeout: std::time::Duration::from_secs(1),
             max_tokens: 100,
             context_window: 10_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -31290,6 +31382,7 @@ manual anchored summary"
             timeout: std::time::Duration::from_secs(1),
             max_tokens: 100,
             context_window: 10_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -31452,6 +31545,7 @@ manual anchored summary"
             timeout: std::time::Duration::from_secs(1),
             max_tokens: 100,
             context_window: 100_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -33816,6 +33910,7 @@ manual anchored summary"
             &log,
             Some(crate::ContextBudget {
                 context_window: 100,
+                context_window_assumed: false,
                 max_output_tokens: 0,
                 reserve_tokens: 0,
             }),
@@ -34279,6 +34374,7 @@ manual anchored summary"
             timeout: std::time::Duration::from_secs(1),
             max_tokens: 100,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
             error_dialect: crate::DialectSelection::Missing,
         });
@@ -34503,6 +34599,7 @@ manual anchored summary"
             timeout: std::time::Duration::from_secs(1),
             max_tokens: 100,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
             error_dialect: crate::DialectSelection::Missing,
         });

@@ -856,10 +856,25 @@ impl App {
         }
     }
 
+    fn note_assumed_context_window(&mut self, message: &str) {
+        if !message.contains("context window assumed") {
+            return;
+        }
+        let already_noted = self
+            .transcript
+            .entries()
+            .iter()
+            .any(|entry| entry.content == message);
+        if !already_noted {
+            self.transcript.append_status(message);
+        }
+    }
+
     fn clear_model_context(&mut self) {
         self.context_used_percent = None;
         if let Some(stats) = self.session_stats.as_mut() {
             stats.context_window = None;
+            stats.context_window_assumed = false;
             stats.context_used_percent = None;
         }
     }
@@ -1369,6 +1384,7 @@ impl App {
                 }
                 if !is_lifecycle_status(&message) {
                     self.status_message.clone_from(&message);
+                    self.note_assumed_context_window(&message);
                 }
             }
             ServerEvent::ModelActivationFinished(result) => {
@@ -3427,9 +3443,24 @@ impl App {
             if let Some(percent) = stats.context_used_percent {
                 lines.push(format!(
                     "context: {}",
-                    crate::status_bar::format_context_meter(percent, stats.context_window)
+                    crate::status_bar::format_context_meter(
+                        percent,
+                        stats
+                            .context_window
+                            .map(|window| (window, stats.context_window_assumed)),
+                    )
                 ));
-            } else if let Some(context_window) = stats.context_window {
+            }
+            if stats.context_window_assumed {
+                if let Some(context_window) = stats.context_window {
+                    lines.push(format!(
+                        "context window: {} (assumed default; model not in catalog)",
+                        crate::status_bar::format_token_capacity(context_window)
+                    ));
+                }
+            } else if stats.context_used_percent.is_none()
+                && let Some(context_window) = stats.context_window
+            {
                 lines.push(format!(
                     "context window: {}",
                     crate::status_bar::format_token_capacity(context_window)
@@ -4211,11 +4242,11 @@ impl BenchmarkApp {
                 .as_ref()
                 .and_then(|stats| stats.total_tokens),
             context_used_percent: self.app.context_used_percent,
-            context_window: self
-                .app
-                .session_stats
-                .as_ref()
-                .and_then(|stats| stats.context_window),
+            context_window: self.app.session_stats.as_ref().and_then(|stats| {
+                stats
+                    .context_window
+                    .map(|window| (window, stats.context_window_assumed))
+            }),
             terminal_focused: self.app.terminal_focused,
             theme: &self.app.theme,
         };
@@ -4424,10 +4455,11 @@ pub async fn run_tui_with_trace_and_options(
                     .and_then(|stats| stats.total_tokens),
                 terminal_focused: app.terminal_focused,
                 context_used_percent: app.context_used_percent,
-                context_window: app
-                    .session_stats
-                    .as_ref()
-                    .and_then(|stats| stats.context_window),
+                context_window: app.session_stats.as_ref().and_then(|stats| {
+                    stats
+                        .context_window
+                        .map(|window| (window, stats.context_window_assumed))
+                }),
                 theme: &app.theme,
             };
             layout::render(frame, &mut render_params);
@@ -6004,6 +6036,7 @@ mod tests {
             total_tokens: None,
             compaction_count: None,
             context_window: Some(120_000),
+            context_window_assumed: false,
             context_used_percent: Some(42),
         }));
 
@@ -6019,6 +6052,7 @@ mod tests {
             total_tokens: None,
             compaction_count: None,
             context_window: Some(240_000),
+            context_window_assumed: false,
             context_used_percent: Some(21),
         }));
         app.handle_server_event(ServerEvent::StateUpdated(Box::new(BackendState {
@@ -8820,6 +8854,7 @@ mod tests {
             total_tokens: None,
             compaction_count: None,
             context_window: Some(200_000),
+            context_window_assumed: false,
             context_used_percent: Some(42),
         }));
 
@@ -8848,6 +8883,133 @@ mod tests {
         assert!(app.prompt_text().is_empty());
     }
 
+    fn session_stats(context_window: Option<u64>, assumed: bool) -> SessionStats {
+        SessionStats {
+            message_count: None,
+            user_message_count: None,
+            assistant_message_count: None,
+            tool_message_count: None,
+            total_tokens: None,
+            compaction_count: None,
+            context_window,
+            context_window_assumed: assumed,
+            context_used_percent: Some(42),
+        }
+    }
+
+    fn status_context_lines(app: &mut App) -> Vec<String> {
+        app.set_prompt_text("/status");
+        app.submit_input();
+        app.transcript
+            .entries()
+            .last()
+            .map(|entry| {
+                entry
+                    .content
+                    .lines()
+                    .filter(|line| line.starts_with("context"))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn status_marks_an_assumed_context_window_and_leaves_a_catalog_window_plain() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut catalog = App::new(tx);
+        catalog.handle_server_event(ServerEvent::SessionStatsUpdated(session_stats(
+            Some(272_000),
+            false,
+        )));
+        assert_eq!(
+            status_context_lines(&mut catalog),
+            vec![String::from("context: ctx:42%/272k")]
+        );
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut assumed = App::new(tx);
+        assumed.handle_server_event(ServerEvent::SessionStatsUpdated(session_stats(
+            Some(200_000),
+            true,
+        )));
+        assert_eq!(
+            status_context_lines(&mut assumed),
+            vec![
+                String::from("context: ctx:42%/~200k"),
+                String::from("context window: 200k (assumed default; model not in catalog)"),
+            ]
+        );
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut overridden = App::new(tx);
+        overridden.handle_server_event(ServerEvent::SessionStatsUpdated(session_stats(
+            Some(1_050_000),
+            false,
+        )));
+        assert_eq!(
+            status_context_lines(&mut overridden),
+            vec![String::from("context: ctx:42%/1.1m")]
+        );
+    }
+
+    #[test]
+    fn unlisted_model_activation_warns_once_and_a_listed_model_does_not() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        let warning = "openai-codex/gpt-6.1-sol is not in the catalog; context window assumed (set it in ~/.yach/models.toml)";
+        app.handle_server_event(ServerEvent::StatusUpdated {
+            message: warning.to_owned(),
+        });
+        app.handle_server_event(ServerEvent::ModelActivationFinished(
+            yach_proto::ModelActivationResult {
+                request_id: 1,
+                target: yach_proto::ModelTarget {
+                    provider: String::from("openai-codex"),
+                    model_id: String::from("gpt-6.1-sol"),
+                    connection_id: String::from("chatgpt"),
+                    connection_key: None,
+                },
+                session_activated: true,
+                default_update: yach_proto::DefaultUpdateOutcome::Saved,
+                message: Some(String::from("model changed to gpt-6.1-sol")),
+            },
+        ));
+        assert_eq!(
+            app.transcript
+                .entries()
+                .iter()
+                .filter(|entry| entry.content == warning)
+                .count(),
+            1,
+            "selecting an unlisted model must leave one warning in the transcript"
+        );
+
+        app.handle_server_event(ServerEvent::ModelActivationFinished(
+            yach_proto::ModelActivationResult {
+                request_id: 2,
+                target: yach_proto::ModelTarget {
+                    provider: String::from("openai-codex"),
+                    model_id: String::from("gpt-5.6-sol"),
+                    connection_id: String::from("chatgpt"),
+                    connection_key: None,
+                },
+                session_activated: true,
+                default_update: yach_proto::DefaultUpdateOutcome::NotAttempted,
+                message: Some(String::from("model changed to gpt-5.6-sol")),
+            },
+        ));
+        assert_eq!(app.status_message, "model changed to gpt-5.6-sol");
+        assert_eq!(
+            app.transcript
+                .entries()
+                .iter()
+                .filter(|entry| entry.content == warning)
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn model_change_never_retains_the_previous_models_context_capacity() {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -8861,6 +9023,7 @@ mod tests {
             total_tokens: None,
             compaction_count: None,
             context_window: Some(120_000),
+            context_window_assumed: false,
             context_used_percent: Some(42),
         }));
 
@@ -8872,6 +9035,7 @@ mod tests {
             app.session_stats.as_ref(),
             Some(SessionStats {
                 context_window: None,
+                context_window_assumed: false,
                 context_used_percent: None,
                 ..
             })
@@ -8885,6 +9049,7 @@ mod tests {
             total_tokens: None,
             compaction_count: None,
             context_window: Some(240_000),
+            context_window_assumed: false,
             context_used_percent: Some(21),
         }));
         assert_eq!(app.context_used_percent, Some(21));

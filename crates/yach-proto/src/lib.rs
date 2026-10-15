@@ -492,6 +492,11 @@ pub struct SessionStats {
     /// Configured model context window before output and compaction reserves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// `true` when `context_window` is the catalog floor because no catalog
+    /// or discovery source lists the model. Absent on older peers, which
+    /// display the number as fact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub context_window_assumed: bool,
     /// Estimated share of the usable context window currently occupied,
     /// from the same accounting as the auto-compaction trigger.
     #[serde(default)]
@@ -1601,6 +1606,39 @@ mod tests {
         assert!(ordinary_message_record.contains("\"direction\":\"client_to_adapter\""));
         let replayed_message = TransportMessage::from_jsonl(&ordinary_message_record);
         assert_eq!(replayed_message.ok(), Some(ordinary_message));
+    }
+
+    #[test]
+    fn session_stats_without_assumed_window_decodes_as_known() {
+        let wire = "{\"message_count\":1,\"context_window\":272000}\n";
+        let Ok(decoded) = serde_json::from_str::<crate::SessionStats>(wire.trim_end()) else {
+            return;
+        };
+        assert_eq!(decoded.context_window, Some(272_000));
+        assert!(!decoded.context_window_assumed);
+        let assumed = crate::SessionStats {
+            message_count: None,
+            user_message_count: None,
+            assistant_message_count: None,
+            tool_message_count: None,
+            total_tokens: None,
+            compaction_count: None,
+            context_window: Some(200_000),
+            context_window_assumed: true,
+            context_used_percent: None,
+        };
+        let Ok(encoded) = serde_json::to_string(&assumed) else {
+            return;
+        };
+        assert!(encoded.contains("\"context_window_assumed\":true"));
+        let known = crate::SessionStats {
+            context_window_assumed: false,
+            ..assumed
+        };
+        let Ok(encoded) = serde_json::to_string(&known) else {
+            return;
+        };
+        assert!(!encoded.contains("context_window_assumed"));
     }
 
     #[test]
