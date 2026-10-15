@@ -125,6 +125,19 @@ pub fn materialize_base(rev: &str) -> Result<PathBuf, String> {
     materialize_base_in(&root, rev)
 }
 
+const PERF_BASE_WORKSPACE: &str = "perf-base";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingBase {
+    /// Registered workspace of this repo; `update-stale` then `new` is safe.
+    Live,
+    /// Present, but jj has forgotten it or it is not this repo's workspace.
+    /// Recreate only when the path is `<root>/.perf/base`.
+    Recreate,
+    /// Not the reserved base path. Never delete it.
+    Refuse,
+}
+
 fn materialize_base_in(root: &Path, rev: &str) -> Result<PathBuf, String> {
     let version = Command::new("jj")
         .arg("--version")
@@ -137,6 +150,18 @@ fn materialize_base_in(root: &Path, rev: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(root.join(".perf"))
         .map_err(|error| format!("create .perf: {error}"))?;
     if dest.exists() {
+        match classify_existing_base(root, &dest)? {
+            ExistingBase::Live => {}
+            ExistingBase::Recreate => recreate_base(root, &dest)?,
+            ExistingBase::Refuse => {
+                return Err(format!(
+                    "refusing to replace {}: not .perf/base under the repo root",
+                    dest.display()
+                ));
+            }
+        }
+    }
+    if dest.exists() {
         run_jj(root, &["-R", ".perf/base", "workspace", "update-stale"])?;
         run_jj(root, &["-R", ".perf/base", "new", rev])?;
     } else {
@@ -146,7 +171,7 @@ fn materialize_base_in(root: &Path, rev: &str) -> Result<PathBuf, String> {
                 "workspace",
                 "add",
                 "--name",
-                "perf-base",
+                PERF_BASE_WORKSPACE,
                 ".perf/base",
                 "-r",
                 rev,
@@ -154,6 +179,87 @@ fn materialize_base_in(root: &Path, rev: &str) -> Result<PathBuf, String> {
         )?;
     }
     Ok(dest)
+}
+
+fn recreate_base(root: &Path, dest: &Path) -> Result<(), String> {
+    let reserved = reserved_base_dir(root)?;
+    if !same_path(dest, &reserved) {
+        return Err(format!(
+            "refusing to remove {}: only .perf/base under the repo root",
+            dest.display()
+        ));
+    }
+    // Forget is a no-op when the name is already unregistered. A forgotten
+    // checkout still has a `.jj` that points at this repo, so `workspace add`
+    // would refuse the directory until it is removed.
+    let _ = run_jj(root, &["workspace", "forget", PERF_BASE_WORKSPACE]);
+    std::fs::remove_dir_all(dest).map_err(|error| format!("remove {}: {error}", dest.display()))?;
+    Ok(())
+}
+
+fn classify_existing_base(root: &Path, dest: &Path) -> Result<ExistingBase, String> {
+    let reserved = reserved_base_dir(root)?;
+    if !same_path(dest, &reserved) {
+        return Ok(ExistingBase::Refuse);
+    }
+    if workspace_is_live(root, PERF_BASE_WORKSPACE, dest)? && shares_repo(root, dest)? {
+        Ok(ExistingBase::Live)
+    } else {
+        Ok(ExistingBase::Recreate)
+    }
+}
+
+fn reserved_base_dir(root: &Path) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("canonicalize {}: {error}", root.display()))?;
+    Ok(root.join(".perf/base"))
+}
+
+fn workspace_is_live(root: &Path, name: &str, dest: &Path) -> Result<bool, String> {
+    let output = Command::new("jj")
+        .args(["workspace", "root", "--name", name])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("jj workspace root: {error}"))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let recorded = String::from_utf8(output.stdout)
+        .map_err(|error| format!("jj workspace root stdout: {error}"))?;
+    let recorded = Path::new(recorded.trim());
+    if recorded.as_os_str().is_empty() {
+        return Ok(false);
+    }
+    Ok(same_path(recorded, dest))
+}
+
+fn shares_repo(root: &Path, dest: &Path) -> Result<bool, String> {
+    match (repo_store(root)?, repo_store(dest)?) {
+        (Some(left), Some(right)) => Ok(left == right),
+        _ => Ok(false),
+    }
+}
+
+fn repo_store(workspace: &Path) -> Result<Option<PathBuf>, String> {
+    let pointer = workspace.join(".jj/repo");
+    if !pointer.exists() {
+        return Ok(None);
+    }
+    let target = if pointer.is_dir() {
+        pointer
+    } else {
+        let raw = std::fs::read_to_string(&pointer)
+            .map_err(|error| format!("read {}: {error}", pointer.display()))?;
+        pointer
+            .parent()
+            .ok_or_else(|| format!("repo pointer {} has no parent", pointer.display()))?
+            .join(raw.trim())
+    };
+    match target.canonicalize() {
+        Ok(path) => Ok(Some(path)),
+        Err(_) => Ok(None),
+    }
 }
 
 fn run_jj(root: &Path, args: &[&str]) -> Result<(), String> {
@@ -1159,7 +1265,10 @@ fn parse_count(flag: &str, value: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AbOptions, BaseMode, Side, check_unmatched, compiler_probe_argv, run_with_sides};
+    use super::{
+        AbOptions, BaseMode, ExistingBase, Side, check_unmatched, classify_existing_base,
+        compiler_probe_argv, run_with_sides,
+    };
     use crate::perf::schema::SCHEMA;
     use crate::perf::thresholds::Thresholds;
     use crate::perf::verdict::Verdict;
@@ -1370,5 +1479,83 @@ mod tests {
         assert!(abs.is_ok(), "{abs:?}");
         let Ok(abs) = abs else { return };
         assert_eq!(abs, vec![String::from("rustc"), String::from("--version")]);
+    }
+
+    #[test]
+    fn forgotten_perf_base_is_not_a_live_workspace() {
+        use std::sync::atomic::Ordering;
+
+        let jj = std::process::Command::new("jj").arg("--version").output();
+        let Ok(version) = jj else {
+            return;
+        };
+        if !version.status.success() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "yach-perf-base-{}-{}",
+            std::process::id(),
+            super::SLOT_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let created = std::fs::create_dir_all(&root);
+        assert!(created.is_ok(), "create temp repo root");
+        let init = std::process::Command::new("jj")
+            .args(["git", "init", "--colocate", "repo"])
+            .current_dir(&root)
+            .status();
+        assert!(init.is_ok_and(|status| status.success()), "jj git init");
+        let repo = root.join("repo");
+        let marked = std::fs::write(repo.join("file"), "hello\n");
+        assert!(marked.is_ok(), "seed file");
+        let bookmarked = std::process::Command::new("jj")
+            .args(["bookmark", "create", "main", "-r", "@"])
+            .current_dir(&repo)
+            .status();
+        assert!(
+            bookmarked.is_ok_and(|status| status.success()),
+            "bookmark main"
+        );
+        let dest = repo.join(".perf/base");
+        let perf_dir = std::fs::create_dir_all(repo.join(".perf"));
+        assert!(perf_dir.is_ok(), "create .perf");
+        let added = std::process::Command::new("jj")
+            .args([
+                "workspace",
+                "add",
+                "--name",
+                "perf-base",
+                ".perf/base",
+                "-r",
+                "main",
+            ])
+            .current_dir(&repo)
+            .status();
+        assert!(added.is_ok_and(|status| status.success()), "workspace add");
+        assert_eq!(
+            classify_existing_base(&repo, &dest),
+            Ok(ExistingBase::Live),
+            "a registered workspace of this repo is reusable"
+        );
+        let forgotten = std::process::Command::new("jj")
+            .args(["workspace", "forget", "perf-base"])
+            .current_dir(&repo)
+            .status();
+        assert!(forgotten.is_ok_and(|status| status.success()), "forget");
+        assert_eq!(
+            classify_existing_base(&repo, &dest),
+            Ok(ExistingBase::Recreate),
+            "a forgotten workspace must be recreated, not update-stale'd"
+        );
+        let elsewhere = root.join("elsewhere");
+        let elsewhere_dir = std::fs::create_dir_all(&elsewhere);
+        assert!(elsewhere_dir.is_ok(), "elsewhere dir");
+        assert_eq!(
+            classify_existing_base(&repo, &elsewhere),
+            Ok(ExistingBase::Refuse),
+            "only .perf/base under the repo root may be removed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
