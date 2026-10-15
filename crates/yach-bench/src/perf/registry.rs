@@ -131,7 +131,7 @@ mod tests {
             BTreeSet::from([
                 "startup/backend_ready_to_first_interactive_headless",
                 "keypress/idle_keypress_to_paint_headless",
-                "keypress/active_stream_replay_headless/100",
+                "keypress/active_stream_on_history_headless/100",
                 "replay/heavy_tool_output_tail_headless/102400",
                 "paste/large_multiline_component/102400",
                 "viewport/huge_transcript_scroll_headless/10000",
@@ -265,7 +265,7 @@ mod tests {
             BTreeSet::from([
                 "startup/backend_ready_to_first_interactive_headless",
                 "keypress/idle_keypress_to_paint_headless",
-                "keypress/active_stream_replay_headless/100",
+                "keypress/active_stream_on_history_headless/100",
                 "replay/heavy_tool_output_tail_headless/102400",
                 "paste/large_multiline_component/102400",
                 "viewport/huge_transcript_scroll_headless/10000",
