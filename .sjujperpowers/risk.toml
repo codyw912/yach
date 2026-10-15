@@ -1,0 +1,50 @@
+# Verification risk policy read by sjujperpowers' verifying-by-risk.
+# Classification always uses the copy on trunk, so a stack that edits this
+# file is graded by the old rules. Grammar is restricted: see
+# verifying-by-risk/hk-conventions.md. The first matching rule wins.
+version = 1
+default = "medium"
+test = "just test"
+
+# Added to the built-in protected paths (hk config, this file, verify
+# skills, .github/workflows, devenv.*). These are what the declared checks
+# read: changing one can weaken a check without touching the check itself.
+protected = [
+  "justfile",
+  "Cargo.toml",
+  "crates/*/Cargo.toml",
+  "clippy.toml",
+  "rust-toolchain.toml",
+  ".cargo/config.toml",
+  "crates/yach-bench/perf-thresholds.toml",
+]
+
+# Agent execution, permission and sandbox boundaries, credentials, and
+# vendored or containerised code: a mistake here runs commands, leaks a
+# secret, or ships unreviewed upstream code.
+[[rule]]
+paths = [
+  "crates/yach-backend/src/shell.rs",
+  "crates/yach-backend/src/permission.rs",
+  "crates/yach-backend/src/sensitive_paths.rs",
+  "crates/yach-backend/src/edit_access.rs",
+  "crates/yach-backend/src/extension.rs",
+  "crates/yach-backend/src/extension_install.rs",
+  "crates/yach-backend/src/extension_capability.rs",
+  "crates/yach-backend/src/extension_capability/**",
+  "crates/yach-backend/src/review.rs",
+  "crates/yach-backend/src/review/**",
+  "crates/yach-backend/src/chatgpt_auth.rs",
+  "crates/yach-backend/src/provider_connections.rs",
+  "crates/yach-connections/**",
+  "crates/yach-cli/src/provider_connections.rs",
+  "crates/yach-jev-reviewer/**",
+  "containers/**",
+  "vendor/**",
+  "secretspec.toml",
+]
+tier = "high"
+
+[[rule]]
+paths = ["docs/**", "*.md", "evals/**/*.md"]
+tier = "low"
