@@ -97,6 +97,26 @@ Each line is `id | class | isolation | requires`. In-process serial latency work
 
 `cargo bench` remains the Criterion path for exploratory microbenchmarks and is not part of the gate.
 
+### CI gates
+
+Two jobs, split by what a shared runner can judge:
+
+- `Perf (deterministic)` gates size and count rows, including the derived `#alloc_count` and `#alloc_bytes` rows, on every pull request and on pushes to `main`. Exact compare against the numeric budget. Latency rows are not in this job: `planned_rows` drops them under `--deterministic`.
+- `Perf (latency)` gates four headless TUI rows on pull requests only, by wall clock, against the PR base. Fail on `regressed` or `error`. `inconclusive` (exit 2) is written to the step summary and does not fail the job: on a shared runner a within-budget delta with a wide base spread is noise, not a regression.
+
+Gated latency rows, budgets from shared-runner A/A spread (`ceil(widest base_spread_pct) + 3`, run 38737173763, recorded in `../project/records/2026-10-15-ci-tui-latency-gate.md`):
+
+| row | budget | why it is gated |
+|---|---:|---|
+| `viewport/huge_transcript_scroll_headless/10000` | 10 | the 10k-entry scroll render. Long enough per sample to absorb a scheduling hiccup, and the row PR #290 made 2.8x slower without a latency gate noticing. |
+| `keypress/active_stream_on_history_headless/100` | 6 | streaming render onto a fixed history. Renamed in #302; the old `keypress/active_stream_replay_headless/100` dropped its deltas and measured no streaming. |
+| `replay/heavy_tool_output_tail_headless/102400` | 8 | heavy tool-output tail. |
+| `startup/backend_ready_to_first_interactive_headless` | 10 | backend-ready to first interactive frame. |
+
+Every other latency row stays manual (`just perf` on a quiet machine). That includes the short headless rows (`keypress/idle_keypress_to_paint_headless`, `paste/large_multiline_component/102400`), every live `terminal/*` row (needs a TTY the runner does not have), the shipping-binary first-output rows, `startup/phase/*`, `turn/scripted/*`, `review/route/*`, and `extension/*`. The 2026-09-14 probe already showed the shortest extension row (`execute/one_call`) `inconclusive` on two of three shared-runner runs; a budget that wide gates nothing, so those rows stay trend evidence. No row measured for this gate was left manual.
+
+There is no absolute frame-time guard. The latency job catches a relative change against the PR base, not a fixed fraction of a 16 ms frame. The probe does not support adding one: the streaming row it would apply to measured p95 37.9–42.6 ms on the shared runner, above a 16 ms frame, so a fraction-of-a-frame ceiling would fail the current code on every run.
+
 ### Recipes
 
 - `just perf [args]` — paired A/B against `main` (ABBA rounds, budgets in `crates/yach-bench/perf-thresholds.toml`). Extra args pass through to `perf ab` (`just perf --filter 'request/*'`). The recipe runs inside this checkout's dev shell and builds both sides with `--build-cmd cargo`, so a devenv host does not re-enter the base checkout's shell and drop artifacts outside `target/release-root`. Pass your own `--build-cmd` to override that default. Exit 1 on `error`/`regressed`, 2 on `inconclusive`. On this machine the first landing exits 2: `inconclusive` on `yach/cli_startup_first_output` (and sometimes `yach/tui_startup_first_output_pty`) because first-output round spread exceeds the evidence-derived budgets while median deltas stay inside them — not a regression; see `baseline-2026-09-10.md`.

@@ -76,3 +76,23 @@ comment = "session diagnostics (PR #283): measured 4586 -> 4609 (+23) against ma
 id = "review/route/*"
 latency_pct = 10.0
 comment = "first landing: no baseline measurement yet; inconclusive acceptable per convention"
+
+[[workload]]
+id = "viewport/huge_transcript_scroll_headless/10000"
+latency_pct = 10.0
+comment = "ceil(spread)+3 on p95 from three 20-sample A/A runs on a shared GitHub runner, run 38737173763 (2026-10-15, commit 9c54bc4e): base_spread 4.84%, 1.96%, 6.43%. Widest ceil(6.43)+3 = 10. The 6.43% run was inconclusive against the 5% default and unchanged against this budget."
+
+[[workload]]
+id = "keypress/active_stream_on_history_headless/100"
+latency_pct = 6.0
+comment = "ceil(spread)+3 on p95 from three 20-sample A/A runs on a shared GitHub runner, run 38737173763 (2026-10-15, commit 9c54bc4e): base_spread 2.46%, 1.68%, 0.80%. Widest ceil(2.46)+3 = 6. Unchanged on every run."
+
+[[workload]]
+id = "replay/heavy_tool_output_tail_headless/102400"
+latency_pct = 8.0
+comment = "ceil(spread)+3 on p95 from three 20-sample A/A runs on a shared GitHub runner, run 38737173763 (2026-10-15, commit 9c54bc4e): base_spread 4.19%, 3.01%, 1.71%. Widest ceil(4.19)+3 = 8. Unchanged on every run."
+
+[[workload]]
+id = "startup/backend_ready_to_first_interactive_headless"
+latency_pct = 10.0
+comment = "ceil(spread)+3 on p95 from three 20-sample A/A runs on a shared GitHub runner, run 38737173763 (2026-10-15, commit 9c54bc4e): base_spread 4.01%, 6.34%, 4.77%. Widest ceil(6.34)+3 = 10. The 6.34% run was inconclusive against the 5% default and unchanged against this budget."

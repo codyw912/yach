@@ -113,3 +113,129 @@ jobs:
       - name: Summarize
         if: always() && steps.base.outputs.available == 'true'
         run: ./target/release-root/release/yach-bench perf report ab.json >> "$GITHUB_STEP_SUMMARY"
+
+  # Opt-in wall-clock gate for the headless TUI rows whose shared-runner A/A
+  # spread was tight enough to budget. Size and count stay on
+  # `Perf (deterministic)`; every other latency row stays manual. Evidence
+  # and the manual-row policy: docs/project/records/2026-10-15-ci-tui-latency-gate.md.
+  #
+  # Pull requests only. Unlike the deterministic job, a push to main has no
+  # second tree worth measuring here, and pull requests restore the `perf`
+  # cache that job already saves.
+  perf-latency:
+    name: Perf (latency)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # One release build of the controller plus two rounds of four in-process
+    # rows. With a warm cache this is minutes; a cold cache rebuilds both
+    # sides. Bounded so a hung sampler fails the job instead of the workflow.
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      # A new branch or force-push has no usable previous commit to compare.
+      - name: Materialize base
+        id: base
+        run: |
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != 0000000000000000000000000000000000000000 ] \
+            && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git worktree add .perf/base "$BASE_SHA"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No base commit to compare against; skipping."
+          fi
+
+      # After the worktree exists: restoring .perf/base/target first would
+      # make `git worktree add` refuse a non-empty directory.
+      - name: Cache Rust builds
+        if: steps.base.outputs.available == 'true'
+        uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: perf
+          workspaces: |
+            . -> target
+            .perf/base -> target
+
+      # Build the controller into the same target directory `perf ab` uses for
+      # the current side (`target/release-root`), so Compare reuses this build
+      # instead of compiling the current revision a second time.
+      - name: Build yach-bench
+        if: steps.base.outputs.available == 'true'
+        run: cargo build --release --locked -p yach-bench
+        env:
+          CARGO_TARGET_DIR: target/release-root
+
+      # `--rounds` > 1 so the first round is not the only evidence. `perf ab`
+      # takes one `--filter` glob, and glob 0.3 does not expand braces, so
+      # each gated row is its own exact-id comparison. Exit 1 on
+      # error/regressed fails the job. Exit 2 (inconclusive) is recorded and
+      # does not: on a shared runner a within-budget delta with a wide base
+      # spread is noise, not a regression. A missing document is a harness
+      # failure, not a verdict.
+      - name: Compare
+        id: compare
+        if: steps.base.outputs.available == 'true'
+        run: |
+          set +e
+          rows=(
+            viewport/huge_transcript_scroll_headless/10000
+            keypress/active_stream_on_history_headless/100
+            replay/heavy_tool_output_tail_headless/102400
+            startup/backend_ready_to_first_interactive_headless
+          )
+          worst=0
+          for row in "${rows[@]}"; do
+            slug="${row//\//_}"
+            ./target/release-root/release/yach-bench perf ab \
+              --base-dir .perf/base \
+              --filter "$row" \
+              --rounds 2 \
+              --build-cmd cargo \
+              --out "ab-${slug}.json"
+            rc=$?
+            echo "$row exit=$rc"
+            if [[ ! -s "ab-${slug}.json" ]]; then
+              echo "no document for $row" >&2
+              exit 1
+            fi
+            if [[ "$rc" -gt "$worst" ]]; then
+              worst=$rc
+            fi
+          done
+          set -e
+          echo "exit=$worst" >> "$GITHUB_OUTPUT"
+          if [[ "$worst" -eq 1 ]]; then
+            echo "latency comparison regressed or errored" >&2
+            exit 1
+          fi
+          if [[ "$worst" -gt 2 ]]; then
+            echo "latency comparison failed to run (exit $worst)" >&2
+            exit "$worst"
+          fi
+
+      - name: Summarize
+        if: always() && steps.base.outputs.available == 'true'
+        run: |
+          shopt -s nullglob
+          for doc in ab-*.json; do
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ${doc%.json}" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            ./target/release-root/release/yach-bench perf report "$doc" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [[ "${{ steps.compare.outputs.exit }}" == "2" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Inconclusive: a gated row did not settle (exit 2). This does not fail the job; read the verdicts above." >> "$GITHUB_STEP_SUMMARY"
+          fi
