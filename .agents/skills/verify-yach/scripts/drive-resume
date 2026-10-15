@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# A finished session survives quitting: `yach tui --resume` shows the prior
+# transcript and the next prompt continues the same session.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+ev=$("$tty" evidence-dir yach)
+"$tty" stop "$session"
+reset_run
+write_script "$(text_round 'First answer.')"
+start_tui
+"$tty" send "$session" "first question"
+"$tty" wait "$session" 'First answer\.' 15
+capture "$ev/01-first-turn.txt"
+"$tty" send "$session" "/quit"
+"$tty" wait "$session" 'Pane is dead' 10
+"$tty" stop "$session"
+# A resumed process does not reattach the scripted provider: it answers with
+# the built-in fixture runner ("fixture response: ..."). The drive therefore
+# checks what resume promises (prior transcript restored, the same session
+# continued) and not the second reply's text.
+start_tui --resume
+"$tty" wait "$session" 'First answer\.' 10
+capture "$ev/02-resumed.txt"
+expect "$ev/02-resumed.txt" '› first question'
+
+"$tty" send "$session" "second question"
+"$tty" wait "$session" 'session messages: 4' 15
+"$tty" send "$session" "/status"
+"$tty" wait "$session" 'Session status' 10
+capture "$ev/03-continued.txt"
+expect "$ev/03-continued.txt" '› first question'
+expect "$ev/03-continued.txt" '› second question'
+expect "$ev/03-continued.txt" 'messages: 4 \(user 2, assistant 2, tool 0\)'
+sessions=$(find "$state/run/sessions" -name '*.jsonl' | wc -l)
+[[ "$sessions" -eq 1 ]] || { echo "drive-resume: expected 1 session file, found $sessions" >&2; exit 1; }
+"$tty" stop "$session"
+echo "$ev"

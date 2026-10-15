@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Send a prompt in the TUI; the scripted reply renders as Markdown and the
+# session records both messages.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+ev=$("$tty" evidence-dir yach)
+"$tty" stop "$session"
+reset_run
+write_script "$(text_round $'## Verify heading\n\nSome **bold** text and `inline code`.\n\n- first item\n- second item\n')"
+start_tui
+capture "$ev/01-started.txt"
+expect "$ev/01-started.txt" 'approval:review'
+
+"$tty" send "$session" "say hello"
+"$tty" wait "$session" 'session messages: 2' 15
+capture "$ev/02-reply.txt"
+expect "$ev/02-reply.txt" '› say hello'
+expect "$ev/02-reply.txt" '• Verify heading'
+expect "$ev/02-reply.txt" 'Some bold text and inline code\.'
+expect "$ev/02-reply.txt" '- second item'
+# Markdown is rendered, not shown literally.
+if grep -Eq '\*\*bold\*\*|## Verify' "$ev/02-reply.txt"; then
+  echo "drive-prompt-reply: Markdown delimiters shown literally" >&2
+  exit 1
+fi
+
+"$tty" send "$session" "/status"
+"$tty" wait "$session" 'Session status' 10
+capture "$ev/03-status.txt"
+expect "$ev/03-status.txt" 'messages: 2 \(user 1, assistant 1, tool 0\)'
+expect "$ev/03-status.txt" 'approval: review'
+
+"$tty" stop "$session"
+echo "$ev"

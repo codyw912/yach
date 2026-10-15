@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stop the driver session and remove the private run state. Safe to run twice.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+"$tty" stop "$session"
+rm -rf "$state/run"
+echo "cleanup: done"

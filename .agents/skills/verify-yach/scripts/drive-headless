@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# `yach run --prompt` prints a yach-run-outcome/1 document on stdout and
+# exits 0; `yach sessions list` and `show latest` find the session it wrote.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+ev=$("$tty" evidence-dir yach)
+"$tty" stop "$session"
+reset_run
+write_script "$(text_round 'headless reply')"
+
+rc=0
+yach_cli run --prompt "headless question" > "$ev/01-outcome.json" 2> "$ev/01-stderr.log" || rc=$?
+echo "exit: $rc" > "$ev/01-exit.txt"
+[[ $rc -eq 0 ]] || { echo "drive-headless: yach run exited $rc" >&2; cat "$ev/01-stderr.log" >&2; exit 1; }
+jq -e '.schema == "yach-run-outcome/1" and .outcome == "completed" and .response == "headless reply" and .turns[0].prompt == "headless question"' \
+  "$ev/01-outcome.json" > /dev/null || { echo "drive-headless: unexpected outcome document" >&2; cat "$ev/01-outcome.json" >&2; exit 1; }
+
+yach_cli sessions list > "$ev/02-sessions-list.txt"
+expect "$ev/02-sessions-list.txt" 'turns=1 +last_outcome=completed +model=scripted-model'
+
+yach_cli sessions show latest > "$ev/03-sessions-show.txt"
+expect "$ev/03-sessions-show.txt" '"headless question"'
+expect "$ev/03-sessions-show.txt" 'outcome completed'
+echo "$ev"

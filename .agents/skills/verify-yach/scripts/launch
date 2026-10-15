@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Build yach with the scripted provider, reset the private run state, and
+# start the TUI in the driver session with a one-reply script. Drive scripts
+# restart the session with their own reply script.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+build_yach
+"$tty" stop "$session"
+reset_run
+write_script "$(text_round "ready")"
+start_tui
+echo "launch: yach running in tmux session '$session' ($(yach_bin))"
