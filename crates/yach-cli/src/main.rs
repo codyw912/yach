@@ -507,7 +507,7 @@ fn resolve_theme(
             );
         }
         let name = requested.to_string_lossy();
-        return Ok(match yach_ui::resolve_base(&name, appearance, extensions) {
+        return Ok(match yach_ui::resolve_base(&name, appearance, &()) {
             Ok(theme) => (theme, Vec::new()),
             Err(error) => (auto, vec![base_error_notice(&error)]),
         });
@@ -556,12 +556,68 @@ fn base_error_notice(error: &yach_ui::BaseError) -> String {
     }
 }
 
+struct InstalledExtensionThemes {
+    files: std::sync::LazyLock<Option<Vec<yach_backend::ExtensionThemeFile>>>,
+}
+
+impl InstalledExtensionThemes {
+    fn new() -> Self {
+        Self {
+            files: std::sync::LazyLock::new(Self::load_files),
+        }
+    }
+
+    fn load_files() -> Option<Vec<yach_backend::ExtensionThemeFile>> {
+        // Filter before indexing: project manifests cannot invalidate or shadow user themes.
+        let user_store = extension_store_path(ExtensionInstallScope::User).ok()?;
+        let mut records = load_install_records_at(&user_store).ok()?;
+        records.retain(|record| record.scope == ExtensionInstallScope::User);
+        let roots = extension_package_roots_from_install_records(&records);
+        ExtensionManifestIndex::from_package_roots(roots)
+            .ok()
+            .map(|index| index.user_theme_files())
+    }
+}
+
+impl yach_ui::ExtensionThemes for InstalledExtensionThemes {
+    fn theme_json(&self, qualified_name: &str) -> Option<String> {
+        let (extension_id, theme_id) = qualified_name.split_once(':')?;
+        let file = self
+            .files
+            .as_deref()?
+            .iter()
+            .find(|file| file.extension_id == extension_id && file.theme_id == theme_id)?;
+        read_extension_theme_file(file)
+    }
+}
+
+fn read_extension_theme_file(file: &yach_backend::ExtensionThemeFile) -> Option<String> {
+    let root = std::fs::canonicalize(&file.package_root).ok()?;
+    let canonical = std::fs::canonicalize(root.join(&file.relative_path)).ok()?;
+    if !canonical.starts_with(&root) {
+        return None;
+    }
+    if !std::fs::metadata(&canonical).ok()?.is_file() {
+        return None;
+    }
+    let opened = std::fs::File::open(canonical).ok()?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(opened, file.max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > file.max_bytes {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn resolve_tui_options(
     env: &ThemeEnv,
     project_root: Option<&Path>,
     resume_session: bool,
+    extensions: &dyn yach_ui::ExtensionThemes,
 ) -> Result<RunTuiOptions, String> {
-    let (theme, mut startup_notices) = resolve_theme(env, &())?;
+    let (theme, mut startup_notices) = resolve_theme(env, extensions)?;
     if project_root.is_some_and(|root| root.join(".yach/theme.json").is_file()) {
         startup_notices.push(String::from(concat!(
             "project themes are not supported; move it to `~/.yach/theme.json` ",
@@ -3961,13 +4017,18 @@ fn run_tui_command(
     trace: Option<&yach_trace::TraceSink>,
 ) -> CommandResult {
     let project_root = std::env::current_dir().ok();
-    let ui_options =
-        match resolve_tui_options(&ThemeEnv::from_process(), project_root.as_deref(), resume) {
-            Ok(options) => options,
-            Err(error) => {
-                return CommandResult::UsageError { message: error };
-            }
-        };
+    let extensions = InstalledExtensionThemes::new();
+    let ui_options = match resolve_tui_options(
+        &ThemeEnv::from_process(),
+        project_root.as_deref(),
+        resume,
+        &extensions,
+    ) {
+        Ok(options) => options,
+        Err(error) => {
+            return CommandResult::UsageError { message: error };
+        }
+    };
     let ui_handshake = alpha_handshake();
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -6521,20 +6582,18 @@ mod tests {
                 }
             }
         }
-        let (theme, notices) =
-            resolve_theme(&theme_env(Some("owl:dim"), None, None, None), &Extension)?;
-        expect_equal(
-            &theme.accent().fg,
-            &Some(ratatui::style::Color::Rgb(17, 34, 51)),
-        )?;
-        expect_equal(&theme.text().fg, &Theme::light().text().fg)?;
-        expect_true(notices.is_empty(), "extension is silent")?;
-        for name in ["owl:invalid", "owl:chain"] {
+        for name in ["owl:dim", "owl:invalid", "owl:chain"] {
             let (theme, notices) =
                 resolve_theme(&theme_env(Some(name), None, Some("0;15"), None), &Extension)?;
             expect_equal(&theme, &Theme::light())?;
             expect_equal(&notices.len(), &1)?;
-            expect_true(notices[0].contains(name), "notice names extension")?;
+            expect_equal(
+                &notices[0],
+                &format!(
+                    "unknown theme '{name}'; using auto. built-in themes: {}",
+                    yach_ui::builtin_theme_names().join(", ")
+                ),
+            )?;
         }
         let root = TestTempDir::new("theme-extension-base")?;
         let path = theme_file(
@@ -6555,6 +6614,399 @@ mod tests {
     }
 
     #[test]
+    fn installed_themes_do_not_read_records_for_builtin_selection() -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("theme-lazy-records")?;
+        let user = root.path().join("user.json");
+        with_extension_store_env(&user, &root.path().join("project.json"), || {
+            expect_ok(std::fs::write(&user, "broken install store"))?;
+            let extensions = super::InstalledExtensionThemes::new();
+            let options = resolve_tui_options(
+                &theme_env(Some("light"), None, None, None),
+                None,
+                false,
+                &extensions,
+            )?;
+            expect_equal(&options.theme, &Theme::light())?;
+            expect_true(
+                options.startup_notices.is_empty(),
+                "built-in ignores broken install records",
+            )?;
+            expect_ok(std::fs::remove_file(&user))?;
+            install_theme_fixture(
+                root.path(),
+                "package",
+                ExtensionInstallScope::User,
+                true,
+                16384,
+            )?;
+            let home = root.path().join("home");
+            theme_file(&home, r#"{"base":"example.themes:night"}"#)?;
+            let options = resolve_tui_options(
+                &theme_env(None, None, None, Some(&home)),
+                None,
+                false,
+                &extensions,
+            )?;
+            expect_equal(
+                &options.theme.accent().fg,
+                &Some(ratatui::style::Color::Rgb(17, 34, 51)),
+            )?;
+            expect_true(
+                options.startup_notices.is_empty(),
+                "first extension lookup reads repaired store",
+            )
+        })
+    }
+
+    const INSTALLED_THEME_JSON: &str = r##"{"base":"light","colors":{"accent":"#112233"}}"##;
+
+    fn install_theme_fixture(
+        root: &Path,
+        name: &str,
+        scope: ExtensionInstallScope,
+        enabled: bool,
+        max_bytes: u64,
+    ) -> Result<PathBuf, String> {
+        let package = root.join(name);
+        expect_ok(std::fs::create_dir_all(package.join("themes")))?;
+        let manifest = serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "example.themes",
+            "version": "0.1.0",
+            "main": { "command": "never-start-this-theme-host" },
+            "contributes": { "themes": [{
+                "id": "night", "title": "Night",
+                "source": { "type": "extension_file", "path": "themes/night.json" },
+                "max_bytes": max_bytes
+            }] }
+        });
+        expect_ok(std::fs::write(
+            package.join("yach.extension.json"),
+            manifest.to_string(),
+        ))?;
+        expect_ok(std::fs::write(
+            package.join("themes/night.json"),
+            INSTALLED_THEME_JSON,
+        ))?;
+        let store_path = expect_ok(extension_store_path(scope))?;
+        let mut store = expect_ok(super::ExtensionInstallStore::load_from_path(&store_path))?;
+        expect_ok(store.install_local_path(name, &package, scope, enabled))?;
+        expect_ok(store.save_to_path(&store_path))?;
+        Ok(package)
+    }
+
+    fn installed_theme_options(home: &Path) -> Result<yach_ui::RunTuiOptions, String> {
+        theme_file(home, r#"{"base":"example.themes:night"}"#)?;
+        resolve_tui_options(
+            &theme_env(None, None, Some("0;15"), Some(home)),
+            None,
+            false,
+            &super::InstalledExtensionThemes::new(),
+        )
+    }
+
+    #[test]
+    fn installed_theme_requires_a_file_base_not_a_bare_environment_name() -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("installed-theme-selection")?;
+        with_extension_store_env(
+            &root.path().join("user.json"),
+            &root.path().join("project.json"),
+            || {
+                install_theme_fixture(
+                    root.path(),
+                    "package",
+                    ExtensionInstallScope::User,
+                    true,
+                    16384,
+                )?;
+                let extensions = super::InstalledExtensionThemes::new();
+                let options = resolve_tui_options(
+                    &theme_env(Some("example.themes:night"), None, Some("0;15"), None),
+                    None,
+                    false,
+                    &extensions,
+                )?;
+                expect_equal(&options.theme, &Theme::light())?;
+                expect_equal(
+                    &options.startup_notices,
+                    &vec![format!(
+                        "unknown theme 'example.themes:night'; using auto. built-in themes: {}",
+                        yach_ui::builtin_theme_names().join(", ")
+                    )],
+                )?;
+                let path = theme_file(
+                    &root.path().join("home"),
+                    r#"{"base":"example.themes:night"}"#,
+                )?;
+                let options = resolve_tui_options(
+                    &theme_env(Some(&path_string(&path)?), None, Some("0;15"), None),
+                    None,
+                    false,
+                    &extensions,
+                )?;
+                expect_equal(
+                    &options.theme.accent().fg,
+                    &Some(ratatui::style::Color::Rgb(17, 34, 51)),
+                )?;
+                expect_true(
+                    options.startup_notices.is_empty(),
+                    "file base selects installed theme",
+                )
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_theme_fifo_falls_back_without_blocking_startup() -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("installed-theme-fifo")?;
+        with_extension_store_env(
+            &root.path().join("user.json"),
+            &root.path().join("project.json"),
+            || {
+                let package = install_theme_fixture(
+                    root.path(),
+                    "package",
+                    ExtensionInstallScope::User,
+                    true,
+                    16384,
+                )?;
+                let path = package.join("themes/night.json");
+                expect_ok(std::fs::remove_file(&path))?;
+                let status = match ProcessCommand::new("mkfifo").arg(&path).status() {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    result => expect_ok(result)?,
+                };
+                expect_true(status.success(), "mkfifo succeeds")?;
+                let home = root.path().join("home");
+                let (sender, receiver) = std::sync::mpsc::channel();
+                // Never join a blocked reader: a regression must fail, not hang the runner.
+                std::thread::spawn(move || {
+                    let _ = sender.send(installed_theme_options(&home));
+                });
+                let options = receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|error| format!("theme startup blocked on FIFO: {error}"))??;
+                expect_equal(&options.theme, &Theme::light())?;
+                expect_equal(&options.startup_notices.len(), &1)?;
+                expect_true(
+                    options.startup_notices[0].contains("example.themes:night"),
+                    "FIFO notice names theme",
+                )
+            },
+        )
+    }
+
+    #[test]
+    fn installed_user_theme_applies_before_startup() -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("installed-theme")?;
+        with_extension_store_env(
+            &root.path().join("user.json"),
+            &root.path().join("project.json"),
+            || {
+                install_theme_fixture(
+                    root.path(),
+                    "user",
+                    ExtensionInstallScope::User,
+                    true,
+                    16384,
+                )?;
+                let options = installed_theme_options(&root.path().join("home"))?;
+                expect_equal(
+                    &options.theme.accent().fg,
+                    &Some(ratatui::style::Color::Rgb(17, 34, 51)),
+                )?;
+                expect_equal(&options.theme.text().fg, &Theme::light().text().fg)?;
+                expect_true(
+                    options.startup_notices.is_empty(),
+                    "installed theme resolves silently",
+                )
+            },
+        )
+    }
+
+    #[test]
+    fn installed_user_theme_ignores_invalid_and_duplicate_project_manifests() -> Result<(), String>
+    {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("theme-project-isolation")?;
+        with_extension_store_env(
+            &root.path().join("user.json"),
+            &root.path().join("project.json"),
+            || {
+                install_theme_fixture(
+                    root.path(),
+                    "user",
+                    ExtensionInstallScope::User,
+                    true,
+                    16384,
+                )?;
+                install_theme_fixture(
+                    root.path(),
+                    "project-duplicate",
+                    ExtensionInstallScope::Project,
+                    true,
+                    16384,
+                )?;
+                let invalid = install_theme_fixture(
+                    root.path(),
+                    "project-invalid",
+                    ExtensionInstallScope::Project,
+                    true,
+                    16384,
+                )?;
+                expect_ok(std::fs::write(
+                    invalid.join("yach.extension.json"),
+                    "not json",
+                ))?;
+                // Mixed-scope records can also share a store; filter before parsing or duplicate checks.
+                let user_path = expect_ok(extension_store_path(ExtensionInstallScope::User))?;
+                let project_path = expect_ok(extension_store_path(ExtensionInstallScope::Project))?;
+                let mut user_store =
+                    expect_ok(super::ExtensionInstallStore::load_from_path(&user_path))?;
+                user_store.records.extend(
+                    expect_ok(super::ExtensionInstallStore::load_from_path(&project_path))?.records,
+                );
+                expect_ok(user_store.save_to_path(&user_path))?;
+                expect_ok(std::fs::write(
+                    &project_path,
+                    "broken project install store",
+                ))?;
+                let options = installed_theme_options(&root.path().join("home"))?;
+                expect_equal(
+                    &options.theme.accent().fg,
+                    &Some(ratatui::style::Color::Rgb(17, 34, 51)),
+                )?;
+                expect_true(
+                    options.startup_notices.is_empty(),
+                    "project manifests cannot affect user themes",
+                )
+            },
+        )
+    }
+
+    #[test]
+    fn installed_theme_unavailable_cases_fall_back_with_one_notice() -> Result<(), String> {
+        let _guard = env_lock()?;
+        for case in [
+            "disabled",
+            "project",
+            "oversize",
+            "missing",
+            "invalid",
+            "chain",
+            "directory",
+        ] {
+            let root = TestTempDir::new(case)?;
+            with_extension_store_env(
+                &root.path().join("user.json"),
+                &root.path().join("project.json"),
+                || {
+                    let scope = if case == "project" {
+                        ExtensionInstallScope::Project
+                    } else {
+                        ExtensionInstallScope::User
+                    };
+                    let package = install_theme_fixture(
+                        root.path(),
+                        "package",
+                        scope,
+                        case != "disabled",
+                        if case == "oversize" { 8 } else { 16384 },
+                    )?;
+                    let path = package.join("themes/night.json");
+                    match case {
+                        "missing" => expect_ok(std::fs::remove_file(&path))?,
+                        "directory" => {
+                            expect_ok(std::fs::remove_file(&path))?;
+                            expect_ok(std::fs::create_dir(&path))?;
+                        }
+                        "invalid" => expect_ok(std::fs::write(&path, "not json"))?,
+                        "chain" => {
+                            expect_ok(std::fs::write(&path, r#"{"base":"other.pack:day"}"#))?;
+                        }
+                        "oversize" => expect_ok(std::fs::write(
+                            &path,
+                            format!("{INSTALLED_THEME_JSON}{}", " ".repeat(1024 * 1024)),
+                        ))?,
+                        _ => {}
+                    }
+                    let options = installed_theme_options(&root.path().join("home"))?;
+                    expect_equal(&options.theme, &Theme::light())?;
+                    expect_equal(&options.startup_notices.len(), &1)?;
+                    expect_true(
+                        options.startup_notices[0].contains("example.themes:night"),
+                        "notice names missing theme",
+                    )?;
+                    if case == "chain" {
+                        expect_true(
+                            options.startup_notices[0].contains("other.pack:day"),
+                            "notice names rejected extension base",
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_theme_rejects_symlink_escape_and_accepts_symlinked_package_root()
+    -> Result<(), String> {
+        let _guard = env_lock()?;
+        let root = TestTempDir::new("theme-containment")?;
+        with_extension_store_env(
+            &root.path().join("user.json"),
+            &root.path().join("project.json"),
+            || {
+                let package = install_theme_fixture(
+                    root.path(),
+                    "package",
+                    ExtensionInstallScope::User,
+                    true,
+                    16384,
+                )?;
+                let outside = root.path().join("outside.json");
+                expect_ok(std::fs::write(&outside, INSTALLED_THEME_JSON))?;
+                let theme_path = package.join("themes/night.json");
+                expect_ok(std::fs::remove_file(&theme_path))?;
+                expect_ok(std::os::unix::fs::symlink(&outside, &theme_path))?;
+                let options = installed_theme_options(&root.path().join("home"))?;
+                expect_equal(&options.theme, &Theme::light())?;
+                expect_equal(&options.startup_notices.len(), &1)?;
+                expect_true(
+                    options.startup_notices[0].contains("example.themes:night"),
+                    "escape notice names theme",
+                )?;
+                expect_ok(std::fs::remove_file(&theme_path))?;
+                expect_ok(std::fs::write(&theme_path, INSTALLED_THEME_JSON))?;
+                let link = root.path().join("linked-package");
+                expect_ok(std::os::unix::fs::symlink(&package, &link))?;
+                let store_path = expect_ok(extension_store_path(ExtensionInstallScope::User))?;
+                let mut store =
+                    expect_ok(super::ExtensionInstallStore::load_from_path(&store_path))?;
+                store.records[0].package_root = link;
+                expect_ok(store.save_to_path(&store_path))?;
+                let options = installed_theme_options(&root.path().join("home"))?;
+                expect_equal(
+                    &options.theme.accent().fg,
+                    &Some(ratatui::style::Color::Rgb(17, 34, 51)),
+                )?;
+                expect_true(
+                    options.startup_notices.is_empty(),
+                    "symlinked root is supported",
+                )
+            },
+        )
+    }
+
+    #[test]
     fn resolve_theme_startup_reads_legacy_user_file_and_only_notices_project_file()
     -> Result<(), String> {
         let root = TestTempDir::new("theme-startup")?;
@@ -6566,6 +7018,7 @@ mod tests {
             &theme_env(None, None, Some("0;15"), Some(&home)),
             Some(&project),
             false,
+            &(),
         )?;
         expect_equal(&options.theme.text().fg, &Theme::dark().text().fg)?;
         expect_equal(
@@ -6586,6 +7039,7 @@ mod tests {
             &theme_env(None, None, Some("0;15"), None),
             Some(&project),
             true,
+            &(),
         )?;
         expect_equal(&options.theme, &Theme::light())?;
         expect_true(options.resume_session, "resume option preserved")?;
