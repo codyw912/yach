@@ -14,7 +14,7 @@ Hide
 Type `cd "$YACH_VISUAL_ROOT/workspace" && env -i HOME="$HOME" PATH="$PATH" TERM=xterm-256color COLORTERM=truecolor YACH_SESSION_DIR="$YACH_SESSION_DIR" "$YACH_VISUAL_BINARY" tui --backend fixture --resume`
 Enter
 Wait+Screen /Updated the greeting/
-Wait+Screen /no model/
+Wait+Screen /approval:review/
 Show
 Sleep 500ms
 Screenshot "target/tui-visual/narrow.png"

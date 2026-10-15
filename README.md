@@ -169,9 +169,9 @@ Environment:
 | `YACH_RIG_OPENAI_MODEL` | — | Model id; required when the provider is `openai`. |
 | `YACH_RIG_OPENAI_COMPAT_BASE_URL` / `_API_KEY` / `_MODEL` | — | Required when `YACH_RIG_PROVIDER=openai-compatible`. |
 | `YACH_RIG_PROVIDER_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
-| `YACH_THEME` | user file, then `auto` | TUI preset (`dark`, `light`, `system`, `auto`), bundled palette name, or explicit JSON path. |
-| `COLORFGBG` | dark appearance | `auto` uses the last semicolon-separated background index: below 8 is dark, 8 or above is light; missing or invalid stays dark. |
-| `NO_COLOR` | unset | Any non-empty value selects monochrome, overriding every theme source. |
+| `YACH_THEME` | user file, then `auto` | Preset (`dark`, `light`, `system`, `auto`), bundled palette name, or explicit path to a theme JSON file. A non-empty `NO_COLOR` overrides it. |
+| `NO_COLOR` | unset | Non-empty selects the monochrome theme and overrides `YACH_THEME` and `~/.yach/theme.json`. |
+| `COLORFGBG` | unset | Read only when the theme is `auto`. Last field below 8 selects `dark`; otherwise `light`. Absent or unparsable selects `dark`. |
 | `YACH_SESSION_DIR` | project-keyed directory under `~/.yach/sessions/` | Absolute override for session storage and lookup. |
 | `YACH_CAPTURE_REQUESTS` | off | Absolute directory. Writes each OpenAI, OpenAI-compatible, ChatGPT-subscription, and native-compaction request body, one private file per attempt. Anthropic requests are not captured. Authentication headers are never written; bodies are the exact request bodies, so they contain whatever the prompt and files contain. Keep capture off unless diagnosing a request. |
 
@@ -241,28 +241,67 @@ Defaults deny `.env*` (except `.env.example` and friends), key material
 listings and refuse reads/edits with an explanation the model can act on.
 Invalid config fails closed to the defaults.
 
-TUI themes use `~/.yach/theme.json` for personal settings. `YACH_THEME` takes
-precedence: select `dark`, `light`, `system`, `auto`, a bundled palette such as
-`catppuccin-mocha` or `nord`, or an explicit JSON path. A value that is absolute,
-starts with `.` or `~`, or contains a path separator is a path; use `./dark` to
-load a file named `dark`. `~/` paths use your home directory. Other values are
-theme names, even if a bare file of that name exists.
+### TUI appearance
 
-Without a selected name or personal file, `auto` follows `COLORFGBG` (see above).
-Use `YACH_THEME=light|dark` to override the guess, or `YACH_THEME=system` for
-terminal colors without painted surfaces. Non-empty `NO_COLOR` wins over all
-of these choices. JSON's optional `base` selects a preset or bundled palette;
-without it, existing files remain dark plus their overrides.
+TUI appearance is chosen once, at startup. `NO_COLOR` set to any non-empty
+value wins over everything else and selects the monochrome theme. Otherwise
+the first match wins:
 
-Unknown names show a diagnostic listing built-in names and fall back to `auto`.
-An unresolved file `base` keeps the file's overrides over `auto`. An explicit
-path that cannot be read or applied shows a startup notice and uses `auto`.
-Project `<project>/.yach/theme.json` files no longer apply: startup shows one
-notice asking you to move the file to `~/.yach/theme.json` or set `YACH_THEME`,
-without changing the project file.
+1. `YACH_THEME`: a preset (`dark`, `light`, `system`, `auto`), a bundled
+   palette name, or an explicit path to a theme file.
+2. `~/.yach/theme.json`.
+3. `auto`.
+
+A value that is absolute, starts with `.` or `~`, or contains a path
+separator is a path; `~/` uses your home directory. Other values are theme
+names, even if a bare file of that name exists. Use `./dark` for a file named
+`dark`. Unknown names show a diagnostic listing built-in names and fall back
+to `auto`. An explicit path that cannot be read or applied shows a startup
+notice and uses `auto`.
+
+`<project>/.yach/theme.json` is not read. When that file exists, the TUI
+shows one notice and leaves the file untouched: "project themes are not
+supported; move it to `~/.yach/theme.json` or set `YACH_THEME`". For a
+per-project look, set `YACH_THEME` in that project's environment.
+
+`auto` reads `COLORFGBG` only. The last semicolon-separated field is the
+background index (`fg;bg` or `fg;default;bg`). An index below 8 selects
+`dark`, any other index selects `light`, and an absent or unparsable value
+selects `dark`. Only some terminals set `COLORFGBG`; shells and multiplexers
+can inherit stale values, and it does not update when the terminal switches
+appearance. When the guess is wrong, set `YACH_THEME=light`,
+`YACH_THEME=dark`, or `YACH_THEME=system`. `system` paints no panel surfaces
+and uses the terminal's default text colors.
+
+| Preset | Surfaces |
+| --- | --- |
+| `dark` | Painted dark panels; the fallback behind `auto` when detection says dark. |
+| `light` | Painted light panels with dark text on every surface. |
+| `system` | No panel backgrounds. Status uses the terminal's ANSI colors. |
+| `auto` | Resolves to `dark` or `light` from `COLORFGBG`. |
+
+Bundled palettes are named themes, selected the same way (`YACH_THEME=nord`
+or `"base": "nord"`). They are 24-bit; on a limited-color terminal use
+`system`. The names are `catppuccin-latte`, `catppuccin-frappe`,
+`catppuccin-macchiato`, `catppuccin-mocha`, `rose-pine`, `rose-pine-moon`,
+`rose-pine-dawn`, `gruvbox-dark`, `gruvbox-light`, `tokyo-night-dark`,
+`tokyo-night-storm`, `tokyo-night-moon`, `tokyo-night-light`,
+`solarized-dark`, `solarized-light`, `dracula`, `nord`, and `monokai`.
+Attribution is in [the palette NOTICE](crates/yach-ui/themes/NOTICE.md).
+
+A theme file is strict JSON. `base` names the theme its overrides apply to
+and defaults to `dark`, so an existing file without `base` keeps its meaning.
+`base` accepts a preset, `auto`, a bundled palette name, or
+`<extension-id>:<theme-id>` contributed by an installed user-scope extension
+(see [Contributing themes](docs/extensions.md#contributing-themes)). Extension
+themes are selected only through a file's `base`, not directly through a
+bare `YACH_THEME` name. Colors in the file override that base. No file is
+merged with another file. An unresolved `base` shows one notice and keeps
+the file's overrides over `auto`.
 
 ```json
 {
+  "base": "auto",
   "vars": {
     "surface": "#282832"
   },
@@ -291,6 +330,17 @@ others), 256-color indices, or entries from `vars`. Available color tokens:
 `diffContext`, `diffHunk`, and `harness`. Unknown fields, tokens, colors, or
 variables in the personal file fail before the TUI opens rather than being
 ignored; explicit `YACH_THEME` file failures instead show the fallback notice.
+
+Monochrome (`NO_COLOR`) draws no color and no panel background. Metadata is
+dim, focused titles, tool names, and errors are bold, and the selected row is
+reversed. Glyphs (`✓`, `✗`, `⚙`, `›`), harness outcome labels (`! failed`,
+for example), and the tool row's `┃` rule carry the distinctions that color
+carried. Tool successes use neutral panels; only failure surfaces are tinted.
+
+For repeatable theme captures, use `just tui-visual session narrow light
+nocolor`; `just dev bash tests/visual/check-nocolor.sh` checks the raw TUI
+bytes independently of VHS. Release size is checked by the relative per-PR
+size gate: `just perf --filter 'binary/size_bytes' --deterministic`.
 
 ### Session logs and privacy
 
