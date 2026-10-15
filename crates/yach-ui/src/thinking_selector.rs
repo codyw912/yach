@@ -1,5 +1,4 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -23,9 +22,9 @@ impl Widget for ThinkingLevelSelector<'_> {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(self.theme.colors.border))
+            .border_style(self.theme.border(false))
             .title(" Thinking Level ")
-            .style(Style::new().fg(self.theme.colors.accent));
+            .style(self.theme.accent());
 
         let lines: Vec<Line> = self
             .levels
@@ -37,21 +36,17 @@ impl Widget for ThinkingLevelSelector<'_> {
                 let indicator = if is_current { "● " } else { "  " };
                 let arrow = if is_selected { "▸ " } else { "  " };
                 let style = if is_selected {
-                    Style::new()
-                        .fg(self.theme.colors.selected_text)
-                        .add_modifier(Modifier::BOLD)
+                    self.theme.selected_label()
                 } else if is_current {
-                    Style::new().fg(self.theme.colors.success)
+                    self.theme.success()
                 } else {
-                    Style::new().fg(self.theme.colors.muted)
+                    self.theme.muted()
                 };
                 let text = format!("{arrow}{indicator}{}", level.as_str());
                 Line::from(Span::styled(text, style))
             })
             .collect();
-        let paragraph = Paragraph::new(lines)
-            .style(Style::new().fg(self.theme.colors.text))
-            .block(block);
+        let paragraph = Paragraph::new(lines).style(self.theme.text()).block(block);
         Widget::render(paragraph, popup_area, buf);
     }
 }

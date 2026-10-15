@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use yach_proto::ForkMessage;
@@ -19,13 +19,9 @@ impl Widget for ForkPicker<'_> {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(self.theme.colors.border))
+            .border_style(self.theme.border(false))
             .title("Fork From Message")
-            .title_style(
-                Style::new()
-                    .fg(self.theme.colors.accent)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .title_style(self.theme.accent().add_modifier(Modifier::BOLD));
 
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
@@ -38,11 +34,9 @@ impl Widget for ForkPicker<'_> {
                 let is_selected = i == self.selected_index;
                 let prefix = if is_selected { "▸ " } else { "  " };
                 let style = if is_selected {
-                    Style::new()
-                        .fg(self.theme.colors.selected_text)
-                        .add_modifier(Modifier::BOLD)
+                    self.theme.selected_label()
                 } else {
-                    Style::new().fg(self.theme.colors.muted)
+                    self.theme.muted()
                 };
                 Line::from(vec![
                     Span::styled(prefix, style),
@@ -56,17 +50,14 @@ impl Widget for ForkPicker<'_> {
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("  Enter", Style::new().fg(self.theme.colors.warning)),
-            Span::styled(
-                " fork before selected message · ",
-                Style::new().fg(self.theme.colors.dim),
-            ),
-            Span::styled("Esc", Style::new().fg(self.theme.colors.warning)),
-            Span::styled(" cancel", Style::new().fg(self.theme.colors.dim)),
+            Span::styled("  Enter", self.theme.warning()),
+            Span::styled(" fork before selected message · ", self.theme.dim()),
+            Span::styled("Esc", self.theme.warning()),
+            Span::styled(" cancel", self.theme.dim()),
         ]));
 
         let paragraph = Paragraph::new(lines)
-            .style(Style::new().fg(self.theme.colors.text))
+            .style(self.theme.text())
             .wrap(Wrap { trim: true });
         Widget::render(paragraph, inner, buf);
     }

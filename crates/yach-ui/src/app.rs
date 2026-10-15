@@ -4624,7 +4624,7 @@ fn render_dialog_overlay(
     dialog: &DialogRenderSnapshot,
     theme: &Theme,
 ) {
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::Modifier;
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -4633,13 +4633,9 @@ fn render_dialog_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(theme.colors.border))
+        .border_style(theme.border(false))
         .title(dialog_summary(&dialog.request))
-        .title_style(
-            Style::new()
-                .fg(theme.colors.accent)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(theme.accent().add_modifier(Modifier::BOLD));
 
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
@@ -4655,18 +4651,14 @@ fn render_dialog_overlay(
     match &dialog.request.kind {
         DialogKind::Confirm => {
             let yes_style = if dialog.confirm_accepted {
-                Style::new()
-                    .fg(theme.colors.selected_text)
-                    .bg(theme.colors.success)
+                theme.selected_on(theme.success())
             } else {
-                Style::new().fg(theme.colors.success)
+                theme.success()
             };
             let no_style = if dialog.confirm_accepted {
-                Style::new().fg(theme.colors.error)
+                theme.error()
             } else {
-                Style::new()
-                    .fg(theme.colors.selected_text)
-                    .bg(theme.colors.error)
+                theme.selected_on(theme.error())
             };
             lines.push(Line::from(vec![
                 Span::styled(" Yes ", yes_style),
@@ -4711,12 +4703,9 @@ fn render_dialog_overlay(
             for (idx, option) in options.iter().enumerate() {
                 let is_selected = idx == dialog.selected;
                 let style = if is_selected {
-                    Style::new()
-                        .fg(theme.colors.selected_text)
-                        .bg(theme.colors.selected_background)
-                        .add_modifier(Modifier::BOLD)
+                    theme.selected().add_modifier(Modifier::BOLD)
                 } else {
-                    Style::new().fg(theme.colors.muted)
+                    theme.muted()
                 };
                 let prefix = if is_selected { "▸ " } else { "  " };
                 lines.push(Line::from(vec![
@@ -4732,7 +4721,7 @@ fn render_dialog_overlay(
         }
     }
 
-    let paragraph = Paragraph::new(lines).style(Style::new().fg(theme.colors.text));
+    let paragraph = Paragraph::new(lines).style(theme.text());
     Widget::render(paragraph, inner, frame.buffer_mut());
 }
 
@@ -4742,7 +4731,7 @@ fn render_local_edit_compose_overlay(
     draft: &LocalEditDraft,
     theme: &Theme,
 ) {
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::Modifier;
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -4751,24 +4740,20 @@ fn render_local_edit_compose_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(theme.colors.border))
+        .border_style(theme.border(false))
         .title("local edit")
-        .title_style(
-            Style::new()
-                .fg(theme.colors.accent)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(theme.accent().add_modifier(Modifier::BOLD));
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
 
     let mut lines = Vec::new();
     if step == LocalEditComposeStep::Kind {
         lines.push(Line::from(vec![
-            Span::styled("1", Style::new().fg(theme.colors.warning)),
+            Span::styled("1", theme.warning()),
             Span::raw(" Modify existing file"),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("2", Style::new().fg(theme.colors.warning)),
+            Span::styled("2", theme.warning()),
             Span::raw(" Create new file"),
         ]));
         lines.push(Line::raw(""));
@@ -4787,7 +4772,7 @@ fn render_local_edit_compose_overlay(
     }
 
     Widget::render(
-        Paragraph::new(lines).style(Style::new().fg(theme.colors.text)),
+        Paragraph::new(lines).style(theme.text()),
         inner,
         frame.buffer_mut(),
     );
@@ -4810,7 +4795,7 @@ fn render_local_edit_review_overlay(
     selected: LocalEditReviewAction,
     theme: &Theme,
 ) {
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::Modifier;
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -4819,29 +4804,21 @@ fn render_local_edit_review_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(theme.colors.border))
+        .border_style(theme.border(false))
         .title("review local edit")
-        .title_style(
-            Style::new()
-                .fg(theme.colors.accent)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(theme.accent().add_modifier(Modifier::BOLD));
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
 
     let apply_style = if selected == LocalEditReviewAction::Apply {
-        Style::new()
-            .fg(theme.colors.selected_text)
-            .bg(theme.colors.success)
+        theme.selected_on(theme.success())
     } else {
-        Style::new().fg(theme.colors.success)
+        theme.success()
     };
     let reject_style = if selected == LocalEditReviewAction::Reject {
-        Style::new()
-            .fg(theme.colors.selected_text)
-            .bg(theme.colors.error)
+        theme.selected_on(theme.error())
     } else {
-        Style::new().fg(theme.colors.error)
+        theme.error()
     };
     let mut lines = vec![
         Line::from(format!("Path: {}", preview.path)),
@@ -4886,28 +4863,26 @@ fn render_local_edit_review_overlay(
     lines.extend(action_lines);
 
     Widget::render(
-        Paragraph::new(lines).style(Style::new().fg(theme.colors.text)),
+        Paragraph::new(lines).style(theme.text()),
         inner,
         frame.buffer_mut(),
     );
 }
 
 fn review_diff_line_style(line: &str, theme: &Theme) -> ratatui::style::Style {
-    use ratatui::style::Style;
-
     if line.starts_with("+++ ") || line.starts_with("--- ") {
-        return Style::new().fg(theme.colors.muted).bold();
+        return theme.muted().add_modifier(ratatui::style::Modifier::BOLD);
     }
     if line.starts_with('+') {
-        return Style::new().fg(theme.colors.diff_added);
+        return theme.diff(crate::theme::DiffKind::Added);
     }
     if line.starts_with('-') {
-        return Style::new().fg(theme.colors.diff_removed);
+        return theme.diff(crate::theme::DiffKind::Removed);
     }
     if line.starts_with("@@") {
-        return Style::new().fg(theme.colors.accent);
+        return theme.accent();
     }
-    Style::new().fg(theme.colors.diff_context)
+    theme.diff(crate::theme::DiffKind::Context)
 }
 
 fn insert_dialog_newline(dialog: &mut PendingDialog) {
@@ -4942,7 +4917,7 @@ fn render_dialog_textarea(
         .split(area);
 
     if prompt_height > 0 {
-        let paragraph = Paragraph::new(prompt_lines).style(Style::new().fg(theme.colors.text));
+        let paragraph = Paragraph::new(prompt_lines).style(theme.text());
         Widget::render(paragraph, chunks[0], frame.buffer_mut());
     }
 
@@ -4950,18 +4925,18 @@ fn render_dialog_textarea(
     textarea.set_block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(theme.colors.border))
+            .border_style(theme.border(false))
             .title("input")
-            .title_style(Style::new().fg(theme.colors.warning)),
+            .title_style(theme.warning()),
     );
     textarea.set_wrap_mode(WrapMode::Word);
-    textarea.set_style(Style::new().fg(theme.colors.text));
+    textarea.set_style(theme.text());
     textarea.set_cursor_line_style(Style::default());
     textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
 
     Widget::render(&textarea, chunks[1], frame.buffer_mut());
     Widget::render(
-        Paragraph::new(Line::from(hint)).style(Style::new().fg(theme.colors.dim)),
+        Paragraph::new(Line::from(hint)).style(theme.dim()),
         chunks[2],
         frame.buffer_mut(),
     );
@@ -9789,5 +9764,212 @@ mod tests {
             .handle_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
         let rows = render_rows(&mut bench, &mut terminal);
         assert!(row_index(&rows, "more diff lines").is_some());
+    }
+
+    fn cell_on_row_containing<'a>(
+        buffer: &'a ratatui::buffer::Buffer,
+        needle: &str,
+        symbol: &str,
+    ) -> Option<&'a ratatui::buffer::Cell> {
+        let area = buffer.area;
+        for y in 0..area.height {
+            let row: String = (0..area.width).map(|x| buffer[(x, y)].symbol()).collect();
+            if !row.contains(needle) {
+                continue;
+            }
+            for x in 0..area.width {
+                if buffer[(x, y)].symbol() == symbol {
+                    return Some(&buffer[(x, y)]);
+                }
+            }
+        }
+        None
+    }
+
+    fn draw_overlay(
+        theme: &crate::theme::Theme,
+        draw: impl FnOnce(&mut ratatui::Frame<'_>, &crate::theme::Theme),
+    ) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = match ratatui::Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(infallible) => match infallible {},
+        };
+        let drawn = terminal.draw(|frame| draw(frame, theme));
+        assert!(drawn.is_ok());
+        terminal.backend().buffer().clone()
+    }
+
+    fn confirm_dialog() -> super::DialogRenderSnapshot {
+        super::DialogRenderSnapshot {
+            request: DialogRequest {
+                id: None,
+                title: Some(String::from("confirm")),
+                prompt: Some(String::from("Ship it?")),
+                kind: DialogKind::Confirm,
+            },
+            input_buffer: String::new(),
+            cursor_pos: 0,
+            selected: 0,
+            confirm_accepted: true,
+        }
+    }
+
+    fn local_edit_review() -> super::LocalEditReview {
+        super::LocalEditReview {
+            preview_id: String::from("preview-1"),
+            permission_decision_id: String::from("permission-1"),
+            path: String::from("src/lib.rs"),
+            operation: String::from("replace"),
+            review_state: LocalEditReviewState::NeedsUserApproval,
+            diff_summary: String::from("-old\n+new"),
+            diff_summary_truncated: false,
+        }
+    }
+
+    fn assert_unpainted_selection(cell: &ratatui::buffer::Cell, theme: &crate::theme::Theme) {
+        use ratatui::style::{Color, Modifier};
+        assert_eq!(
+            cell.bg,
+            Color::Reset,
+            "selection must not paint a background"
+        );
+        let selected = if theme.mode() == crate::theme::ThemeMode::Mono {
+            Modifier::REVERSED
+        } else {
+            Modifier::BOLD
+        };
+        assert!(
+            cell.modifier.contains(selected),
+            "selection cell {:?} missing {selected:?}",
+            cell.modifier
+        );
+    }
+
+    #[test]
+    fn system_and_mono_selection_is_an_unpainted_attribute() {
+        use crate::approval_selector::ApprovalModeSelector;
+        use crate::theme::{Theme, ThemeMode};
+
+        for theme in [Theme::system(), Theme::monochrome()] {
+            let dialog = draw_overlay(&theme, |frame, theme| {
+                super::render_dialog_overlay(frame, &confirm_dialog(), theme);
+            });
+            let yes = cell_on_row_containing(&dialog, "Yes", "Y");
+            assert!(
+                yes.is_some(),
+                "{:?} dialog confirm cell missing",
+                theme.mode()
+            );
+            let Some(yes) = yes else { return };
+            assert_unpainted_selection(yes, &theme);
+
+            let review = draw_overlay(&theme, |frame, theme| {
+                super::render_local_edit_review_overlay(
+                    frame,
+                    &local_edit_review(),
+                    LocalEditReviewAction::Apply,
+                    theme,
+                );
+            });
+            let approve = cell_on_row_containing(&review, "Approve", "A");
+            assert!(
+                approve.is_some(),
+                "{:?} review choice cell missing",
+                theme.mode()
+            );
+            let Some(approve) = approve else { return };
+            assert_unpainted_selection(approve, &theme);
+
+            let area = Rect::new(0, 0, 40, 8);
+            let mut picker = Buffer::empty(area);
+            Widget::render(
+                ApprovalModeSelector {
+                    current_mode: ApprovalMode::Review,
+                    selected_index: 0,
+                    theme: &theme,
+                },
+                area,
+                &mut picker,
+            );
+            let row = cell_on_row_containing(&picker, "▸", "▸");
+            assert!(row.is_some(), "{:?} approval row missing", theme.mode());
+            let Some(row) = row else { return };
+            assert_unpainted_selection(row, &theme);
+            if theme.mode() == ThemeMode::System {
+                assert!(
+                    !row.modifier.contains(ratatui::style::Modifier::REVERSED),
+                    "system selection is an attribute, not reversal"
+                );
+            }
+        }
+    }
+
+    fn assert_painted_choice(
+        cell: &ratatui::buffer::Cell,
+        fg: ratatui::style::Color,
+        bg: ratatui::style::Color,
+    ) {
+        use ratatui::style::Modifier;
+        assert_eq!(cell.fg, fg);
+        assert_eq!(cell.bg, bg);
+        assert_eq!(cell.modifier, Modifier::empty());
+    }
+
+    #[test]
+    fn painted_confirm_and_review_labels_keep_todays_cells() {
+        use crate::theme::Theme;
+        use ratatui::style::Color;
+
+        let theme = Theme::dark();
+        let selected_text = Color::White;
+        let success = Color::Rgb(181, 189, 104);
+        let error = Color::Rgb(204, 102, 102);
+
+        let accepted = draw_overlay(&theme, |frame, theme| {
+            super::render_dialog_overlay(frame, &confirm_dialog(), theme);
+        });
+        let yes = cell_on_row_containing(&accepted, "Yes", "Y");
+        assert!(yes.is_some(), "selected Yes cell missing");
+        let Some(yes) = yes else { return };
+        assert_painted_choice(yes, selected_text, success);
+
+        let mut rejected = confirm_dialog();
+        rejected.confirm_accepted = false;
+        let declined = draw_overlay(&theme, |frame, theme| {
+            super::render_dialog_overlay(frame, &rejected, theme);
+        });
+        let no = cell_on_row_containing(&declined, "No", "N");
+        assert!(no.is_some(), "selected No cell missing");
+        let Some(no) = no else { return };
+        assert_painted_choice(no, selected_text, error);
+
+        let apply = draw_overlay(&theme, |frame, theme| {
+            super::render_local_edit_review_overlay(
+                frame,
+                &local_edit_review(),
+                LocalEditReviewAction::Apply,
+                theme,
+            );
+        });
+        let approve = cell_on_row_containing(&apply, "Approve", "A");
+        assert!(approve.is_some(), "selected Approve cell missing");
+        let Some(approve) = approve else { return };
+        assert_painted_choice(approve, selected_text, success);
+
+        let reject = draw_overlay(&theme, |frame, theme| {
+            super::render_local_edit_review_overlay(
+                frame,
+                &local_edit_review(),
+                LocalEditReviewAction::Reject,
+                theme,
+            );
+        });
+        let rejected_action = cell_on_row_containing(&reject, "Reject", "R");
+        assert!(rejected_action.is_some(), "selected Reject cell missing");
+        let Some(rejected_action) = rejected_action else {
+            return;
+        };
+        assert_painted_choice(rejected_action, selected_text, error);
     }
 }

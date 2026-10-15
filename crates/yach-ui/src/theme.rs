@@ -38,35 +38,35 @@ pub enum DiffKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
-    pub colors: ThemeColors,
+    colors: ThemeColors,
     pub spacing: ThemeSpacing,
     mode: ThemeMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ThemeColors {
-    pub accent: Color,
-    pub border: Color,
-    pub success: Color,
-    pub error: Color,
-    pub warning: Color,
-    pub muted: Color,
-    pub dim: Color,
-    pub text: Color,
-    pub selected_background: Color,
-    pub selected_text: Color,
-    pub user_message_background: Color,
-    pub user_message_text: Color,
-    pub tool_pending_background: Color,
-    pub tool_success_background: Color,
-    pub tool_error_background: Color,
-    pub tool_title: Color,
-    pub tool_output: Color,
-    pub diff_added: Color,
-    pub diff_removed: Color,
-    pub diff_context: Color,
-    pub diff_hunk: Color,
-    pub harness: Color,
+struct ThemeColors {
+    accent: Color,
+    border: Color,
+    success: Color,
+    error: Color,
+    warning: Color,
+    muted: Color,
+    dim: Color,
+    text: Color,
+    selected_background: Color,
+    selected_text: Color,
+    user_message_background: Color,
+    user_message_text: Color,
+    tool_pending_background: Color,
+    tool_success_background: Color,
+    tool_error_background: Color,
+    tool_title: Color,
+    tool_output: Color,
+    diff_added: Color,
+    diff_removed: Color,
+    diff_context: Color,
+    diff_hunk: Color,
+    harness: Color,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,13 +167,44 @@ impl Theme {
     /// system selection.
     #[must_use]
     pub fn selected(&self) -> Style {
-        if self.mode == ThemeMode::Mono {
-            return Style::new()
+        match self.mode {
+            ThemeMode::Mono => Style::new()
                 .fg(Color::Reset)
                 .bg(Color::Reset)
-                .add_modifier(Modifier::REVERSED);
+                .add_modifier(Modifier::REVERSED),
+            ThemeMode::System => self
+                .surface(self.colors.selected_text, self.colors.selected_background)
+                .add_modifier(Modifier::BOLD),
+            ThemeMode::Painted => {
+                self.surface(self.colors.selected_text, self.colors.selected_background)
+            }
         }
-        self.surface(self.colors.selected_text, self.colors.selected_background)
+    }
+
+    /// Selected confirm/apply/reject label. Painted mode keeps today's
+    /// cells: selected text on the role color as background. System and
+    /// Mono never paint that background; selection is an attribute.
+    #[must_use]
+    pub fn selected_on(&self, role: Style) -> Style {
+        if self.mode == ThemeMode::Painted {
+            return Style::new()
+                .fg(self.colors.selected_text)
+                .bg(role.fg.unwrap_or(Color::Reset));
+        }
+        self.selected().add_modifier(Modifier::BOLD)
+    }
+
+    /// Selected list row that today sets `selected_text` and no background.
+    /// Painted keeps that. System and Mono take `selected()` so Mono stays
+    /// reversed and System stays unpainted.
+    #[must_use]
+    pub fn selected_label(&self) -> Style {
+        if self.mode == ThemeMode::Painted {
+            return Style::new()
+                .fg(self.colors.selected_text)
+                .add_modifier(Modifier::BOLD);
+        }
+        self.selected().add_modifier(Modifier::BOLD)
     }
 
     #[must_use]
@@ -799,6 +830,7 @@ mod tests {
             Color::Rgb(0x11, 0x22, 0x33)
         );
         assert!(is_reset(bg(theme.selected())));
+        assert!(theme.selected().add_modifier.contains(Modifier::BOLD));
         assert!(!theme.selected().add_modifier.contains(Modifier::REVERSED));
     }
 
