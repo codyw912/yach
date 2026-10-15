@@ -25,7 +25,8 @@ pub struct RenderParams<'a> {
     pub compaction_count: u64,
     pub total_tokens: Option<u64>,
     pub context_used_percent: Option<u8>,
-    pub context_window: Option<u64>,
+    /// Window and whether it is the catalog floor rather than a listed value.
+    pub context_window: Option<(u64, bool)>,
     pub terminal_focused: bool,
     pub theme: &'a Theme,
 }

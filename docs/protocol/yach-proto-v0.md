@@ -83,7 +83,7 @@ This is intentionally close to the PRD's Pi-RPC-shaped phase-1 direction without
 - available models updated
 - fork messages updated
 - session messages updated
-- session stats updated
+- session stats updated, including optional `context_window` and `context_window_assumed` (omitted when false so older peers still decode the number as fact)
 - correlated model activation finished with independent session and default-update outcomes
 - prompt attempt reset with prompt-wide sequence and exact UTF-8 suffix byte count
 - structured model selection required with a categorical resolution reason

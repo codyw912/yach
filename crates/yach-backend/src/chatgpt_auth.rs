@@ -340,6 +340,7 @@ pub fn managed_chatgpt_adapter(
         timeout,
         max_tokens,
         context_window,
+        context_window_assumed: false,
         max_tokens_param,
         error_dialect,
     })

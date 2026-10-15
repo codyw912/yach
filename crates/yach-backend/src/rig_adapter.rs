@@ -275,6 +275,10 @@ pub struct RigProviderAdapterConfig {
     /// layering as `max_tokens`; this field is deliberately a plain
     /// number for the same reason.
     pub context_window: u64,
+    /// `true` when `context_window` is the catalog floor because no catalog
+    /// or discovery source lists the model. Display-only: compaction still
+    /// uses the numeric window.
+    pub context_window_assumed: bool,
     /// Which field carries `max_tokens` on the openai-compatible shape.
     pub max_tokens_param: MaxTokensParam,
     /// Immutable typed dialect selection resolved at adapter construction.
@@ -2921,6 +2925,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 max_tokens: 1,
                 context_window: 1,
+                context_window_assumed: false,
                 max_tokens_param: MaxTokensParam::MaxTokens,
                 error_dialect: DialectSelection::Missing,
             },
@@ -2932,6 +2937,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 max_tokens: 1,
                 context_window: 1,
+                context_window_assumed: false,
                 max_tokens_param: MaxTokensParam::MaxTokens,
                 error_dialect: DialectSelection::Missing,
             },
@@ -2943,6 +2949,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 max_tokens: 1,
                 context_window: 1,
+                context_window_assumed: false,
                 max_tokens_param: MaxTokensParam::MaxTokens,
                 error_dialect: DialectSelection::Missing,
             },
@@ -3101,6 +3108,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         };
@@ -3204,6 +3212,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 777,
             context_window: 2_000,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         };
@@ -3255,6 +3264,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         };
@@ -3303,6 +3313,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         };
@@ -3338,6 +3349,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         };
@@ -3401,6 +3413,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_tokens: 1,
             context_window: 1,
+            context_window_assumed: false,
             max_tokens_param: MaxTokensParam::MaxTokens,
             error_dialect: DialectSelection::Missing,
         };

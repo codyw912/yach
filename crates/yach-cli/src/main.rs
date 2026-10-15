@@ -1339,6 +1339,10 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             )?),
             max_tokens: output_budget.value,
             context_window: profile.context_window.value,
+            context_window_assumed: matches!(
+                profile.context_window.source,
+                yach_catalog::CatalogSource::Default
+            ),
             max_tokens_param,
             error_dialect: adapter_error_dialect(&provider_label),
         },
@@ -1592,6 +1596,10 @@ fn catalog_entries_from_discovery(
                 },
                 curated,
                 context_window: profile.context_window.value,
+                context_window_assumed: matches!(
+                    profile.context_window.source,
+                    yach_catalog::CatalogSource::Default
+                ),
                 output_budget: output_budget.value,
                 max_tokens_param: max_tokens_param_from_catalog(profile.output_tokens_param.value),
                 responses_compact: profile.responses_compact.map(|capability| capability.value),
@@ -1624,6 +1632,65 @@ fn model_layers_fixture() -> ModelOverrideLayers {
         fetched_codex: None,
         env: yach_catalog::EnvOverrides::default(),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn unlisted_discovery_model_marks_the_window_assumed_until_models_toml_overrides_it() {
+    let baked = yach_catalog::Catalog::empty("test");
+    let layers = model_layers_fixture();
+    let unknown = catalog_entries_from_discovery(
+        "openai-codex",
+        vec![discovered("gpt-6.1-sol", None)],
+        &layers,
+        &baked,
+    );
+    assert_eq!(unknown.len(), 1);
+    assert!(unknown[0].context_window_assumed);
+    assert_eq!(
+        unknown[0].context_window,
+        yach_catalog::DEFAULT_CONTEXT_WINDOW
+    );
+
+    let mut baked = yach_catalog::Catalog::empty("test");
+    baked.insert(
+        "openai-codex",
+        "gpt-5.6-sol",
+        yach_catalog::CatalogEntry {
+            context_window: Some(272_000),
+            ..yach_catalog::CatalogEntry::default()
+        },
+    );
+    let listed = catalog_entries_from_discovery(
+        "openai-codex",
+        vec![discovered("gpt-5.6-sol", None)],
+        &layers,
+        &baked,
+    );
+    assert!(!listed[0].context_window_assumed);
+    assert_eq!(listed[0].context_window, 272_000);
+
+    let user = yach_catalog::Overrides::from_toml_str(
+        "[\"openai-codex\".\"gpt-6.1-unlisted\"]\ncontext_window = 1050000\n",
+    );
+    let Ok(user) = user else {
+        return;
+    };
+    let overridden_layers = ModelOverrideLayers {
+        user: Some(user),
+        ..model_layers_fixture()
+    };
+    let overridden = catalog_entries_from_discovery(
+        "openai-codex",
+        vec![discovered("gpt-6.1-unlisted", None)],
+        &overridden_layers,
+        &yach_catalog::Catalog::empty("test"),
+    );
+    assert!(
+        !overridden[0].context_window_assumed,
+        "a models.toml context_window override is a known window"
+    );
+    assert_eq!(overridden[0].context_window, 1_050_000);
 }
 
 #[cfg(test)]
@@ -2272,6 +2339,7 @@ fn run_rig_provider_request_smoke() -> CommandResult {
         timeout: Duration::from_secs(timeout_secs),
         max_tokens,
         context_window: 200_000,
+        context_window_assumed: false,
         max_tokens_param: MaxTokensParam::default(),
         error_dialect: adapter_error_dialect(&request.model.provider),
     };
@@ -2542,6 +2610,7 @@ fn run_responses_compaction_smoke() -> CommandResult {
         timeout: Duration::from_secs(timeout_secs),
         max_tokens: 1_024,
         context_window: 20_000,
+        context_window_assumed: false,
         max_tokens_param: MaxTokensParam::default(),
         error_dialect: adapter_error_dialect("openai"),
     });
@@ -5493,6 +5562,7 @@ fn provider_label_covers_openai_responses_variant() {
         timeout: Duration::from_secs(5),
         max_tokens: 1024,
         context_window: 10_000,
+        context_window_assumed: false,
         max_tokens_param: MaxTokensParam::default(),
         error_dialect: DialectSelection::Missing,
     };
@@ -5751,6 +5821,7 @@ fn loop_provider_cancel_persists_user_entry() {
                         timeout: std::time::Duration::from_millis(1),
                         max_tokens: 1,
                         context_window: 200_000,
+                        context_window_assumed: false,
                         max_tokens_param: MaxTokensParam::default(),
                         error_dialect: DialectSelection::Missing,
                     }),
@@ -5861,6 +5932,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
 
                         max_tokens: 1,
                         context_window: 200_000,
+                        context_window_assumed: false,
                         max_tokens_param: MaxTokensParam::default(),
                         error_dialect: DialectSelection::Missing,
                     }),
@@ -6272,6 +6344,7 @@ mod tests {
             },
             curated: true,
             context_window: 1,
+            context_window_assumed: false,
             output_budget: 1,
             max_tokens_param: yach_backend::rig_adapter::MaxTokensParam::MaxTokens,
             responses_compact: None,

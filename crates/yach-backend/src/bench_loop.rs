@@ -258,6 +258,7 @@ pub(crate) fn scripted_provider_config() -> crate::ProviderConfig {
             timeout: Duration::from_secs(30),
             max_tokens: 1000,
             context_window: 200_000,
+            context_window_assumed: false,
             max_tokens_param: crate::rig_adapter::MaxTokensParam::default(),
             error_dialect: crate::DialectSelection::Missing,
         }),
