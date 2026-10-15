@@ -41,7 +41,7 @@ pub static HEADLESS: [Workload; 6] = [
         emit_alloc: true,
     },
     Workload {
-        id: "keypress/active_stream_replay_headless/100",
+        id: "keypress/active_stream_on_history_headless/100",
         class: Class::Latency,
         isolation: Isolation::InProcessSerial,
         requires: &[],
@@ -275,8 +275,16 @@ fn idle_keypress_steps() -> Vec<ReplayStep> {
     ]
 }
 
+/// Streams onto existing scrollback, where per-entry render caching matters.
+/// `ready_state_event` must precede the deltas: it sets the app's session id
+/// to the fixtures' `SESSION_ID`, and the app drops deltas for any other
+/// session, which left this row measuring 100 no-op renders.
 fn active_stream_steps(count: usize) -> Vec<ReplayStep> {
-    let mut steps = vec![ReplayStep::Backend(connected_event())];
+    let mut steps = vec![
+        ReplayStep::Backend(connected_event()),
+        ReplayStep::Backend(ready_state_event()),
+        ReplayStep::Transcript(transcript_fixture(TranscriptScale::Medium)),
+    ];
     steps.extend(
         prompt_delta_events(count)
             .into_iter()
@@ -631,5 +639,28 @@ fn restore_terminal() -> io::Result<()> {
         Err(error)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use yach_ui::BenchmarkApp;
+
+    use crate::fixtures::TranscriptScale;
+    use crate::replay::apply_step;
+
+    use super::active_stream_steps;
+
+    #[test]
+    fn active_stream_deltas_reach_the_transcript() {
+        let mut app = BenchmarkApp::new();
+        for step in &active_stream_steps(3) {
+            apply_step(&mut app, step);
+        }
+
+        let entries = app.transcript().entries();
+        assert_eq!(entries.len(), TranscriptScale::Medium.entries() + 1);
+        let streamed = entries.last().map(|entry| entry.content.as_str());
+        assert_eq!(streamed, Some("token_0 token_1 token_2 "));
     }
 }

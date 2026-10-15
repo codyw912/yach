@@ -4148,6 +4148,11 @@ impl BenchmarkApp {
         self.app.scroll_to_bottom();
     }
 
+    #[must_use]
+    pub fn transcript(&self) -> &Transcript {
+        &self.app.transcript
+    }
+
     pub fn scroll_down(&mut self, lines: usize) {
         self.app.scroll_offset = self.app.scroll_offset.saturating_add(lines);
     }

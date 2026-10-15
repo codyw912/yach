@@ -2,7 +2,7 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use crossterm::event::{KeyCode, KeyModifiers};
 use yach_bench::fixtures::{
     PayloadScale, TranscriptScale, connected_event, heavy_tool_events, large_paste_payload,
-    prompt_delta_events, transcript_fixture,
+    prompt_delta_events, ready_state_event, transcript_fixture,
 };
 use yach_bench::replay::{ReplayStep, replay_headless};
 
@@ -28,7 +28,12 @@ fn bench_idle_keypress_to_paint_headless(c: &mut Criterion) {
 fn bench_active_stream_replay_headless(c: &mut Criterion) {
     let mut group = c.benchmark_group("keypress");
     for event_count in [100_usize, 1_000] {
-        let mut steps = vec![ReplayStep::Backend(connected_event())];
+        // Without ready_state_event the app keeps session id "default" and
+        // drops every delta addressed to the fixtures' session.
+        let mut steps = vec![
+            ReplayStep::Backend(connected_event()),
+            ReplayStep::Backend(ready_state_event()),
+        ];
         steps.extend(
             prompt_delta_events(event_count)
                 .into_iter()

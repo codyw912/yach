@@ -49,7 +49,7 @@ pub fn replay_headless(steps: &[ReplayStep], width: u16, height: u16) -> ReplayR
     }
 }
 
-fn apply_step(app: &mut BenchmarkApp, step: &ReplayStep) {
+pub(crate) fn apply_step(app: &mut BenchmarkApp, step: &ReplayStep) {
     match step {
         ReplayStep::Backend(event) => app.handle_backend_event(event.clone()),
         ReplayStep::Key { code, modifiers } => app.handle_key(*code, *modifiers),
