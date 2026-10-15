@@ -1,6 +1,11 @@
 mod palettes;
+mod select;
 
 pub use palettes::{BundledPalette, bundled_palette};
+pub use select::{
+    Appearance, BaseError, ExtensionThemes, appearance_from_colorfgbg, builtin_theme_names,
+    is_builtin_theme_name, resolve_base,
+};
 #[cfg(test)]
 mod contrast;
 #[cfg(test)]

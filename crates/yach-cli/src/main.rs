@@ -430,37 +430,149 @@ fn selected_tui_resume(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--resume")
 }
 
-fn load_tui_theme(project_root: Option<&Path>) -> Result<Theme, String> {
-    let explicit = std::env::var_os("YACH_THEME").map(PathBuf::from);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let Some(path) = tui_theme_path(project_root, explicit.as_deref(), home.as_deref()) else {
-        return Ok(Theme::default());
-    };
-    let json = std::fs::read_to_string(&path)
+struct ThemeEnv {
+    yach_theme: Option<std::ffi::OsString>,
+    no_color: Option<std::ffi::OsString>,
+    colorfgbg: Option<String>,
+    home: Option<PathBuf>,
+}
+
+impl ThemeEnv {
+    fn from_process() -> Self {
+        Self {
+            yach_theme: std::env::var_os("YACH_THEME"),
+            no_color: std::env::var_os("NO_COLOR"),
+            colorfgbg: std::env::var("COLORFGBG").ok(),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        }
+    }
+}
+
+fn read_theme_file(path: &Path) -> Result<ThemeDocument, String> {
+    let json = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to load theme {}: {error}", path.display()))?;
-    let document = ThemeDocument::parse(&json)
-        .map_err(|error| format!("failed to load theme {}: {error}", path.display()))?;
-    document
-        .apply(Theme::dark())
+    ThemeDocument::parse(&json)
         .map_err(|error| format!("failed to load theme {}: {error}", path.display()))
 }
 
-fn tui_theme_path(
+fn fallback_notice(requested: &str) -> String {
+    format!(
+        "unknown theme '{requested}'; using auto. built-in themes: {}",
+        yach_ui::builtin_theme_names().join(", ")
+    )
+}
+
+fn explicit_theme_path(requested: &std::ffi::OsStr, home: Option<&Path>) -> Option<PathBuf> {
+    let path = Path::new(requested);
+    let spelling = requested.to_string_lossy();
+    if !path.is_absolute()
+        && !spelling.starts_with(['.', '~'])
+        && !spelling.contains(std::path::is_separator)
+    {
+        return None;
+    }
+    if let Ok(relative) = path.strip_prefix("~")
+        && let Some(home) = home
+    {
+        return Some(home.join(relative));
+    }
+    Some(path.to_path_buf())
+}
+
+fn resolve_theme(
+    env: &ThemeEnv,
+    extensions: &dyn yach_ui::ExtensionThemes,
+) -> Result<(Theme, Vec<String>), String> {
+    if env
+        .no_color
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Ok((Theme::monochrome(), Vec::new()));
+    }
+    let appearance = yach_ui::appearance_from_colorfgbg(env.colorfgbg.as_deref());
+    let auto = match appearance {
+        yach_ui::Appearance::Dark => Theme::dark(),
+        yach_ui::Appearance::Light => Theme::light(),
+    };
+    if let Some(requested) = env.yach_theme.as_deref() {
+        if let Some(path) = explicit_theme_path(requested, env.home.as_deref()) {
+            return Ok(
+                match read_theme_file(&path)
+                    .and_then(|document| apply_document(&path, &document, appearance, extensions))
+                {
+                    Ok(resolved) => resolved,
+                    Err(error) => (auto, vec![format!("{error}; using auto")]),
+                },
+            );
+        }
+        let name = requested.to_string_lossy();
+        return Ok(match yach_ui::resolve_base(&name, appearance, extensions) {
+            Ok(theme) => (theme, Vec::new()),
+            Err(error) => (auto, vec![base_error_notice(&error)]),
+        });
+    }
+    if let Some(home) = env.home.as_deref() {
+        let path = home.join(".yach/theme.json");
+        if path.is_file() {
+            return apply_document(&path, &read_theme_file(&path)?, appearance, extensions);
+        }
+    }
+    Ok((auto, Vec::new()))
+}
+
+fn apply_document(
+    path: &Path,
+    document: &ThemeDocument,
+    appearance: yach_ui::Appearance,
+    extensions: &dyn yach_ui::ExtensionThemes,
+) -> Result<(Theme, Vec<String>), String> {
+    let base_name = document.base().map_or("dark", |name| name);
+    let (base, notices) = match yach_ui::resolve_base(base_name, appearance, extensions) {
+        Ok(base) => (base, Vec::new()),
+        Err(error) => {
+            let auto = match appearance {
+                yach_ui::Appearance::Dark => Theme::dark(),
+                yach_ui::Appearance::Light => Theme::light(),
+            };
+            (auto, vec![base_error_notice(&error)])
+        }
+    };
+    document
+        .apply(base)
+        .map(|theme| (theme, notices))
+        .map_err(|error| format!("failed to load theme {}: {error}", path.display()))
+}
+
+fn base_error_notice(error: &yach_ui::BaseError) -> String {
+    match error {
+        yach_ui::BaseError::Unknown(name) => fallback_notice(name),
+        yach_ui::BaseError::ExtensionBaseNotBuiltin { theme, base } => format!(
+            "theme '{theme}' cannot use base '{base}': an extension theme's base must be a built-in theme; using auto"
+        ),
+        yach_ui::BaseError::Invalid { name, error } => {
+            format!("theme '{name}' is invalid: {error}; using auto")
+        }
+    }
+}
+
+fn resolve_tui_options(
+    env: &ThemeEnv,
     project_root: Option<&Path>,
-    explicit: Option<&Path>,
-    home: Option<&Path>,
-) -> Option<PathBuf> {
-    if let Some(path) = explicit {
-        return Some(path.to_path_buf());
+    resume_session: bool,
+) -> Result<RunTuiOptions, String> {
+    let (theme, mut startup_notices) = resolve_theme(env, &())?;
+    if project_root.is_some_and(|root| root.join(".yach/theme.json").is_file()) {
+        startup_notices.push(String::from(concat!(
+            "project themes are not supported; move it to `~/.yach/theme.json` ",
+            "or set `YACH_THEME`"
+        )));
     }
-
-    let project_theme = project_root.map(|root| root.join(".yach/theme.json"));
-    if project_theme.as_ref().is_some_and(|path| path.is_file()) {
-        return project_theme;
-    }
-
-    let user_theme = home.map(|root| root.join(".yach/theme.json"));
-    user_theme.filter(|path| path.is_file())
+    Ok(RunTuiOptions {
+        resume_session,
+        theme,
+        startup_notices,
+    })
 }
 
 impl Command {
@@ -3583,6 +3695,7 @@ fn run_tui_provider_connection_smoke_command() -> CommandResult {
                 ui_options: RunTuiOptions {
                     resume_session: false,
                     theme: Theme::default(),
+                    startup_notices: Vec::new(),
                 },
                 trace: None,
                 catalog_refresh: None,
@@ -3848,16 +3961,13 @@ fn run_tui_command(
     trace: Option<&yach_trace::TraceSink>,
 ) -> CommandResult {
     let project_root = std::env::current_dir().ok();
-    let theme = match load_tui_theme(project_root.as_deref()) {
-        Ok(theme) => theme,
-        Err(error) => {
-            return CommandResult::UsageError { message: error };
-        }
-    };
-    let ui_options = RunTuiOptions {
-        resume_session: resume,
-        theme,
-    };
+    let ui_options =
+        match resolve_tui_options(&ThemeEnv::from_process(), project_root.as_deref(), resume) {
+            Ok(options) => options,
+            Err(error) => {
+                return CommandResult::UsageError { message: error };
+            }
+        };
     let ui_handshake = alpha_handshake();
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -3871,8 +3981,7 @@ fn run_tui_command(
         trace.mark(yach_trace::TraceScope::Startup, "tokio_runtime_created");
     }
 
-    // Resolve cwd once so override and theme loading use the same project
-    // root as the backend runner.
+    // Reuse the cwd resolved for startup notices as the backend runner's root.
     let layers = ModelOverrideLayers::load_for_project(project_root.as_deref());
 
     let result = match backend {
@@ -4091,13 +4200,46 @@ struct NativeTuiRunConfig<'a> {
     session_path_override: Option<PathBuf>,
 }
 
+fn tui_startup_session_path(
+    ui_options: &mut RunTuiOptions,
+    session_path_override: Option<PathBuf>,
+    project_root: Option<&Path>,
+    fresh_session_id: &str,
+) -> io::Result<PathBuf> {
+    let resume = ui_options.resume_session;
+    let (session_path, resume_existing_session) = if let Some(session_path) = session_path_override
+    {
+        let resume_existing = resume && session_path.is_file();
+        (session_path, resume_existing)
+    } else {
+        let session_project_root = project_root
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| io::Error::other("unable to resolve the current project"))?;
+        let session_dir = project_session_log_dir(&session_project_root)?;
+        let latest_session_path = latest_session_log_path_in(&session_dir);
+        let resume_existing = resume && latest_session_path.is_some();
+        (
+            tui_session_path_from_latest(
+                resume,
+                latest_session_path,
+                fresh_session_id,
+                &session_dir,
+            ),
+            resume_existing,
+        )
+    };
+    ui_options.resume_session = resume_existing_session;
+    Ok(session_path)
+}
+
 async fn run_tui_with_native_backend_config_observed(
     ui_handshake: Handshake,
     setup: NativeTuiBackendSetup,
     options: NativeTuiRunConfig<'_>,
 ) -> io::Result<()> {
     let NativeTuiRunConfig {
-        ui_options,
+        mut ui_options,
         trace,
         catalog_refresh,
         project_root,
@@ -4106,7 +4248,6 @@ async fn run_tui_with_native_backend_config_observed(
         event_observer,
         session_path_override,
     } = options;
-    let resume = ui_options.resume_session;
     if let Some(trace) = trace.as_ref() {
         trace.mark(yach_trace::TraceScope::Startup, "backend_setup_start");
     }
@@ -4140,28 +4281,12 @@ async fn run_tui_with_native_backend_config_observed(
         trace.mark(yach_trace::TraceScope::Startup, "backend_session_started");
     }
     let fresh_session_id = fresh_session_id();
-    let (session_path, resume_existing_session) = if let Some(session_path) = session_path_override
-    {
-        let resume_existing = resume && session_path.is_file();
-        (session_path, resume_existing)
-    } else {
-        let session_project_root = project_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| io::Error::other("unable to resolve the current project"))?;
-        let session_dir = project_session_log_dir(&session_project_root)?;
-        let latest_session_path = latest_session_log_path_in(&session_dir);
-        let resume_existing = resume && latest_session_path.is_some();
-        (
-            tui_session_path_from_latest(
-                resume,
-                latest_session_path,
-                &fresh_session_id,
-                &session_dir,
-            ),
-            resume_existing,
-        )
-    };
+    let session_path = tui_startup_session_path(
+        &mut ui_options,
+        session_path_override,
+        project_root.as_deref(),
+        &fresh_session_id,
+    )?;
     let (provider, provider_setup_error, model_discovery) = match setup {
         NativeTuiBackendSetup::Fixture => (None, None, None),
         NativeTuiBackendSetup::Configured {
@@ -4221,7 +4346,7 @@ async fn run_tui_with_native_backend_config_observed(
     if let Some(trace) = trace.as_ref() {
         trace.mark(yach_trace::TraceScope::Startup, "client_initialize_sent");
     }
-    if resume_existing_session {
+    if ui_options.resume_session {
         let _ = client_tx.send(ClientEvent::SessionPathSelected {
             session_path: session_path.to_string_lossy().into_owned(),
         });
@@ -6013,12 +6138,13 @@ mod tests {
     use super::{
         CliArgs, Command, CommandResult, ExtensionDiagnosticRecord, ExtensionDiagnosticsCommand,
         ExtensionDiagnosticsOutcome, ExtensionManagementAction, ExtensionManagementOutcome,
-        NativeTuiBackendSetup, RigSmokeConfigError, RigSmokeOutcome, RunnerConfigInput,
+        NativeTuiBackendSetup, RigSmokeConfigError, RigSmokeOutcome, RunnerConfigInput, ThemeEnv,
         TuiBackendSelection, dialog_smoke_requests, extension_package_roots_from_install_records,
         extension_store_path, native_backend_handshake, print_capabilities,
-        provider_setup_error_message, run_extension_install_command, run_extension_list_command,
-        run_extension_remove_command, run_extension_set_enabled_command, runner_config,
-        tui_session_path_from_latest, tui_theme_path, unconfigured_launch_setup_error,
+        provider_setup_error_message, resolve_theme, resolve_tui_options,
+        run_extension_install_command, run_extension_list_command, run_extension_remove_command,
+        run_extension_set_enabled_command, runner_config, tui_session_path_from_latest,
+        unconfigured_launch_setup_error,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Read, Write};
@@ -6041,7 +6167,7 @@ mod tests {
         NewConnectionDraft, ProviderKind, ProviderSecret,
     };
     use yach_proto::{BackendEvent, ClientEvent, PromptOutcome, ServerEvent};
-    use yach_ui::negotiate_with;
+    use yach_ui::{Theme, ThemeMode, negotiate_with};
 
     trait TestUnwrap {
         type Output;
@@ -6169,36 +6295,301 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("print-capabilities")));
     }
 
-    #[test]
-    fn tui_theme_path_prefers_explicit_then_project_then_user() -> Result<(), String> {
-        let root = TestTempDir::new("theme-path")?;
-        let project = root.path().join("project");
-        let home = root.path().join("home");
-        let project_theme = project.join(".yach/theme.json");
-        let user_theme = home.join(".yach/theme.json");
-        expect_ok(std::fs::create_dir_all(
-            project_theme.parent().ok_or("project parent")?,
-        ))?;
-        expect_ok(std::fs::create_dir_all(
-            user_theme.parent().ok_or("user parent")?,
-        ))?;
-        expect_ok(std::fs::write(&project_theme, "{}"))?;
-        expect_ok(std::fs::write(&user_theme, "{}"))?;
+    fn theme_env(
+        yach_theme: Option<&str>,
+        no_color: Option<&str>,
+        colorfgbg: Option<&str>,
+        home: Option<&Path>,
+    ) -> ThemeEnv {
+        ThemeEnv {
+            yach_theme: yach_theme.map(std::ffi::OsString::from),
+            no_color: no_color.map(std::ffi::OsString::from),
+            colorfgbg: colorfgbg.map(str::to_owned),
+            home: home.map(Path::to_path_buf),
+        }
+    }
 
+    fn theme_file(dir: &Path, body: &str) -> Result<PathBuf, String> {
+        expect_ok(std::fs::create_dir_all(dir.join(".yach")))?;
+        let path = dir.join(".yach/theme.json");
+        expect_ok(std::fs::write(&path, body))?;
+        Ok(path)
+    }
+
+    #[test]
+    fn resolve_theme_precedence() -> Result<(), String> {
+        let root = TestTempDir::new("theme-precedence")?;
+        let home = root.path().join("home");
+        theme_file(&home, r##"{"colors":{"accent":"#020202"}}"##)?;
+        for (name, expected) in [
+            ("light", Theme::light()),
+            ("dark", Theme::dark()),
+            ("system", Theme::system()),
+            ("auto", Theme::light()),
+        ] {
+            let (theme, notices) =
+                resolve_theme(&theme_env(Some(name), None, Some("0;15"), Some(&home)), &())?;
+            expect_equal(&theme, &expected)?;
+            expect_true(notices.is_empty(), "preset is silent")?;
+        }
+        for (name, color) in [("chosen.json", "#010101"), ("dark", "#030303")] {
+            let path = root.path().join(name);
+            expect_ok(std::fs::write(
+                &path,
+                format!(r#"{{"colors":{{"accent":"{color}"}}}}"#),
+            ))?;
+            let (theme, notices) = resolve_theme(
+                &theme_env(Some(&path_string(&path)?), None, None, Some(&home)),
+                &(),
+            )?;
+            let component = if name == "dark" { 3 } else { 1 };
+            expect_equal(
+                &theme.accent().fg,
+                &Some(ratatui::style::Color::Rgb(component, component, component)),
+            )?;
+            expect_true(notices.is_empty(), "explicit file is silent")?;
+        }
+        let (theme, notices) =
+            resolve_theme(&theme_env(None, None, Some("0;15"), Some(&home)), &())?;
         expect_equal(
-            &tui_theme_path(Some(&project), None, Some(&home)),
-            &Some(project_theme.clone()),
+            &theme.accent().fg,
+            &Some(ratatui::style::Color::Rgb(2, 2, 2)),
         )?;
-        expect_ok(std::fs::remove_file(project.join(".yach/theme.json")))?;
+        expect_equal(&theme.text().fg, &Theme::dark().text().fg)?;
+        expect_true(notices.is_empty(), "user file is silent")?;
+        for (colorfgbg, expected) in [
+            (Some("0;15"), Theme::light()),
+            (Some("15;0"), Theme::dark()),
+            (None, Theme::dark()),
+        ] {
+            let (theme, notices) =
+                resolve_theme(&theme_env(None, None, colorfgbg, Some(root.path())), &())?;
+            expect_equal(&theme, &expected)?;
+            expect_true(notices.is_empty(), "auto is silent")?;
+        }
+        let (theme, notices) = resolve_theme(
+            &theme_env(Some("nord"), None, Some("0;15"), Some(&home)),
+            &(),
+        )?;
+        expect_true(theme != Theme::light(), "palette ignores appearance")?;
+        expect_equal(&theme.mode(), &ThemeMode::Painted)?;
+        expect_true(notices.is_empty(), "palette is silent")?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_theme_unknown_name_lists_builtins_and_uses_auto() -> Result<(), String> {
+        let root = TestTempDir::new("theme-unknown")?;
+        // Even an existing bare file is a name, not an implicit path.
+        for name in ["not-a-theme", "Cargo.toml"] {
+            let (theme, notices) = resolve_theme(
+                &theme_env(Some(name), None, Some("0;15"), Some(root.path())),
+                &(),
+            )?;
+            expect_equal(&theme, &Theme::light())?;
+            expect_equal(&notices.len(), &1)?;
+            for text in [name, "dark", "catppuccin-mocha", "auto"] {
+                expect_true(notices[0].contains(text), &notices[0])?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_theme_file_with_unknown_base_keeps_file_tokens_over_auto() -> Result<(), String> {
+        let root = TestTempDir::new("theme-bad-base")?;
+        let path = root.path().join("custom.json");
+        expect_ok(std::fs::write(
+            &path,
+            r##"{"base":"not-a-palette","colors":{"accent":"#040404"}}"##,
+        ))?;
+        let (theme, notices) = resolve_theme(
+            &theme_env(Some(&path_string(&path)?), None, Some("0;15"), None),
+            &(),
+        )?;
+        expect_equal(&notices.len(), &1)?;
+        expect_true(notices[0].contains("not-a-palette"), "notice names base")?;
         expect_equal(
-            &tui_theme_path(Some(&project), None, Some(&home)),
-            &Some(user_theme),
+            &theme.accent().fg,
+            &Some(ratatui::style::Color::Rgb(4, 4, 4)),
         )?;
-        let explicit = root.path().join("chosen-theme.json");
+        expect_equal(&theme.text().fg, &Theme::light().text().fg)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_theme_no_color_overrides_every_source() -> Result<(), String> {
+        let root = TestTempDir::new("theme-no-color")?;
+        let home = root.path().join("home");
+        theme_file(&home, "not json")?;
+        for requested in [
+            None,
+            Some("light"),
+            Some("unknown:theme"),
+            Some("./missing.json"),
+        ] {
+            for no_color in ["1", "0", " "] {
+                let (theme, notices) = resolve_theme(
+                    &theme_env(requested, Some(no_color), Some("0;15"), Some(&home)),
+                    &(),
+                )?;
+                expect_equal(&theme, &Theme::monochrome())?;
+                expect_equal(&theme.mode(), &ThemeMode::Mono)?;
+                expect_true(notices.is_empty(), "NO_COLOR is silent")?;
+            }
+        }
+        let (theme, _) =
+            resolve_theme(&theme_env(Some("light"), Some(""), None, Some(&home)), &())?;
+        expect_equal(&theme, &Theme::light())?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_theme_explicit_path_errors_report_notice_and_use_auto() -> Result<(), String> {
+        let root = TestTempDir::new("theme-path-errors")?;
+        let invalid = root.path().join("invalid.json");
+        expect_ok(std::fs::write(&invalid, "not json"))?;
+        let invalid_tokens = root.path().join("tokens.json");
+        expect_ok(std::fs::write(
+            &invalid_tokens,
+            r#"{"colors":{"accent":"invalid"}}"#,
+        ))?;
+        for path in [
+            root.path().join("missing.json"),
+            invalid,
+            invalid_tokens,
+            root.path().to_path_buf(),
+            PathBuf::from("./missing.json"),
+            PathBuf::from("subdir/missing.json"),
+        ] {
+            let (theme, notices) = resolve_theme(
+                &theme_env(Some(&path_string(&path)?), None, Some("0;15"), None),
+                &(),
+            )?;
+            expect_equal(&theme, &Theme::light())?;
+            expect_equal(&notices.len(), &1)?;
+            expect_true(
+                notices[0].contains(&path_string(&path)?),
+                "notice names file",
+            )?;
+            expect_true(
+                notices[0].contains("failed to load theme"),
+                "file load diagnostic",
+            )?;
+            expect_true(
+                !notices[0].starts_with("unknown theme '"),
+                "not an unknown name",
+            )?;
+        }
+        let home = root.path().join("home");
+        theme_file(&home, "not json")?;
+        expect_true(
+            resolve_theme(&theme_env(None, None, None, Some(&home)), &()).is_err(),
+            "invalid user file is an error",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_theme_tilde_path_uses_supplied_home() -> Result<(), String> {
+        let root = TestTempDir::new("theme-tilde")?;
+        theme_file(root.path(), r##"{"colors":{"accent":"#030303"}}"##)?;
+        let (theme, notices) = resolve_theme(
+            &theme_env(Some("~/.yach/theme.json"), None, None, Some(root.path())),
+            &(),
+        )?;
         expect_equal(
-            &tui_theme_path(Some(&project), Some(&explicit), Some(&home)),
-            &Some(explicit),
+            &theme.accent().fg,
+            &Some(ratatui::style::Color::Rgb(3, 3, 3)),
         )?;
+        expect_true(notices.is_empty(), "tilde path is silent")?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_theme_extension_names_and_file_bases() -> Result<(), String> {
+        struct Extension;
+        impl yach_ui::ExtensionThemes for Extension {
+            fn theme_json(&self, name: &str) -> Option<String> {
+                match name {
+                    "owl:dim" => Some(String::from(
+                        r##"{"base":"light","colors":{"accent":"#112233"}}"##,
+                    )),
+                    "owl:invalid" => Some(String::from("not json")),
+                    "owl:chain" => Some(String::from(r#"{"base":"owl:dim"}"#)),
+                    _ => None,
+                }
+            }
+        }
+        let (theme, notices) =
+            resolve_theme(&theme_env(Some("owl:dim"), None, None, None), &Extension)?;
+        expect_equal(
+            &theme.accent().fg,
+            &Some(ratatui::style::Color::Rgb(17, 34, 51)),
+        )?;
+        expect_equal(&theme.text().fg, &Theme::light().text().fg)?;
+        expect_true(notices.is_empty(), "extension is silent")?;
+        for name in ["owl:invalid", "owl:chain"] {
+            let (theme, notices) =
+                resolve_theme(&theme_env(Some(name), None, Some("0;15"), None), &Extension)?;
+            expect_equal(&theme, &Theme::light())?;
+            expect_equal(&notices.len(), &1)?;
+            expect_true(notices[0].contains(name), "notice names extension")?;
+        }
+        let root = TestTempDir::new("theme-extension-base")?;
+        let path = theme_file(
+            root.path(),
+            r##"{"base":"owl:dim","colors":{"accent":"#040404"}}"##,
+        )?;
+        let (theme, notices) = resolve_theme(
+            &theme_env(Some(&path_string(&path)?), None, None, None),
+            &Extension,
+        )?;
+        expect_equal(
+            &theme.accent().fg,
+            &Some(ratatui::style::Color::Rgb(4, 4, 4)),
+        )?;
+        expect_equal(&theme.text().fg, &Theme::light().text().fg)?;
+        expect_true(notices.is_empty(), "file over extension is silent")?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_theme_startup_reads_legacy_user_file_and_only_notices_project_file()
+    -> Result<(), String> {
+        let root = TestTempDir::new("theme-startup")?;
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        theme_file(&home, r##"{"colors":{"accent":"#020202"}}"##)?;
+        let project_file = theme_file(&project, "invalid project theme is never read")?;
+        let options = resolve_tui_options(
+            &theme_env(None, None, Some("0;15"), Some(&home)),
+            Some(&project),
+            false,
+        )?;
+        expect_equal(&options.theme.text().fg, &Theme::dark().text().fg)?;
+        expect_equal(
+            &options.theme.accent().fg,
+            &Some(ratatui::style::Color::Rgb(2, 2, 2)),
+        )?;
+        expect_equal(
+            &options.startup_notices,
+            &vec![String::from(
+                "project themes are not supported; move it to `~/.yach/theme.json` or set `YACH_THEME`",
+            )],
+        )?;
+        expect_equal(
+            &expect_ok(std::fs::read_to_string(project_file))?,
+            &String::from("invalid project theme is never read"),
+        )?;
+        let options = resolve_tui_options(
+            &theme_env(None, None, Some("0;15"), None),
+            Some(&project),
+            true,
+        )?;
+        expect_equal(&options.theme, &Theme::light())?;
+        expect_true(options.resume_session, "resume option preserved")?;
+        expect_equal(&options.startup_notices.len(), &1)?;
         Ok(())
     }
 
@@ -7082,6 +7473,54 @@ mod tests {
             tui_session_path_from_latest(true, None, "fresh-session", &session_dir),
             session_log_path_in(&session_dir, "fresh-session")
         );
+    }
+
+    #[test]
+    fn tui_resume_missing_session_does_not_defer_startup_notices() -> Result<(), String> {
+        let root = TestTempDir::new("resume-notices")?;
+        let missing = root.path().join("missing.jsonl");
+        let mut options = yach_ui::RunTuiOptions {
+            resume_session: true,
+            startup_notices: vec![String::from("theme fallback notice")],
+            ..Default::default()
+        };
+        let selected = super::tui_startup_session_path(
+            &mut options,
+            Some(missing.clone()),
+            Some(root.path()),
+            "fresh",
+        )
+        .map_err(|error| error.to_string())?;
+        expect_equal(&selected, &missing)?;
+        expect_true(
+            !options.resume_session,
+            "no session means notices display immediately",
+        )?;
+        expect_equal(
+            &options.startup_notices,
+            &vec![String::from("theme fallback notice")],
+        )?;
+        expect_true(
+            !missing.exists(),
+            "selection must not create missing session",
+        )?;
+        options.resume_session = true;
+        let fresh = super::tui_startup_session_path(&mut options, None, Some(root.path()), "fresh")
+            .map_err(|error| error.to_string())?;
+        expect_true(
+            !options.resume_session,
+            "no latest session means immediate notices",
+        )?;
+        expect_true(fresh.ends_with("fresh.jsonl"), "fresh session chosen")?;
+        expect_ok(std::fs::write(&missing, ""))?;
+        options.resume_session = true;
+        super::tui_startup_session_path(&mut options, Some(missing), Some(root.path()), "fresh")
+            .map_err(|error| error.to_string())?;
+        expect_true(
+            options.resume_session,
+            "existing session defers until hydration",
+        )?;
+        Ok(())
     }
 
     #[test]

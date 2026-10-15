@@ -169,7 +169,9 @@ Environment:
 | `YACH_RIG_OPENAI_MODEL` | — | Model id; required when the provider is `openai`. |
 | `YACH_RIG_OPENAI_COMPAT_BASE_URL` / `_API_KEY` / `_MODEL` | — | Required when `YACH_RIG_PROVIDER=openai-compatible`. |
 | `YACH_RIG_PROVIDER_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
-| `YACH_THEME` | auto-discovered | Explicit path to a TUI theme JSON file. |
+| `YACH_THEME` | user file, then `auto` | TUI preset (`dark`, `light`, `system`, `auto`), bundled palette name, or explicit JSON path. |
+| `COLORFGBG` | dark appearance | `auto` uses the last semicolon-separated background index: below 8 is dark, 8 or above is light; missing or invalid stays dark. |
+| `NO_COLOR` | unset | Any non-empty value selects monochrome, overriding every theme source. |
 | `YACH_SESSION_DIR` | project-keyed directory under `~/.yach/sessions/` | Absolute override for session storage and lookup. |
 | `YACH_CAPTURE_REQUESTS` | off | Absolute directory. Writes each OpenAI, OpenAI-compatible, ChatGPT-subscription, and native-compaction request body, one private file per attempt. Anthropic requests are not captured. Authentication headers are never written; bodies are the exact request bodies, so they contain whatever the prompt and files contain. Keep capture off unless diagnosing a request. |
 
@@ -239,11 +241,25 @@ Defaults deny `.env*` (except `.env.example` and friends), key material
 listings and refuse reads/edits with an explanation the model can act on.
 Invalid config fails closed to the defaults.
 
-TUI themes use `~/.yach/theme.json` for personal settings or
-`<project>/.yach/theme.json` for project settings. `YACH_THEME=/path/to/theme.json`
-selects any named theme file and takes precedence over both; project settings
-take precedence over personal settings. Without a file, yach uses its built-in
-Pi-inspired dark theme.
+TUI themes use `~/.yach/theme.json` for personal settings. `YACH_THEME` takes
+precedence: select `dark`, `light`, `system`, `auto`, a bundled palette such as
+`catppuccin-mocha` or `nord`, or an explicit JSON path. A value that is absolute,
+starts with `.` or `~`, or contains a path separator is a path; use `./dark` to
+load a file named `dark`. `~/` paths use your home directory. Other values are
+theme names, even if a bare file of that name exists.
+
+Without a selected name or personal file, `auto` follows `COLORFGBG` (see above).
+Use `YACH_THEME=light|dark` to override the guess, or `YACH_THEME=system` for
+terminal colors without painted surfaces. Non-empty `NO_COLOR` wins over all
+of these choices. JSON's optional `base` selects a preset or bundled palette;
+without it, existing files remain dark plus their overrides.
+
+Unknown names show a diagnostic listing built-in names and fall back to `auto`.
+An unresolved file `base` keeps the file's overrides over `auto`. An explicit
+path that cannot be read or applied shows a startup notice and uses `auto`.
+Project `<project>/.yach/theme.json` files no longer apply: startup shows one
+notice asking you to move the file to `~/.yach/theme.json` or set `YACH_THEME`,
+without changing the project file.
 
 ```json
 {
@@ -273,7 +289,8 @@ others), 256-color indices, or entries from `vars`. Available color tokens:
 `userMessageText`, `toolPendingBackground`, `toolSuccessBackground`,
 `toolErrorBackground`, `toolTitle`, `toolOutput`, `diffAdded`, `diffRemoved`,
 `diffContext`, `diffHunk`, and `harness`. Unknown fields, tokens, colors, or
-variables fail before the TUI opens rather than being ignored.
+variables in the personal file fail before the TUI opens rather than being
+ignored; explicit `YACH_THEME` file failures instead show the fallback notice.
 
 ### Session logs and privacy
 

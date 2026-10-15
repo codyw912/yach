@@ -28,6 +28,9 @@ yach-proto = { version = "0.1.0", path = "../yach-proto" }
 yach-ui = { version = "0.1.0", path = "../yach-ui" }
 yach-trace = { version = "0.1.0", path = "../yach-trace" }
 
+[dev-dependencies]
+ratatui = "0.30"
+
 [lints]
 workspace = true
 

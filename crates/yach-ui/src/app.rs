@@ -30,10 +30,11 @@ use crate::theme::Theme;
 use crate::thinking_level::ThinkingLevel;
 use crate::transcript::{self, Transcript, TranscriptAlignment, TranscriptRenderCache};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunTuiOptions {
     pub resume_session: bool,
     pub theme: Theme,
+    pub startup_notices: Vec<String>,
 }
 
 fn lifecycle_action_verb(action: ExtensionLifecycleAction) -> &'static str {
@@ -764,6 +765,8 @@ pub struct App {
     pending_session_id: Option<String>,
     session_file: Option<String>,
     session_message_hydration: SessionMessageHydration,
+    /// Startup notices held until resume hydration rebuilds the transcript.
+    pending_startup_notices: Vec<String>,
     pending_thinking_level: Option<ThinkingLevel>,
     pending_thinking_handoff: Option<PendingThinkingHandoff>,
     perf_metrics: PerfMetrics,
@@ -834,6 +837,7 @@ impl App {
             pending_session_id: None,
             session_file: None,
             session_message_hydration: SessionMessageHydration::None,
+            pending_startup_notices: Vec::new(),
             pending_thinking_level: None,
             pending_thinking_handoff: None,
             perf_metrics: PerfMetrics::new(),
@@ -868,6 +872,23 @@ impl App {
         if !already_noted {
             self.transcript.append_status(message);
         }
+    }
+
+    fn new_with_options(
+        client_tx: mpsc::UnboundedSender<ClientEvent>,
+        options: &RunTuiOptions,
+    ) -> Self {
+        let mut app = Self::new_with_theme(client_tx, options.theme);
+        if options.resume_session {
+            app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+            app.pending_startup_notices
+                .clone_from(&options.startup_notices);
+        } else {
+            for notice in &options.startup_notices {
+                app.transcript.append_status(notice);
+            }
+        }
+        app
     }
 
     fn clear_model_context(&mut self) {
@@ -1368,6 +1389,16 @@ impl App {
                 self.scroll_to_bottom();
             }
             ServerEvent::StatusUpdated { message } => {
+                if self.session_message_hydration == SessionMessageHydration::ExplicitResume
+                    && (message.starts_with("failed to load session log:")
+                        || message.starts_with("unknown session path "))
+                {
+                    self.session_message_hydration = SessionMessageHydration::None;
+                    for notice in std::mem::take(&mut self.pending_startup_notices) {
+                        self.transcript.append_status(&notice);
+                    }
+                    self.scroll_to_bottom();
+                }
                 match status_lifecycle(&message) {
                     Some(StatusLifecycle::Ended) => {
                         if !matches!(self.stream_state, StreamState::Desynchronized { .. }) {
@@ -2196,6 +2227,9 @@ impl App {
                 "system" => self.transcript.append_compaction(&message.text),
                 _ => {}
             }
+        }
+        for notice in std::mem::take(&mut self.pending_startup_notices) {
+            self.transcript.append_status(&notice);
         }
         if !messages.is_empty() {
             self.scroll_to_bottom();
@@ -4299,10 +4333,7 @@ pub async fn run_tui_with_trace_and_options(
     if let Some(trace) = trace.as_ref() {
         trace.mark(yach_trace::TraceScope::Startup, "run_tui_start");
     }
-    let mut app = App::new_with_theme(client_tx, options.theme);
-    if options.resume_session {
-        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
-    }
+    let mut app = App::new_with_options(client_tx, &options);
     if let Some(trace) = trace.as_ref() {
         trace.mark(yach_trace::TraceScope::Startup, "tui_app_created");
     }
@@ -4994,11 +5025,13 @@ fn centered_rect(
 
 #[cfg(test)]
 mod tests {
+    use super::RunTuiOptions;
     use super::{
         App, AppMode, EMPTY_ASSISTANT_RESPONSE_MESSAGE, FullAccessConfirmationAction,
         LocalEditComposeStep, LocalEditDraft, LocalEditReview, LocalEditReviewAction,
         MAX_TOOL_ERROR_EXCERPT_CHARS, SessionMessageHydration, tool_output_summary,
     };
+    use crate::theme::Theme;
     use crate::thinking_level::ThinkingLevel;
     use crate::transcript::EntryKind;
     use crossterm::event::{Event, KeyCode, KeyModifiers};
@@ -5023,6 +5056,122 @@ mod tests {
                 &default_backend_handshake(),
             ),
         }
+    }
+
+    const LEGACY_NOTICE: &str = concat!(
+        "project themes are not supported; move it to `~/.yach/theme.json` ",
+        "or set `YACH_THEME`"
+    );
+
+    fn notice_options(resume_session: bool) -> RunTuiOptions {
+        RunTuiOptions {
+            resume_session,
+            theme: Theme::default(),
+            startup_notices: vec![
+                String::from(LEGACY_NOTICE),
+                String::from("unknown theme 'nope'; using auto"),
+            ],
+        }
+    }
+
+    fn status_contents(app: &App) -> Vec<&str> {
+        app.transcript
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.kind, EntryKind::Status))
+            .map(|entry| entry.content.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn startup_notices_land_in_the_transcript_before_the_first_event() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let app = App::new_with_options(tx, &notice_options(false));
+        assert_eq!(app.transcript.entries().len(), 2);
+        assert_eq!(
+            status_contents(&app),
+            vec![LEGACY_NOTICE, "unknown theme 'nope'; using auto"]
+        );
+    }
+
+    #[test]
+    fn startup_notices_survive_resume_hydration_once() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new_with_options(tx, &notice_options(true));
+        assert!(app.transcript.entries().is_empty());
+        assert_eq!(
+            app.session_message_hydration,
+            SessionMessageHydration::ExplicitResume
+        );
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![
+                session_message("user", "u1", "Start"),
+                session_message("assistant", "a1", "Answer"),
+            ],
+        });
+        assert_eq!(app.transcript.entries()[0].content, "Start");
+        assert_eq!(
+            status_contents(&app),
+            vec![LEGACY_NOTICE, "unknown theme 'nope'; using auto"]
+        );
+        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![session_message("user", "u2", "Other")],
+        });
+        assert!(status_contents(&app).is_empty());
+    }
+
+    #[test]
+    fn startup_notices_survive_empty_resume_hydration() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new_with_options(tx, &notice_options(true));
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: Vec::new(),
+        });
+        assert_eq!(
+            status_contents(&app),
+            vec![LEGACY_NOTICE, "unknown theme 'nope'; using auto"]
+        );
+    }
+
+    #[test]
+    fn startup_notices_failed_resume_flushes_once_and_clears_hydration() {
+        for message in [
+            "failed to load session log: permission denied",
+            "unknown session path /missing.jsonl",
+        ] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new_with_options(tx, &notice_options(true));
+            app.handle_server_event(ServerEvent::StatusUpdated {
+                message: message.to_owned(),
+            });
+            assert_eq!(
+                status_contents(&app),
+                vec![LEGACY_NOTICE, "unknown theme 'nope'; using auto"]
+            );
+            assert_eq!(app.session_message_hydration, SessionMessageHydration::None);
+            app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+                messages: vec![session_message("user", "u1", "Tree request")],
+            });
+            assert_eq!(app.transcript.entries().len(), 2);
+            app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+            app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+                messages: vec![session_message("user", "u2", "Later resume")],
+            });
+            assert!(status_contents(&app).is_empty());
+        }
+    }
+
+    #[test]
+    fn startup_notices_fresh_session_never_replays_on_later_resume() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new_with_options(tx, &notice_options(false));
+        assert_eq!(status_contents(&app).len(), 2);
+        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![session_message("user", "u1", "Later resume")],
+        });
+        assert!(status_contents(&app).is_empty());
     }
 
     #[test]
