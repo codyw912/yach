@@ -144,21 +144,41 @@ lint-ci:
 # Exit 1 on error/regressed, 2 on inconclusive. See
 # docs/project/specs/2026-09-08-performance-measurement-framework-design.md.
 # Extra args pass through to `perf ab` (e.g. `just perf --filter 'request/*'`).
+#
+# The controller runs inside this checkout's dev shell and builds both sides
+# with bare `cargo` (`--build-cmd cargo`), the same way CI does. `perf ab`'s
+# own default is `just dev cargo`, which on a devenv host re-enters the *base*
+# checkout's shell and overwrites `CARGO_TARGET_DIR`, so the base artifacts
+# miss `target/release-root`. A caller-supplied `--build-cmd` wins: this
+# recipe inserts the default only when that flag is absent.
 perf *args:
   #!/usr/bin/env bash
   set -euo pipefail
   mkdir -p .perf/results
   out=".perf/results/$(date +%Y%m%dT%H%M%S)-ab.json"
+  args=(--build-cmd cargo)
+  for arg in "$@"; do
+    if [[ "$arg" == "--build-cmd" ]]; then
+      args=()
+      break
+    fi
+  done
+  if [[ "$#" -gt 0 ]]; then
+    args+=("$@")
+  fi
   printf 'perf ab extra argv:' >&2
-  printf ' %q' "$@" >&2
+  printf ' %q' "${args[@]}" >&2
   printf '\n' >&2
-  just --justfile "{{justfile()}}" dev cargo run -p yach-bench --release --locked -- perf ab --base main "$@" --out "$out"
+  just --justfile "{{justfile()}}" dev cargo run -p yach-bench --release --locked -- perf ab --base main "${args[@]}" --out "$out"
 
 # Record @ only (trend evidence, never a gate input).
 perf-record:
   #!/usr/bin/env bash
   set -euo pipefail
-  # `perf run` builds the current checkout's artifacts itself (Task 9).
+  # `perf run` builds the current checkout only, from inside this recipe's
+  # `just dev` shell. It has no `--build-cmd` and always uses `just dev cargo`;
+  # that re-entry is a no-op here because `DEVENV_ROOT` is already this
+  # checkout. Unlike `just perf`, there is no second checkout to build.
   fp="$(just --justfile "{{justfile()}}" dev cargo run -p yach-bench --release --locked -- perf host-fingerprint)"
   dir="${XDG_CACHE_HOME:-$HOME/.cache}/yach/perf/$fp"; mkdir -p "$dir"
   out="$dir/$(date +%Y-%m-%d)-$(git rev-parse --short HEAD 2>/dev/null || echo nogit).json"

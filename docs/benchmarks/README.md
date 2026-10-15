@@ -99,8 +99,8 @@ Each line is `id | class | isolation | requires`. In-process serial latency work
 
 ### Recipes
 
-- `just perf [args]` — paired A/B against `main` (ABBA rounds, budgets in `crates/yach-bench/perf-thresholds.toml`). Extra args pass through to `perf ab` (`just perf --filter 'request/*'`). Exit 1 on `error`/`regressed`, 2 on `inconclusive`. On this machine the first landing exits 2: `inconclusive` on `yach/cli_startup_first_output` (and sometimes `yach/tui_startup_first_output_pty`) because first-output round spread exceeds the evidence-derived budgets while median deltas stay inside them — not a regression; see `baseline-2026-09-10.md`.
-- `just perf-record` — `perf run` for `@` only, saved under `~/.cache/yach/perf/<fingerprint>/<date>-<commit>.json`. Trend evidence, never a gate input.
+- `just perf [args]` — paired A/B against `main` (ABBA rounds, budgets in `crates/yach-bench/perf-thresholds.toml`). Extra args pass through to `perf ab` (`just perf --filter 'request/*'`). The recipe runs inside this checkout's dev shell and builds both sides with `--build-cmd cargo`, so a devenv host does not re-enter the base checkout's shell and drop artifacts outside `target/release-root`. Pass your own `--build-cmd` to override that default. Exit 1 on `error`/`regressed`, 2 on `inconclusive`. On this machine the first landing exits 2: `inconclusive` on `yach/cli_startup_first_output` (and sometimes `yach/tui_startup_first_output_pty`) because first-output round spread exceeds the evidence-derived budgets while median deltas stay inside them — not a regression; see `baseline-2026-09-10.md`.
+- `just perf-record` — `perf run` for `@` only, saved under `~/.cache/yach/perf/<fingerprint>/<date>-<commit>.json`. Trend evidence, never a gate input. Builds the current checkout only, from inside the dev shell; it does not take `--build-cmd`.
 - `just perf-report <results.json> [<ab.json>]` — Markdown on stdout.
 - `just perf-profile <id> [samples]` — flamegraph the **worker** (`perf worker --schema <SCHEMA>`), not the controller. Linux: `perf` + `inferno`; macOS: `samply`.
 
