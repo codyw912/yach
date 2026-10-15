@@ -1339,25 +1339,33 @@ fn render_tool_entry_lines(
         .saturating_sub(tool_horizontal_padding(width_usize, theme).saturating_mul(2))
         .saturating_sub(marker.width())
         .max(1);
-    let wrapped: Vec<_> = content
+    let wrapped = content
         .lines()
         .chain(content.is_empty().then_some(""))
         .enumerate()
         .flat_map(|(source_index, source_line)| {
-            wrap_text(source_line, available_width)
-                .into_iter()
-                .map(move |line| (source_index, line))
-        })
-        .collect();
-    let mut result = Vec::with_capacity(wrapped.len() + entry.stream_tail.lines().count());
+            wrap_line(source_line, available_width).map(move |line| (source_index, line))
+        });
+    let mut result = Vec::with_capacity(
+        content.lines().count().max(1)
+            + entry.stream_tail.lines().count()
+            + usize::from(theme.spacing.tool_vertical_padding).saturating_mul(2),
+    );
     let mut title_remaining = title.len();
-    for (index, (source_index, mut line)) in wrapped.into_iter().enumerate() {
-        let mut spans = vec![if index == 0 {
+    for (index, (source_index, line)) in wrapped.enumerate() {
+        let title_len = title_remaining.min(line.len());
+        let body_spans = if title_len > 0 && title_len < line.len() {
+            2
+        } else {
+            1
+        };
+        // Reserve the rule and both surface paddings as well as this body.
+        let mut spans = Vec::with_capacity(body_spans + 4);
+        spans.push(if index == 0 {
             marker.clone()
         } else {
             Span::raw("  ")
-        }];
-        let title_len = title_remaining.min(line.len());
+        });
         title_remaining -= title_len;
         let default =
             if (source_index == 0 && !entry.expanded) || omission_line == Some(source_index) {
@@ -1365,24 +1373,30 @@ fn render_tool_entry_lines(
             } else {
                 theme.tool_output(state)
             };
-        let style = transcript_line_style(entry, &line, default, theme);
+        let style = transcript_line_style(entry, line, default, theme);
         if title_len == 0 {
-            spans.push(Span::styled(line, style));
+            spans.push(Span::styled(line.to_owned(), style));
         } else if title_len == line.len() {
-            spans.push(Span::styled(line, theme.tool_title()));
+            spans.push(Span::styled(line.to_owned(), theme.tool_title()));
         } else {
-            let detail = line.split_off(title_len);
-            spans.push(Span::styled(line, theme.tool_title()));
-            spans.push(Span::styled(detail, style));
+            spans.push(Span::styled(
+                line[..title_len].to_owned(),
+                theme.tool_title(),
+            ));
+            spans.push(Span::styled(line[title_len..].to_owned(), style));
         }
         result.push(Line::from(spans));
     }
     if !entry.stream_tail.is_empty() {
-        for line in wrap_text(&entry.stream_tail, available_width) {
-            result.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(line, theme.tool_output(state)),
-            ]));
+        for line in entry
+            .stream_tail
+            .lines()
+            .flat_map(|line| wrap_line(line, available_width))
+        {
+            let mut spans = Vec::with_capacity(5);
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(line.to_owned(), theme.tool_output(state)));
+            result.push(Line::from(spans));
         }
     }
     render_tool_surface(result, width, state, theme)
@@ -1416,7 +1430,7 @@ fn clip_tool_line(line: &mut Line<'static>, width: usize) {
 }
 
 fn render_tool_surface(
-    lines: Vec<Line<'static>>,
+    mut lines: Vec<Line<'static>>,
     width: u16,
     state: crate::theme::ToolState,
     theme: &Theme,
@@ -1439,22 +1453,25 @@ fn render_tool_surface(
             ),
         ])
     };
-    let mut rendered = Vec::with_capacity(lines.len() + vertical_padding.saturating_mul(2));
-    rendered.extend(std::iter::repeat_with(padding_row).take(vertical_padding));
-    for mut line in lines {
-        clip_tool_line(&mut line, inner_width);
+    for line in &mut lines {
+        clip_tool_line(line, inner_width);
         let line_width = line.width().min(inner_width);
         for span in &mut line.spans {
             span.style.bg = surface.bg;
         }
-        let mut spans = Vec::with_capacity(line.spans.len() + 3);
-        spans.push(rule.clone());
-        spans.push(Span::styled(
-            " ".repeat(horizontal_padding),
-            background_style,
-        ));
-        spans.extend(line.spans);
-        spans.push(Span::styled(
+        line.spans.insert(0, rule.clone());
+        line.spans.insert(
+            1,
+            Span::styled(
+                match horizontal_padding {
+                    0 => std::borrow::Cow::Borrowed(""),
+                    1 => std::borrow::Cow::Borrowed(" "),
+                    _ => std::borrow::Cow::Owned(" ".repeat(horizontal_padding)),
+                },
+                background_style,
+            ),
+        );
+        line.spans.push(Span::styled(
             " ".repeat(
                 inner_width
                     .saturating_sub(line_width)
@@ -1462,10 +1479,11 @@ fn render_tool_surface(
             ),
             background_style,
         ));
-        rendered.push(Line::from(spans));
     }
-    rendered.extend(std::iter::repeat_with(padding_row).take(vertical_padding));
-    rendered
+    lines.extend(std::iter::repeat_with(padding_row).take(vertical_padding));
+    lines.rotate_right(vertical_padding);
+    lines.extend(std::iter::repeat_with(padding_row).take(vertical_padding));
+    lines
 }
 
 fn tool_state(entry: &TranscriptEntry) -> crate::theme::ToolState {
@@ -1560,27 +1578,33 @@ fn matches_tool_call(kind: &EntryKind, id: Option<&str>, name: &str) -> bool {
     }
 }
 
+/// Borrow each wrapped slice so callers allocate only the spans they keep.
+fn wrap_line(mut remaining: &str, width: usize) -> impl Iterator<Item = &str> {
+    let mut empty = remaining.is_empty();
+    std::iter::from_fn(move || {
+        if empty {
+            empty = false;
+            return Some("");
+        }
+        if remaining.is_empty() {
+            return None;
+        }
+        let byte_len = char_boundary_at_or_before(remaining, width);
+        let (line, rest) = remaining.split_at(byte_len);
+        remaining = rest;
+        Some(line)
+    })
+}
+
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
     }
-    let mut lines = Vec::new();
-    for raw_line in text.lines() {
-        if raw_line.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-        let mut remaining = raw_line;
-        while !remaining.is_empty() {
-            let byte_len = char_boundary_at_or_before(remaining, width);
-            lines.push(remaining[..byte_len].to_owned());
-            remaining = &remaining[byte_len..];
-        }
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
+    text.lines()
+        .chain(text.is_empty().then_some(""))
+        .flat_map(|line| wrap_line(line, width))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn char_boundary_at_or_before(s: &str, max_width: usize) -> usize {

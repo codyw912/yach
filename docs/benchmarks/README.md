@@ -153,6 +153,15 @@ Latency/memory: median round delta vs budget, with sign agreement ≥ 0.8. Size/
 
 `crates/yach-bench/perf-thresholds.toml`. Rows match by glob; most specific (longest literal prefix) wins. Only numeric fields have effect. An intentional regression lands by raising the affected workload's budget in the same change. A thresholds row whose glob matches no workload on either side is a hard error.
 
+The themed transcript renderer wraps borrowed source-line slices and allocates
+only the owned title/body spans retained by its render cache. Tool rows reserve
+space for the rule and surface padding before construction, then apply the
+surface in place. Keep those temporary vectors out of the per-row path when
+changing transcript roles; the three scaled headless workloads can be checked
+together with `just perf --deterministic --filter '*headless/*'`. Filters are
+globs, not pipe-separated regular expressions; an empty verdict table does not
+exercise a workload.
+
 ### External-mode caveat
 
 `--base-mode` defaults to `auto`: `worker` when the base `yach-bench` answers `perf worker --schema-probe` with this schema, `external` otherwise. In `external` mode the controller measures only the five shipping-binary rows (`binary/size_bytes`, the three first-output startups, `memory/peak_rss/tui_ready`) through the base's ordinary `yach` binary. Every other workload is `no_base_worker`. The gate is therefore partial exactly once — on the change that lands this harness — and complete for every change after it.
