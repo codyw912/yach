@@ -354,6 +354,15 @@ Hook definitions live in `devenv.nix`. Shell entry regenerates
 shared hooks also work in linked worktrees. Change the Nix definitions rather than
 editing the generated file, and commit both when hook behavior changes.
 
+Static checks (`cargo fmt --check`, Clippy with `-D warnings`) are also declared
+for [hk](https://hk.jdx.dev) in `hk.pkl`, which amends the template base
+`.hk/base/rust.pkl`. The dev shell provides the pinned hk binary from
+`nix/hk.nix`. Agents run them through sjujperpowers' `verifying-by-risk`
+`scripts/hk-check`, which ignores local overrides; hk's git hooks are not
+installed, and tests stay in `just test`. Re-pin hk with
+`bash scripts/update-hk [vX.Y.Z]`, which updates the binary hashes and the hk
+Config package version together; do not use `devenv update` for it.
+
 The runtime image in `containers/yach-runtime/` and evaluation containers remain
 supported. The old
 template-generated devcontainer and `devc` helper are no longer provided.

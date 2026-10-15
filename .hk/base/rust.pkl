@@ -1,0 +1,33 @@
+/// Static checks for a Rust workspace, run as `hk check --all` through
+/// sjujperpowers' verifying-by-risk `scripts/hk-check`.
+///
+/// Copied from the project template; project additions belong in the root
+/// hk.pkl, not here. The package version below moves with the hk binary:
+/// `bash scripts/update-hk [vX.Y.Z]` rewrites both.
+///
+/// Steps without `profiles` are the default set and are static only: tests
+/// run once per verification as risk.toml's `test`, never here. Only the
+/// `check` hook exists; format with the project's own recipe (`just fmt`).
+amends "package://github.com/jdx/hk/releases/download/v2.6.0/hk@2.6.0#/Config.pkl"
+
+hooks {
+  ["check"] {
+    steps {
+      ["cargo-fmt"] {
+        glob = List("**/*.rs", "**/rustfmt.toml", "**/.rustfmt.toml")
+        // Whole-workspace check: rustfmt formats crates, not file lists.
+        check = "cargo fmt --all --check"
+      }
+      ["cargo-clippy"] {
+        glob = List("**/*.rs", "**/Cargo.toml", "Cargo.lock", "clippy.toml")
+        check = "cargo clippy --workspace --all-targets --all-features --locked --quiet -- -D warnings"
+        // Clippy and rustfmt both read the workspace; running them at once
+        // only contends for the Cargo lock.
+        depends = List("cargo-fmt")
+        env {
+          ["CARGO_TERM_PROGRESS_WHEN"] = "never"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,4 @@
+/// yach's static checks. Run through sjujperpowers' `hk-check`, never bare
+/// `hk check`; see verifying-by-risk/hk-conventions.md. Steps come from the
+/// template base; add or override yach-specific steps below.
+amends ".hk/base/rust.pkl"

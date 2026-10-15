@@ -23,6 +23,7 @@
     zlib
     libiconv # Explicit libiconv for reliable macOS linking
     inferno # flamegraph from collapsed stacks (`just perf-profile`)
+    (import ./nix/hk.nix { inherit pkgs; }) # static checks (`hk.pkl`), pinned by scripts/update-hk
   ] ++ lib.optionals stdenv.isLinux [
     perf # linux `perf` for `just perf-profile`
   ] ++ lib.optionals stdenv.isDarwin [
