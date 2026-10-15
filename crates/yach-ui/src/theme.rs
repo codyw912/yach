@@ -1,12 +1,10 @@
 mod palettes;
 mod select;
 
-pub use palettes::{BundledPalette, bundled_palette};
 pub use select::{
     Appearance, BaseError, ExtensionThemes, appearance_from_colorfgbg, builtin_theme_names,
-    is_builtin_theme_name, resolve_base,
+    resolve_base,
 };
-#[cfg(test)]
 mod contrast;
 #[cfg(test)]
 mod palette_test;
@@ -186,15 +184,32 @@ impl Theme {
         }
     }
 
-    /// Selected confirm/apply/reject label. Painted mode keeps today's
-    /// cells: selected text on the role color as background. System and
-    /// Mono never paint that background; selection is an attribute.
+    /// Selected confirm/apply/reject label. Painted mode retains the role
+    /// background, choosing a legible foreground for that specific pair.
+    /// System and Mono select with attributes, never a painted background.
     #[must_use]
     pub fn selected_on(&self, role: Style) -> Style {
         if self.mode == ThemeMode::Painted {
-            return Style::new()
-                .fg(self.colors.selected_text)
-                .bg(role.fg.unwrap_or(Color::Reset));
+            let background = role.fg.unwrap_or(Color::Reset);
+            let foreground = match contrast::contrast_ratio(self.colors.selected_text, background) {
+                Some(ratio) if ratio >= 4.5 => self.colors.selected_text,
+                // Only a terminal-default background is unknowable. A Reset
+                // foreground on a measurable painted background still needs
+                // an explicit black/white pairing.
+                None if background == Color::Reset => self.colors.selected_text,
+                Some(_) | None => {
+                    let black = Color::Rgb(0, 0, 0);
+                    let white = Color::Rgb(255, 255, 255);
+                    if contrast::contrast_ratio(black, background)
+                        >= contrast::contrast_ratio(white, background)
+                    {
+                        black
+                    } else {
+                        white
+                    }
+                }
+            };
+            return Style::new().fg(foreground).bg(background);
         }
         self.selected().add_modifier(Modifier::BOLD)
     }
@@ -419,10 +434,12 @@ impl ThemeDocument {
         self.base.as_deref()
     }
 
+    #[cfg(test)]
     pub fn color_tokens(&self) -> impl Iterator<Item = &str> {
         self.colors.keys().map(String::as_str)
     }
 
+    #[cfg(test)]
     pub fn var_names(&self) -> impl Iterator<Item = &str> {
         self.vars.keys().map(String::as_str)
     }
@@ -495,7 +512,7 @@ fn resolve_color(
 
 fn parse_color(value: &str) -> Option<Color> {
     if let Some(hex) = value.strip_prefix('#') {
-        if hex.len() != 6 {
+        if hex.len() != 6 || !hex.is_ascii() {
             return None;
         }
         let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
@@ -548,6 +565,70 @@ mod tests {
             ("tool_success", theme.tool_surface(ToolState::Success)),
             ("tool_error", theme.tool_surface(ToolState::Error)),
         ]
+    }
+
+    #[test]
+    fn selected_action_colors_clear_body_contrast() {
+        for name in super::builtin_theme_names() {
+            let theme = super::resolve_base(name, super::Appearance::Dark, &());
+            assert!(theme.is_ok(), "{name}: {theme:?}");
+            let Ok(theme) = theme else { return };
+            for (role_name, role) in [
+                ("success", theme.success()),
+                ("error", theme.error()),
+                ("warning", theme.warning()),
+            ] {
+                let selected = theme.selected_on(role);
+                if bg(selected) == Color::Reset {
+                    continue;
+                }
+                let ratio = contrast_ratio(fg(selected), bg(selected));
+                assert!(
+                    ratio.is_some_and(|ratio| ratio >= 4.5),
+                    "{name} {role_name}: {selected:?}, contrast {ratio:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_action_keeps_readable_requested_text_and_unmeasurable_pairs() {
+        let document =
+            ThemeDocument::parse(r##"{"colors":{"selectedText":"#ffffff","success":"#000000"}}"##);
+        assert!(document.is_ok());
+        let Ok(document) = document else { return };
+        let theme = document.apply(Theme::dark());
+        assert!(theme.is_ok());
+        let Ok(theme) = theme else { return };
+        assert_eq!(
+            fg(theme.selected_on(theme.success())),
+            Color::Rgb(255, 255, 255)
+        );
+        assert_eq!(
+            fg(theme.selected_on(Style::new())),
+            Color::Rgb(255, 255, 255)
+        );
+    }
+
+    #[test]
+    fn selected_action_resolves_reset_text_on_measurable_background() {
+        let document = ThemeDocument::parse(r#"{"colors":{"selectedText":"default"}}"#);
+        assert!(document.is_ok());
+        let Ok(document) = document else { return };
+        let theme = document.apply(Theme::dark());
+        assert!(theme.is_ok());
+        let Ok(theme) = theme else { return };
+        let selected = theme.selected_on(theme.success());
+        assert!(contrast_ratio(fg(selected), bg(selected)).is_some_and(|ratio| ratio >= 4.5));
+    }
+
+    #[test]
+    fn non_ascii_hex_is_rejected_without_panicking() {
+        assert_eq!(super::parse_color("#aéaaa"), None);
+        let document = ThemeDocument::parse(r##"{"colors":{"accent":"#aéaaa"}}"##);
+        assert!(document.is_ok());
+        let Ok(document) = document else { return };
+        assert!(document.apply(Theme::dark()).is_err());
     }
 
     #[test]

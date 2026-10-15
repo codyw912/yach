@@ -449,6 +449,15 @@ impl ThemeEnv {
 }
 
 fn read_theme_file(path: &Path) -> Result<ThemeDocument, String> {
+    let metadata = path
+        .metadata()
+        .map_err(|error| format!("failed to load theme {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "failed to load theme {}: not a regular file",
+            path.display()
+        ));
+    }
     let json = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to load theme {}: {error}", path.display()))?;
     ThemeDocument::parse(&json)
@@ -479,6 +488,13 @@ fn explicit_theme_path(requested: &std::ffi::OsStr, home: Option<&Path>) -> Opti
     Some(path.to_path_buf())
 }
 
+fn auto_theme(appearance: yach_ui::Appearance) -> Theme {
+    match appearance {
+        yach_ui::Appearance::Dark => Theme::dark(),
+        yach_ui::Appearance::Light => Theme::light(),
+    }
+}
+
 fn resolve_theme(
     env: &ThemeEnv,
     extensions: &dyn yach_ui::ExtensionThemes,
@@ -491,11 +507,8 @@ fn resolve_theme(
         return Ok((Theme::monochrome(), Vec::new()));
     }
     let appearance = yach_ui::appearance_from_colorfgbg(env.colorfgbg.as_deref());
-    let auto = match appearance {
-        yach_ui::Appearance::Dark => Theme::dark(),
-        yach_ui::Appearance::Light => Theme::light(),
-    };
-    if let Some(requested) = env.yach_theme.as_deref() {
+    let auto = auto_theme(appearance);
+    if let Some(requested) = env.yach_theme.as_deref().filter(|value| !value.is_empty()) {
         if let Some(path) = explicit_theme_path(requested, env.home.as_deref()) {
             return Ok(
                 match read_theme_file(&path)
@@ -531,10 +544,7 @@ fn apply_document(
     let (base, notices) = match yach_ui::resolve_base(base_name, appearance, extensions) {
         Ok(base) => (base, Vec::new()),
         Err(error) => {
-            let auto = match appearance {
-                yach_ui::Appearance::Dark => Theme::dark(),
-                yach_ui::Appearance::Light => Theme::light(),
-            };
+            let auto = auto_theme(appearance);
             (auto, vec![base_error_notice(&error)])
         }
     };
@@ -618,7 +628,17 @@ fn resolve_tui_options(
     extensions: &dyn yach_ui::ExtensionThemes,
 ) -> Result<RunTuiOptions, String> {
     let (theme, mut startup_notices) = resolve_theme(env, extensions)?;
-    if project_root.is_some_and(|root| root.join(".yach/theme.json").is_file()) {
+    let project_theme = project_root.map(|root| root.join(".yach/theme.json"));
+    let home_theme = env.home.as_ref().map(|home| home.join(".yach/theme.json"));
+    if project_theme.as_ref().is_some_and(|path| {
+        path.is_file()
+            && !home_theme.as_ref().is_some_and(|home| {
+                path.canonicalize()
+                    .ok()
+                    .zip(home.canonicalize().ok())
+                    .is_some_and(|(project, home)| project == home)
+            })
+    }) {
         startup_notices.push(String::from(concat!(
             "project themes are not supported; move it to `~/.yach/theme.json` ",
             "or set `YACH_THEME`"
@@ -6375,6 +6395,70 @@ mod tests {
         let path = dir.join(".yach/theme.json");
         expect_ok(std::fs::write(&path, body))?;
         Ok(path)
+    }
+
+    #[test]
+    fn resolve_theme_empty_env_reads_home_file() -> Result<(), String> {
+        let root = TestTempDir::new("theme-empty-env")?;
+        theme_file(root.path(), r#"{"base":"system"}"#)?;
+        let (theme, notices) =
+            resolve_theme(&theme_env(Some(""), None, None, Some(root.path())), &())?;
+        expect_equal(&theme, &Theme::system())?;
+        expect_true(notices.is_empty(), "empty env is unset")
+    }
+
+    #[test]
+    fn resolve_theme_home_project_file_has_no_migration_notice() -> Result<(), String> {
+        let root = TestTempDir::new("theme-home-project")?;
+        theme_file(root.path(), r#"{"base":"light"}"#)?;
+        let options = resolve_tui_options(
+            &theme_env(None, None, None, Some(root.path())),
+            Some(&root.path().join(".yach/..")),
+            false,
+            &(),
+        )?;
+        expect_equal(&options.theme, &Theme::light())?;
+        expect_true(
+            options.startup_notices.is_empty(),
+            "personal theme is not a project theme",
+        )
+    }
+
+    #[test]
+    fn resolve_theme_explicit_fifo_falls_back_without_blocking() -> Result<(), String> {
+        let root = TestTempDir::new("theme-explicit-fifo")?;
+        let path = root.path().join("theme.fifo");
+        let status = expect_ok(ProcessCommand::new("mkfifo").arg(&path).status())?;
+        expect_true(status.success(), "mkfifo succeeds")?;
+        let env = theme_env(Some(&path_string(&path)?), None, Some("0;15"), None);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(resolve_theme(&env, &()));
+        });
+        let (theme, notices) = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("theme startup blocked on FIFO: {error}"))??;
+        expect_equal(&theme, &Theme::light())?;
+        expect_equal(&notices.len(), &1)?;
+        expect_true(
+            notices[0].contains("not a regular file"),
+            "non-regular diagnostic",
+        )
+    }
+
+    #[test]
+    fn resolve_theme_explicit_directory_reports_non_regular_file() -> Result<(), String> {
+        let root = TestTempDir::new("theme-explicit-directory")?;
+        let (theme, notices) = resolve_theme(
+            &theme_env(Some(&path_string(root.path())?), None, Some("0;15"), None),
+            &(),
+        )?;
+        expect_equal(&theme, &Theme::light())?;
+        expect_equal(&notices.len(), &1)?;
+        expect_true(
+            notices[0].contains("not a regular file"),
+            "non-regular diagnostic",
+        )
     }
 
     #[test]

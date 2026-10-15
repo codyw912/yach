@@ -21,6 +21,7 @@ pub fn appearance_from_colorfgbg(value: Option<&str>) -> Appearance {
     }
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn is_builtin_theme_name(name: &str) -> bool {
     PRESET_NAMES.contains(&name) || bundled_palette(name).is_some()
@@ -247,7 +248,11 @@ mod tests {
 
     #[test]
     fn resolve_base_invalid_extension_is_reported() {
-        for json in ["not json", r#"{"colors":{"accent":"invalid"}}"#] {
+        for json in [
+            "not json",
+            r#"{"colors":{"accent":"invalid"}}"#,
+            r##"{"colors":{"accent":"#aéaaa"}}"##,
+        ] {
             let error = resolve_base("nightowl:dim", Appearance::Dark, &OneTheme(json));
             assert!(
                 matches!(&error, Err(BaseError::Invalid { name, .. }) if name == "nightowl:dim"),

@@ -247,8 +247,8 @@ TUI appearance is chosen once, at startup. `NO_COLOR` set to any non-empty
 value wins over everything else and selects the monochrome theme. Otherwise
 the first match wins:
 
-1. `YACH_THEME`: a preset (`dark`, `light`, `system`, `auto`), a bundled
-   palette name, or an explicit path to a theme file.
+1. Non-empty `YACH_THEME`: a preset (`dark`, `light`, `system`, `auto`), a
+   bundled palette name, or an explicit path to a theme file. Empty is unset.
 2. `~/.yach/theme.json`.
 3. `auto`.
 
@@ -256,11 +256,13 @@ A value that is absolute, starts with `.` or `~`, or contains a path
 separator is a path; `~/` uses your home directory. Other values are theme
 names, even if a bare file of that name exists. Use `./dark` for a file named
 `dark`. Unknown names show a diagnostic listing built-in names and fall back
-to `auto`. An explicit path that cannot be read or applied shows a startup
-notice and uses `auto`.
+to `auto`. An explicit path that is not a regular file (including a FIFO or
+directory), cannot be read, or cannot be applied shows one startup notice
+and uses `auto`.
 
-`<project>/.yach/theme.json` is not read. When that file exists, the TUI
-shows one notice and leaves the file untouched: "project themes are not
+`<project>/.yach/theme.json` is not read as a project theme. Unless it resolves
+to the same file as the personal theme, the TUI shows one notice when it exists
+and leaves the file untouched: "project themes are not
 supported; move it to `~/.yach/theme.json` or set `YACH_THEME`". For a
 per-project look, set `YACH_THEME` in that project's environment.
 
@@ -336,6 +338,12 @@ dim, focused titles, tool names, and errors are bold, and the selected row is
 reversed. Glyphs (`✓`, `✗`, `⚙`, `›`), harness outcome labels (`! failed`,
 for example), and the tool row's `┃` rule carry the distinctions that color
 carried. Tool successes use neutral panels; only failure surfaces are tinted.
+
+Selected confirm, approve, and reject labels keep their action-colored
+background. They use `selectedText` when it reaches 4.5:1 contrast against
+that background; otherwise they use whichever of black or white contrasts
+better. This also applies to the dark preset. Terminal-default backgrounds
+cannot be measured, so they retain the requested text color.
 
 For repeatable theme captures, use `just tui-visual session narrow light
 nocolor`; `just dev bash tests/visual/check-nocolor.sh` checks the raw TUI

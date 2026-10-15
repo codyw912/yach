@@ -770,7 +770,11 @@ fn review_detail(review: &ToolReviewRow, show_full_diff: bool) -> String {
 }
 
 fn entry_display_text(entry: &TranscriptEntry) -> String {
-    match &entry.kind {
+    entry_display_text_with_omission(entry).0
+}
+
+fn entry_display_text_with_omission(entry: &TranscriptEntry) -> (String, Option<usize>) {
+    let text = match &entry.kind {
         EntryKind::ToolCall { .. } => {
             let mut sections = Vec::new();
             if !entry.call_preview.is_empty() {
@@ -809,11 +813,15 @@ fn entry_display_text(entry: &TranscriptEntry) -> String {
                 summary.push_str("review ");
                 summary.push_str(review_status_label(review.status));
             }
-            if let Some(preview) = collapsed_tool_output(name, &summary, entry.detail.as_deref()) {
+            if let Some((preview, omission_line)) =
+                collapsed_tool_output(name, &summary, entry.detail.as_deref())
+            {
+                let preview_start = summary.lines().count();
                 if !summary.is_empty() {
                     summary.push('\n');
                 }
                 summary.push_str(&preview);
+                return (summary, omission_line.map(|line| preview_start + line));
             }
             summary
         }
@@ -823,13 +831,18 @@ fn entry_display_text(entry: &TranscriptEntry) -> String {
         | EntryKind::HarnessOutcome { .. }
         | EntryKind::Compaction
         | EntryKind::Error => entry.content.clone(),
-    }
+    };
+    (text, None)
 }
 
 const DEFAULT_TOOL_OUTPUT_PREVIEW_LINES: usize = 10;
 const COMMAND_OUTPUT_PREVIEW_LINES: usize = 5;
 
-fn collapsed_tool_output(name: &str, summary: &str, detail: Option<&str>) -> Option<String> {
+fn collapsed_tool_output(
+    name: &str,
+    summary: &str,
+    detail: Option<&str>,
+) -> Option<(String, Option<usize>)> {
     let detail = detail?.trim_end_matches('\n');
     if detail.is_empty() || detail == summary {
         return None;
@@ -852,20 +865,20 @@ fn collapsed_tool_output(name: &str, summary: &str, detail: Option<&str>) -> Opt
         DEFAULT_TOOL_OUTPUT_PREVIEW_LINES
     };
     if line_count <= max_lines {
-        return Some(detail.to_owned());
+        return Some((detail.to_owned(), None));
     }
 
     let omitted = line_count - max_lines;
     if is_command {
         let tail = detail.lines().skip(omitted).collect::<Vec<_>>().join("\n");
-        Some(format!("… {omitted} earlier lines\n{tail}"))
+        Some((format!("… {omitted} earlier lines\n{tail}"), Some(0)))
     } else {
         let head = detail
             .lines()
             .take(max_lines)
             .collect::<Vec<_>>()
             .join("\n");
-        Some(format!("{head}\n… {omitted} more lines"))
+        Some((format!("{head}\n… {omitted} more lines"), Some(max_lines)))
     }
 }
 
@@ -1318,7 +1331,7 @@ fn render_tool_entry_lines(
         }
         _ => unreachable!(),
     };
-    let display_text = entry_display_text(entry);
+    let (display_text, omission_line) = entry_display_text_with_omission(entry);
     let content = name_and_detail(&title, &display_text);
     let width_usize = usize::from(width.max(1));
     let available_width = width_usize
@@ -1346,11 +1359,12 @@ fn render_tool_entry_lines(
         }];
         let title_len = title_remaining.min(line.len());
         title_remaining -= title_len;
-        let default = if source_index == 0 && !entry.expanded {
-            theme.muted()
-        } else {
-            theme.tool_output(state)
-        };
+        let default =
+            if (source_index == 0 && !entry.expanded) || omission_line == Some(source_index) {
+                theme.muted()
+            } else {
+                theme.tool_output(state)
+            };
         let style = transcript_line_style(entry, &line, default, theme);
         if title_len == 0 {
             spans.push(Span::styled(line, style));
@@ -2483,6 +2497,19 @@ mod tests {
         assert!(read.contains("read-10"));
         assert!(!read.contains("read-11"));
         assert!(read.contains("… 2 more lines"));
+        let theme = Theme::dark();
+        let lines = render_lines_with_theme(transcript.entries(), 80, &theme);
+        for marker in ["… 3 earlier lines", "… 2 more lines"] {
+            let span = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == marker);
+            assert!(span.is_some(), "missing marker {marker}");
+            if let Some(span) = span {
+                assert_eq!(span.style.fg, theme.muted().fg, "{marker} is metadata");
+                assert_eq!(span.style.add_modifier, theme.muted().add_modifier);
+            }
+        }
     }
 
     #[test]

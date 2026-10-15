@@ -1,6 +1,6 @@
 /// One bundled named palette. `json` is the theme file embedded from
 /// `crates/yach-ui/themes/<name>.json`; startup parses only the selected one.
-pub struct BundledPalette {
+pub(crate) struct BundledPalette {
     pub name: &'static str,
     pub json: &'static str,
 }
@@ -76,7 +76,7 @@ const fn palette(name: &'static str, json: &'static str) -> BundledPalette {
 /// Returns the bundled palette with this exact name, or `None` for a preset
 /// name, an extension theme name, or anything else.
 #[must_use]
-pub fn bundled_palette(name: &str) -> Option<&'static BundledPalette> {
+pub(crate) fn bundled_palette(name: &str) -> Option<&'static BundledPalette> {
     BUNDLED_PALETTES.iter().find(|palette| palette.name == name)
 }
 

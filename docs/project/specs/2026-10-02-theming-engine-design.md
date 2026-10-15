@@ -244,6 +244,13 @@ color token is added**.
 | `tool_title` / `tool_output` | header name; output body | `toolTitle`, `toolOutput` |
 | `diff(kind)` | added, removed, context, hunk | `diffAdded`, `diffRemoved`, `diffContext`, `diffHunk` |
 
+
+Painted confirm/apply/reject selections use the action role color as their
+background. Use `selectedText` only when it reaches 4.5:1 against that color;
+otherwise use the higher-contrast of RGB black and white. This includes the
+dark preset (final-review ruling, 2026-10-15, superseding migration cell pins).
+An unmeasurable terminal-default background retains the requested text color.
+
 `ToolState` is `Pending`, `Success`, `Error`, or `Harness`. `Harness` is the
 existing refined-outcome case that today uses the error surface
 (`transcript.rs:1181-1191`). The rule color per state is derived, not
@@ -324,10 +331,12 @@ Bundled palettes (next section) are also built-in names.
 
 Selection is a single winner, as today. Highest first:
 
-1. `YACH_THEME`. If its value is exactly a preset name (`dark`, `light`,
-   `system`, `auto`) or a bundled palette name, it names that theme; otherwise
-   it is a file path, as today (`main.rs:426,439-441`). Those names are
-   therefore reserved; a file with a reserved name is reachable as `./<name>`.
+1. Non-empty `YACH_THEME`; empty is unset. Preset and bundled palette names
+   select that theme. Absolute values, values beginning with `.` or `~`, and
+   values containing a path separator are explicit paths; other values are
+   names. Reserved names remain reachable as files through `./<name>`.
+   Explicit paths must resolve to regular files before opening; directories
+   and FIFOs receive the same one-notice `auto` fallback as other path errors.
 2. User `~/.yach/theme.json`.
 3. Default: `auto`.
 
@@ -472,8 +481,9 @@ than gated behind a future project trust. That removes a precedence row, the
 question of whether repository content may restyle approval or diff text, and
 a trust dependency.
 
-Behavior change: an existing `<project>/.yach/theme.json` stops applying. When
-that file exists, the TUI startup path (not the resolver) shows one
+Behavior change: an existing `<project>/.yach/theme.json` stops applying as a
+project theme. Unless its canonical path equals the personal theme's path,
+the TUI startup path (not the resolver) shows one
 diagnostic: "project themes are not supported; move it to
 `~/.yach/theme.json` or set `YACH_THEME`". The file is never deleted or
 rewritten. A user who wants a per-project look can set `YACH_THEME` in that
@@ -713,7 +723,7 @@ names), then 3 (the owner-visible fix), then 5, then 6; docs (7) last.
 | Files that set the above explicitly | Unaffected; their values still win |
 | Files that did not | Pick up the new defaults (the intended fix) |
 | Project `<root>/.yach/theme.json` | No longer applied; startup diagnostic (Project themes removed) |
-| `YACH_THEME=<path>` | Unchanged, except reserved preset and bundled palette names |
+| `YACH_THEME=<path>` | Explicit paths reject non-regular files before opening; failures show one notice and use `auto` |
 
 ## Testing
 

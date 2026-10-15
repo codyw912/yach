@@ -1,9 +1,10 @@
 //! WCAG 2.x contrast over the colors a theme can name.
 //!
-//! Test-only: presets and palettes assert contrast here, widgets do not.
+//! Selection uses measurable pairs at runtime; presets and palettes also test them.
 
 use ratatui::style::Color;
 
+#[cfg(test)]
 use super::{Theme, ThemeMode, ToolState};
 
 /// Contrast ratio of `a` against `b`. `None` when either color is `Reset`
@@ -20,6 +21,7 @@ pub(crate) fn contrast_ratio(a: Color, b: Color) -> Option<f64> {
 /// Body text on every painted surface is at least 4.5:1. `muted`,
 /// `success`, `warning`, `error`, and `harness` are at least 3:1 against
 /// the tool panel. Presets and palettes share this bar.
+#[cfg(test)]
 pub(crate) fn assert_preset_contrast(theme: &Theme) {
     assert_eq!(theme.mode(), ThemeMode::Painted);
     let panel = theme
@@ -69,6 +71,7 @@ pub(crate) fn assert_preset_contrast(theme: &Theme) {
     }
 }
 
+#[cfg(test)]
 fn assert_contrast_at_least(name: &str, foreground: Color, background: Color, minimum: f64) {
     let ratio = contrast_ratio(foreground, background);
     assert!(

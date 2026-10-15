@@ -1390,10 +1390,11 @@ impl App {
             }
             ServerEvent::StatusUpdated { message } => {
                 if self.session_message_hydration == SessionMessageHydration::ExplicitResume
-                    && (message.starts_with("failed to load session log:")
-                        || message.starts_with("unknown session path "))
+                    && (message.starts_with(yach_proto::SESSION_LOAD_FAILED_PREFIX)
+                        || message.starts_with(yach_proto::UNKNOWN_SESSION_PATH_PREFIX))
                 {
-                    self.session_message_hydration = SessionMessageHydration::None;
+                    // Startup can load twice: a failed first attempt must not
+                    // consume the queued selection's successful hydration.
                     for notice in std::mem::take(&mut self.pending_startup_notices) {
                         self.transcript.append_status(&notice);
                     }
@@ -5135,7 +5136,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_notices_failed_resume_flushes_once_and_clears_hydration() {
+    fn startup_notices_failed_resume_flushes_once_then_success_hydrates() {
         for message in [
             "failed to load session log: permission denied",
             "unknown session path /missing.jsonl",
@@ -5149,11 +5150,31 @@ mod tests {
                 status_contents(&app),
                 vec![LEGACY_NOTICE, "unknown theme 'nope'; using auto"]
             );
-            assert_eq!(app.session_message_hydration, SessionMessageHydration::None);
-            app.handle_server_event(ServerEvent::SessionMessagesUpdated {
-                messages: vec![session_message("user", "u1", "Tree request")],
+            app.handle_server_event(ServerEvent::StatusUpdated {
+                message: message.to_owned(),
             });
-            assert_eq!(app.transcript.entries().len(), 2);
+            assert_eq!(
+                status_contents(&app).len(),
+                2,
+                "terminal/repeated failure preserves transcript"
+            );
+            assert_eq!(
+                app.session_message_hydration,
+                SessionMessageHydration::ExplicitResume
+            );
+            app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+                messages: vec![session_message("user", "u1", "Retry history")],
+            });
+            assert_eq!(app.transcript.entries()[0].content, "Retry history");
+            assert!(
+                status_contents(&app).is_empty(),
+                "flushed notices are never replayed"
+            );
+            app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+                messages: vec![session_message("user", "tree", "Tree request")],
+            });
+            assert_eq!(app.transcript.entries()[0].content, "Retry history");
+            assert!(status_contents(&app).is_empty());
             app.session_message_hydration = SessionMessageHydration::ExplicitResume;
             app.handle_server_event(ServerEvent::SessionMessagesUpdated {
                 messages: vec![session_message("user", "u2", "Later resume")],
@@ -10054,6 +10075,33 @@ mod tests {
         }
     }
 
+    fn assert_selected_action_cells(
+        buffer: &ratatui::buffer::Buffer,
+        background: ratatui::style::Color,
+        label: &str,
+    ) {
+        let selected: Vec<_> = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.bg == background)
+            .collect();
+        assert_eq!(
+            selected.len(),
+            label.chars().count(),
+            "only action label cells change"
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>(),
+            label
+        );
+        for cell in selected {
+            assert_painted_choice(cell, ratatui::style::Color::Rgb(0, 0, 0), background);
+        }
+    }
+
     fn assert_painted_choice(
         cell: &ratatui::buffer::Cell,
         fg: ratatui::style::Color,
@@ -10066,12 +10114,12 @@ mod tests {
     }
 
     #[test]
-    fn painted_confirm_and_review_labels_keep_todays_cells() {
+    fn painted_confirm_and_review_labels_pin_legible_action_cells() {
         use crate::theme::Theme;
         use ratatui::style::Color;
 
         let theme = Theme::dark();
-        let selected_text = Color::White;
+        let selected_text = Color::Rgb(0, 0, 0);
         let success = Color::Rgb(181, 189, 104);
         let error = Color::Rgb(204, 102, 102);
 
@@ -10082,6 +10130,7 @@ mod tests {
         assert!(yes.is_some(), "selected Yes cell missing");
         let Some(yes) = yes else { return };
         assert_painted_choice(yes, selected_text, success);
+        assert_selected_action_cells(&accepted, success, " Yes ");
 
         let mut rejected = confirm_dialog();
         rejected.confirm_accepted = false;
@@ -10092,6 +10141,7 @@ mod tests {
         assert!(no.is_some(), "selected No cell missing");
         let Some(no) = no else { return };
         assert_painted_choice(no, selected_text, error);
+        assert_selected_action_cells(&declined, error, " No ");
 
         let apply = draw_overlay(&theme, |frame, theme| {
             super::render_local_edit_review_overlay(
@@ -10105,6 +10155,7 @@ mod tests {
         assert!(approve.is_some(), "selected Approve cell missing");
         let Some(approve) = approve else { return };
         assert_painted_choice(approve, selected_text, success);
+        assert_selected_action_cells(&apply, success, "› Approve");
 
         let reject = draw_overlay(&theme, |frame, theme| {
             super::render_local_edit_review_overlay(
@@ -10120,5 +10171,6 @@ mod tests {
             return;
         };
         assert_painted_choice(rejected_action, selected_text, error);
+        assert_selected_action_cells(&reject, error, "› Reject");
     }
 }
