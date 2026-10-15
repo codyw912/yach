@@ -19,14 +19,22 @@ pub(crate) fn contrast_ratio(a: Color, b: Color) -> Option<f64> {
 
 /// Body text on every painted surface is at least 4.5:1. `muted`,
 /// `success`, `warning`, `error`, and `harness` are at least 3:1 against
-/// the tool panel. Task 2's palettes call this too.
+/// the tool panel. Presets and palettes share this bar.
 ///
 /// `toolOutput` on `dark` is still `Rgb(128, 128, 128)` and does not clear
 /// 4.5:1 on the pending panel. Task 5 changes that default; until then this
-/// helper skips `tool_output` for `Theme::dark()` only.
+/// helper skips `tool_output` for `Theme::dark()` only. Bundled palettes are
+/// not that preset, so they still have to clear the bar on both panels.
 pub(crate) fn assert_preset_contrast(theme: &Theme) {
     assert_eq!(theme.mode(), ThemeMode::Painted);
-    let panel = theme.tool_surface(ToolState::Pending).bg.unwrap_or(Color::Reset);
+    let panel = theme
+        .tool_surface(ToolState::Pending)
+        .bg
+        .unwrap_or(Color::Reset);
+    let error_panel = theme
+        .tool_surface(ToolState::Error)
+        .bg
+        .unwrap_or(Color::Reset);
     for (name, surface) in [
         ("selected", theme.selected()),
         ("user_message", theme.user_message()),
@@ -40,10 +48,22 @@ pub(crate) fn assert_preset_contrast(theme: &Theme) {
     }
     let text = theme.text().fg.unwrap_or(Color::Reset);
     assert_contrast_at_least("text on panel", text, panel, 4.5);
+    assert_contrast_at_least("text on error panel", text, error_panel, 4.5);
+    let title = theme.tool_title().fg.unwrap_or(Color::Reset);
+    assert_contrast_at_least("tool title on panel", title, panel, 4.5);
+    assert_contrast_at_least("tool title on error panel", title, error_panel, 4.5);
     // Dark tool output stays below the body-text bar until Task 5.
     if theme != &Theme::dark() {
-        let output = theme.tool_output(ToolState::Pending).fg.unwrap_or(Color::Reset);
+        let output = theme
+            .tool_output(ToolState::Pending)
+            .fg
+            .unwrap_or(Color::Reset);
         assert_contrast_at_least("tool_output on panel", output, panel, 4.5);
+        let error_output = theme
+            .tool_output(ToolState::Error)
+            .fg
+            .unwrap_or(Color::Reset);
+        assert_contrast_at_least("tool_output on error panel", error_output, error_panel, 4.5);
     }
     for (name, style) in [
         ("muted", theme.muted()),
@@ -128,7 +148,10 @@ fn indexed_rgb(index: u8) -> (u8, u8, u8) {
         15 => (255, 255, 255),
         16..=231 => cube_rgb(index),
         232..=255 => {
-            let level = index.saturating_sub(232).saturating_mul(10).saturating_add(8);
+            let level = index
+                .saturating_sub(232)
+                .saturating_mul(10)
+                .saturating_add(8);
             (level, level, level)
         }
     }

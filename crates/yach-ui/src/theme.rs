@@ -1,6 +1,11 @@
-mod presets;
+mod palettes;
+
+pub use palettes::{BundledPalette, bundled_palette};
 #[cfg(test)]
 mod contrast;
+#[cfg(test)]
+mod palette_test;
+mod presets;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -653,7 +658,8 @@ mod tests {
     fn base_key_parses_and_is_exposed_but_not_resolved() {
         // Resolution of the name is Task 4. Task 1 only records it and
         // applies tokens over whatever base the caller hands in.
-        let document = ThemeDocument::parse(r##"{ "base": "light", "colors": { "accent": "#abcdef" } }"##);
+        let document =
+            ThemeDocument::parse(r##"{ "base": "light", "colors": { "accent": "#abcdef" } }"##);
         assert!(document.is_ok());
         let Ok(document) = document else { return };
         assert_eq!(document.base(), Some("light"));
@@ -788,7 +794,10 @@ mod tests {
         assert!(theme.is_ok());
         let Ok(theme) = theme else { return };
         assert_eq!(theme.mode(), ThemeMode::System);
-        assert_eq!(theme.colors.selected_background, Color::Rgb(0x11, 0x22, 0x33));
+        assert_eq!(
+            theme.colors.selected_background,
+            Color::Rgb(0x11, 0x22, 0x33)
+        );
         assert!(is_reset(bg(theme.selected())));
         assert!(!theme.selected().add_modifier.contains(Modifier::REVERSED));
     }
@@ -799,12 +808,27 @@ mod tests {
         assert_eq!(theme.mode(), ThemeMode::Mono);
         let colors = theme.colors;
         for color in [
-            colors.accent, colors.border, colors.success, colors.error, colors.warning,
-            colors.muted, colors.dim, colors.text, colors.selected_background,
-            colors.selected_text, colors.user_message_background, colors.user_message_text,
-            colors.tool_pending_background, colors.tool_success_background,
-            colors.tool_error_background, colors.tool_title, colors.tool_output,
-            colors.diff_added, colors.diff_removed, colors.diff_context, colors.diff_hunk,
+            colors.accent,
+            colors.border,
+            colors.success,
+            colors.error,
+            colors.warning,
+            colors.muted,
+            colors.dim,
+            colors.text,
+            colors.selected_background,
+            colors.selected_text,
+            colors.user_message_background,
+            colors.user_message_text,
+            colors.tool_pending_background,
+            colors.tool_success_background,
+            colors.tool_error_background,
+            colors.tool_title,
+            colors.tool_output,
+            colors.diff_added,
+            colors.diff_removed,
+            colors.diff_context,
+            colors.diff_hunk,
             colors.harness,
         ] {
             assert_eq!(color, Color::Reset);
@@ -825,7 +849,10 @@ mod tests {
         assert!(!theme.warning().add_modifier.contains(Modifier::BOLD));
         assert!(!theme.harness().add_modifier.contains(Modifier::BOLD));
         assert_eq!(theme.diff(DiffKind::Added).add_modifier, Modifier::empty());
-        assert_eq!(theme.diff(DiffKind::Removed).add_modifier, Modifier::empty());
+        assert_eq!(
+            theme.diff(DiffKind::Removed).add_modifier,
+            Modifier::empty()
+        );
     }
 
     #[test]
@@ -867,22 +894,49 @@ mod tests {
         assert_eq!(fg(theme.selected()), theme.colors.selected_text);
         assert_eq!(bg(theme.selected()), theme.colors.selected_background);
         assert_eq!(fg(theme.user_message()), theme.colors.user_message_text);
-        assert_eq!(bg(theme.user_message()), theme.colors.user_message_background);
+        assert_eq!(
+            bg(theme.user_message()),
+            theme.colors.user_message_background
+        );
 
-        assert_eq!(bg(theme.tool_surface(ToolState::Pending)), theme.colors.tool_pending_background);
-        assert_eq!(bg(theme.tool_surface(ToolState::Success)), theme.colors.tool_success_background);
-        assert_eq!(bg(theme.tool_surface(ToolState::Error)), theme.colors.tool_error_background);
-        assert_eq!(bg(theme.tool_surface(ToolState::Harness)), theme.colors.tool_error_background);
-        assert_eq!(fg(theme.tool_surface(ToolState::Pending)), theme.colors.text);
+        assert_eq!(
+            bg(theme.tool_surface(ToolState::Pending)),
+            theme.colors.tool_pending_background
+        );
+        assert_eq!(
+            bg(theme.tool_surface(ToolState::Success)),
+            theme.colors.tool_success_background
+        );
+        assert_eq!(
+            bg(theme.tool_surface(ToolState::Error)),
+            theme.colors.tool_error_background
+        );
+        assert_eq!(
+            bg(theme.tool_surface(ToolState::Harness)),
+            theme.colors.tool_error_background
+        );
+        assert_eq!(
+            fg(theme.tool_surface(ToolState::Pending)),
+            theme.colors.text
+        );
 
-        assert_eq!(fg(theme.tool_rule(ToolState::Pending)), theme.colors.warning);
+        assert_eq!(
+            fg(theme.tool_rule(ToolState::Pending)),
+            theme.colors.warning
+        );
         assert_eq!(fg(theme.tool_rule(ToolState::Success)), theme.colors.dim);
         assert_eq!(fg(theme.tool_rule(ToolState::Error)), theme.colors.error);
-        assert_eq!(fg(theme.tool_rule(ToolState::Harness)), theme.colors.harness);
+        assert_eq!(
+            fg(theme.tool_rule(ToolState::Harness)),
+            theme.colors.harness
+        );
 
         assert!(theme.tool_title().add_modifier.contains(Modifier::BOLD));
         assert_eq!(fg(theme.tool_title()), theme.colors.tool_title);
-        assert_eq!(fg(theme.tool_output(ToolState::Success)), theme.colors.tool_output);
+        assert_eq!(
+            fg(theme.tool_output(ToolState::Success)),
+            theme.colors.tool_output
+        );
         assert_eq!(
             bg(theme.tool_output(ToolState::Success)),
             bg(theme.tool_surface(ToolState::Success))

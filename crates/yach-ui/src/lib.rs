@@ -24,7 +24,8 @@ pub use app::{
 };
 
 pub use theme::{
-    DiffKind, Theme, ThemeColors, ThemeDocument, ThemeLoadError, ThemeMode, ThemeSpacing, ToolState,
+    BundledPalette, DiffKind, Theme, ThemeColors, ThemeDocument, ThemeLoadError, ThemeMode,
+    ThemeSpacing, ToolState, bundled_palette,
 };
 pub use transcript::Transcript;
 
