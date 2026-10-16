@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::perf::Outcome;
+use crate::perf::alloc::AllocCounts;
 use crate::perf::provenance::{capture_build, capture_host};
 use crate::perf::registry::{self, Bin, Measured, Requirement, RunCtx, Workload};
 use crate::perf::schema::{Class, Isolation, ResultDoc, SCHEMA, Status, WorkloadRow};
@@ -163,22 +164,31 @@ fn measure_restricted(
             samples,
             ..ctx.clone()
         };
+        // Budgets for the derived `#alloc_*` rows are per-sample, which is
+        // what a deterministic run measures. A latency run's window spans all
+        // of its samples, so the same per-sample delta would scale with
+        // `--samples`; take the counts from a separate one-sample run instead.
+        let one_sample_alloc = (wants_alloc && samples > 1).then(|| {
+            let one = RunCtx {
+                samples: 1,
+                ..ctx.clone()
+            };
+            (workload.run)(&one).map(|measured| alloc_counts(&measured))
+        });
         let result = (workload.run)(&local);
         match result {
             Ok(measured) => {
-                let inner = match &measured {
-                    Measured::Latency {
-                        alloc: Some(counts),
-                        ..
-                    } => Some(*counts),
-                    _ => None,
-                };
+                let inner = alloc_counts(&measured);
                 let row = row_from(workload, measured, raw);
                 if wants_row {
                     rows.push(row.clone());
                 }
-                if wants_alloc && let Some(counts) = inner {
-                    rows.extend(registry::derived_alloc_rows(&row, counts));
+                if wants_alloc {
+                    match one_sample_alloc.unwrap_or(Ok(inner)) {
+                        Ok(Some(counts)) => rows.extend(registry::derived_alloc_rows(&row, counts)),
+                        Ok(None) => {}
+                        Err(message) => rows.extend(alloc_error_rows(workload, &message)),
+                    }
                 }
             }
             Err(message) => {
@@ -191,20 +201,34 @@ fn measure_restricted(
                     ));
                 }
                 if wants_alloc {
-                    for suffix in ["#alloc_count", "#alloc_bytes"] {
-                        rows.push(WorkloadRow::error(
-                            &format!("{}{suffix}", workload.id),
-                            Class::Count,
-                            workload.isolation,
-                            &message,
-                        ));
-                    }
+                    rows.extend(alloc_error_rows(workload, &message));
                 }
             }
         }
         grouped.entry(index).or_default().extend(rows);
     }
     grouped.into_values().flatten().collect()
+}
+
+fn alloc_counts(measured: &Measured) -> Option<AllocCounts> {
+    match measured {
+        Measured::Latency {
+            alloc: Some(counts),
+            ..
+        } => Some(*counts),
+        _ => None,
+    }
+}
+
+fn alloc_error_rows(workload: &Workload, message: &str) -> [WorkloadRow; 2] {
+    ["#alloc_count", "#alloc_bytes"].map(|suffix| {
+        WorkloadRow::error(
+            &format!("{}{suffix}", workload.id),
+            Class::Count,
+            workload.isolation,
+            message,
+        )
+    })
 }
 
 /// Whether the planner measures `workload`'s own row and its derived
@@ -873,7 +897,7 @@ mod tests {
     };
     use crate::perf::alloc::lock_window_for_test;
     use crate::perf::registry::{self, RunCtx};
-    use crate::perf::schema::{Class, Status};
+    use crate::perf::schema::{Class, Status, WorkloadRow};
     use std::collections::BTreeSet;
 
     /// The A/B controller skips the `--features bench` release build (one per
@@ -935,6 +959,37 @@ mod tests {
             !rows.iter().any(|row| row.id == "request/assemble/10_turns"),
             "deterministic run should omit the latency row"
         );
+    }
+
+    /// The latency job and the deterministic job judge the same `#alloc_*`
+    /// rows against one per-sample budget, so a multi-sample latency run must
+    /// report the counts a one-sample deterministic run reports, not a total.
+    #[test]
+    fn latency_measure_reports_per_sample_alloc_rows() {
+        let _guard = lock_window_for_test();
+        let ctx = |samples| RunCtx {
+            samples,
+            yach_bin: None,
+            yach_bench_yach_bin: None,
+            yach_bench_bin: None,
+            filter: glob::Pattern::new("request/assemble/10_turns").ok(),
+        };
+        let alloc_rows = |rows: Vec<WorkloadRow>| {
+            rows.into_iter()
+                .filter(|row| row.id.contains("#alloc_"))
+                .map(|row| (row.id, row.status, row.value))
+                .collect::<Vec<_>>()
+        };
+        let deterministic = alloc_rows(measure(&ctx(1), true, false));
+        let latency = alloc_rows(measure(&ctx(5), false, false));
+        assert_eq!(deterministic.len(), 2, "{deterministic:?}");
+        assert!(
+            deterministic
+                .iter()
+                .all(|(_, status, value)| *status == Status::Ok && value.is_some_and(|v| v > 0)),
+            "{deterministic:?}"
+        );
+        assert_eq!(latency, deterministic);
     }
 
     #[test]
