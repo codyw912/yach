@@ -36,17 +36,14 @@ struct InputStyles {
 fn input_styles(terminal_focused: bool, theme: &Theme) -> InputStyles {
     if terminal_focused {
         InputStyles {
-            border: Style::new().fg(theme.colors.border),
-            title: Style::new()
-                .fg(theme.colors.accent)
-                .add_modifier(Modifier::BOLD),
-            hint: Style::new().fg(theme.colors.dim),
+            border: theme.border(false),
+            title: theme.accent().add_modifier(Modifier::BOLD),
+            hint: theme.dim(),
             cursor: Style::default().add_modifier(Modifier::REVERSED),
         }
     } else {
-        let dim = Style::default()
-            .fg(theme.colors.dim)
-            .add_modifier(Modifier::DIM);
+        // Unfocused dims the border, title, and hint together, not the border alone.
+        let dim = theme.dim().add_modifier(Modifier::DIM);
         InputStyles {
             border: dim,
             title: dim,
@@ -77,8 +74,7 @@ impl Widget for InputComposer<'_> {
 
         self.textarea.set_block(block);
         self.textarea.set_wrap_mode(WrapMode::Glyph);
-        self.textarea
-            .set_style(Style::new().fg(self.theme.colors.text));
+        self.textarea.set_style(self.theme.text());
         self.textarea.set_cursor_line_style(Style::default());
         self.textarea.set_cursor_style(styles.cursor);
 
@@ -220,12 +216,7 @@ mod tests {
         let focused = input_styles(true, &theme);
         let unfocused = input_styles(false, &theme);
 
-        assert_eq!(
-            focused.title,
-            Style::new()
-                .fg(theme.colors.accent)
-                .add_modifier(Modifier::BOLD)
-        );
+        assert_eq!(focused.title, theme.accent().add_modifier(Modifier::BOLD));
         assert_ne!(focused.border, unfocused.border);
         assert_eq!(
             unfocused.cursor,

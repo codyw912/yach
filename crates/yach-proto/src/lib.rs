@@ -6,6 +6,11 @@ use zeroize::Zeroize;
 pub const PROTOCOL_VERSION: &str = "0.3.0";
 pub const MAX_PROTOCOL_VERSION_BYTES: usize = 32;
 
+/// Status prefixes shared by session loaders and startup notice handling.
+/// These remain plain status messages, not new wire event variants.
+pub const SESSION_LOAD_FAILED_PREFIX: &str = "failed to load session log:";
+pub const UNKNOWN_SESSION_PATH_PREFIX: &str = "unknown session path ";
+
 /// Truncates a protocol version for diagnostics and mismatch copy.
 #[must_use]
 pub fn bounded_protocol_version(version: &str) -> String {

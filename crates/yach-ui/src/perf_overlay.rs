@@ -1,5 +1,4 @@
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -31,18 +30,16 @@ impl Widget for PerfMetricsOverlay<'_> {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(self.theme.colors.border))
+            .border_style(self.theme.border(false))
             .title(" Performance ")
-            .style(Style::new().fg(self.theme.colors.accent));
+            .style(self.theme.accent());
 
         let spans: Vec<Line> = lines
             .iter()
-            .map(|l| Line::from(Span::styled(l, Style::new().fg(self.theme.colors.muted))))
+            .map(|l| Line::from(Span::styled(l, self.theme.muted())))
             .collect();
 
-        let paragraph = Paragraph::new(spans)
-            .style(Style::new().fg(self.theme.colors.text))
-            .block(block);
+        let paragraph = Paragraph::new(spans).style(self.theme.text()).block(block);
         Widget::render(paragraph, popup_area, buf);
     }
 }

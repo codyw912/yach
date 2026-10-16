@@ -1,6 +1,6 @@
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use yach_proto::ModelInfo;
@@ -39,13 +39,9 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(self.theme.colors.border))
+            .border_style(self.theme.border(false))
             .title("Select Model · Ctrl+R refresh")
-            .title_style(
-                Style::new()
-                    .fg(self.theme.colors.accent)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .title_style(self.theme.accent().add_modifier(Modifier::BOLD));
 
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
@@ -55,7 +51,7 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                 vec![
                     Line::from(Span::styled(
                         "Available models are loading from the backend...",
-                        Style::new().fg(self.theme.colors.warning),
+                        self.theme.warning(),
                     )),
                     Line::raw(""),
                     Line::from("Close with Esc and try again shortly."),
@@ -64,12 +60,12 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                 vec![
                     Line::from(Span::styled(
                         format!("No models match \"{}\".", self.query),
-                        Style::new().fg(self.theme.colors.warning),
+                        self.theme.warning(),
                     )),
                     Line::raw(""),
                     Line::from(Span::styled(
                         "Backspace edits the search; Esc closes.",
-                        Style::new().fg(self.theme.colors.dim),
+                        self.theme.dim(),
                     )),
                 ]
             }
@@ -85,13 +81,13 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
             if show_help {
                 lines.push(Line::from(Span::styled(
                     "Type to search all discovered models. Arrows move; Enter requests a model change; Esc closes.",
-                    Style::new().fg(self.theme.colors.dim),
+                    self.theme.dim(),
                 )));
             }
             if show_search {
                 lines.push(Line::from(vec![
-                    Span::styled("Search: ", Style::new().fg(self.theme.colors.dim)),
-                    Span::styled(self.query, Style::new().fg(self.theme.colors.text)),
+                    Span::styled("Search: ", self.theme.dim()),
+                    Span::styled(self.query, self.theme.text()),
                 ]));
             }
             if show_blank {
@@ -125,10 +121,7 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                 let capacity = row_area - usize::from(show_up) - usize::from(show_down);
                 let start = selected.saturating_sub(capacity.saturating_sub(1));
                 if show_up {
-                    lines.push(Line::from(Span::styled(
-                        "  ↑ more",
-                        Style::new().fg(self.theme.colors.dim),
-                    )));
+                    lines.push(Line::from(Span::styled("  ↑ more", self.theme.dim())));
                 }
                 lines.extend(
                     self.models
@@ -168,13 +161,11 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                                 (false, false) => "",
                             };
                             let style = if is_selected {
-                                Style::new()
-                                    .fg(self.theme.colors.selected_text)
-                                    .add_modifier(Modifier::BOLD)
+                                self.theme.selected_label()
                             } else if is_current || is_default {
-                                Style::new().fg(self.theme.colors.warning)
+                                self.theme.warning()
                             } else {
-                                Style::new().fg(self.theme.colors.muted)
+                                self.theme.muted()
                             };
                             let row_label = model.connection_display.as_deref().map_or_else(
                                 || model.label(),
@@ -192,18 +183,13 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
                         }),
                 );
                 if show_down {
-                    lines.push(Line::from(Span::styled(
-                        "  ↓ more",
-                        Style::new().fg(self.theme.colors.dim),
-                    )));
+                    lines.push(Line::from(Span::styled("  ↓ more", self.theme.dim())));
                 }
             }
             let action_style = if self.save_default_selected {
-                Style::new()
-                    .fg(self.theme.colors.selected_text)
-                    .add_modifier(Modifier::BOLD)
+                self.theme.selected_label()
             } else {
-                Style::new().fg(self.theme.colors.accent)
+                self.theme.accent()
             };
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
@@ -217,7 +203,7 @@ impl<M: ModelRow> Widget for ModelSelector<'_, M> {
             lines
         };
 
-        let paragraph = Paragraph::new(lines).style(Style::new().fg(self.theme.colors.text));
+        let paragraph = Paragraph::new(lines).style(self.theme.text());
         Widget::render(paragraph, inner, buf);
     }
 }

@@ -494,7 +494,7 @@ where
         Ok(load_result) => session_state_from_load_result(tx, load_result),
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: format!("failed to load session log: {error}"),
+                message: format!("{} {error}", yach_proto::SESSION_LOAD_FAILED_PREFIX),
             }));
             SessionLog::default()
         }
@@ -517,7 +517,7 @@ pub(super) fn session_state_from_load_result(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => SessionLog::default(),
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: format!("failed to load session log: {error}"),
+                message: format!("{} {error}", yach_proto::SESSION_LOAD_FAILED_PREFIX),
             }));
             SessionLog::default()
         }

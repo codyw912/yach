@@ -4,6 +4,15 @@ Status: accepted 2026-08-19 — owner taste session complete
 Date: 2026-08-19
 Scope: UX sprint Wave 3 — transcript hierarchy, spacing, tool-row visuals, and a docked responsive input composer.
 
+> **Superseded in part, 2026-10-06.** Tool-row treatment in this document
+> (outcome-tinted full-width surfaces, and "a compact successful row receives
+> no background band") is superseded by
+> [the theming engine spec](2026-10-02-theming-engine-design.md). Every tool
+> row is a neutral panel with a state-colored left rule (`┃`); only the
+> failure surface is tinted. Theme selection, `NO_COLOR`, and the theme file's
+> `base` key are also defined there. Transcript hierarchy, spacing, and the
+> docked composer in this document still hold.
+
 ## Problem
 
 Wave 1 fixed concrete ergonomics and Wave 2 unified tool lifecycle and review behavior, but the resulting TUI still reads as a functional debug surface:

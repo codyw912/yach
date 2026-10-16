@@ -30,10 +30,11 @@ use crate::theme::Theme;
 use crate::thinking_level::ThinkingLevel;
 use crate::transcript::{self, Transcript, TranscriptAlignment, TranscriptRenderCache};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunTuiOptions {
     pub resume_session: bool,
     pub theme: Theme,
+    pub startup_notices: Vec<String>,
 }
 
 fn lifecycle_action_verb(action: ExtensionLifecycleAction) -> &'static str {
@@ -764,6 +765,8 @@ pub struct App {
     pending_session_id: Option<String>,
     session_file: Option<String>,
     session_message_hydration: SessionMessageHydration,
+    /// Startup notices held until resume hydration rebuilds the transcript.
+    pending_startup_notices: Vec<String>,
     pending_thinking_level: Option<ThinkingLevel>,
     pending_thinking_handoff: Option<PendingThinkingHandoff>,
     perf_metrics: PerfMetrics,
@@ -834,6 +837,7 @@ impl App {
             pending_session_id: None,
             session_file: None,
             session_message_hydration: SessionMessageHydration::None,
+            pending_startup_notices: Vec::new(),
             pending_thinking_level: None,
             pending_thinking_handoff: None,
             perf_metrics: PerfMetrics::new(),
@@ -868,6 +872,23 @@ impl App {
         if !already_noted {
             self.transcript.append_status(message);
         }
+    }
+
+    fn new_with_options(
+        client_tx: mpsc::UnboundedSender<ClientEvent>,
+        options: &RunTuiOptions,
+    ) -> Self {
+        let mut app = Self::new_with_theme(client_tx, options.theme);
+        if options.resume_session {
+            app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+            app.pending_startup_notices
+                .clone_from(&options.startup_notices);
+        } else {
+            for notice in &options.startup_notices {
+                app.transcript.append_status(notice);
+            }
+        }
+        app
     }
 
     fn clear_model_context(&mut self) {
@@ -1368,6 +1389,17 @@ impl App {
                 self.scroll_to_bottom();
             }
             ServerEvent::StatusUpdated { message } => {
+                if self.session_message_hydration == SessionMessageHydration::ExplicitResume
+                    && (message.starts_with(yach_proto::SESSION_LOAD_FAILED_PREFIX)
+                        || message.starts_with(yach_proto::UNKNOWN_SESSION_PATH_PREFIX))
+                {
+                    // Startup can load twice: a failed first attempt must not
+                    // consume the queued selection's successful hydration.
+                    for notice in std::mem::take(&mut self.pending_startup_notices) {
+                        self.transcript.append_status(&notice);
+                    }
+                    self.scroll_to_bottom();
+                }
                 match status_lifecycle(&message) {
                     Some(StatusLifecycle::Ended) => {
                         if !matches!(self.stream_state, StreamState::Desynchronized { .. }) {
@@ -2196,6 +2228,9 @@ impl App {
                 "system" => self.transcript.append_compaction(&message.text),
                 _ => {}
             }
+        }
+        for notice in std::mem::take(&mut self.pending_startup_notices) {
+            self.transcript.append_status(&notice);
         }
         if !messages.is_empty() {
             self.scroll_to_bottom();
@@ -4299,10 +4334,7 @@ pub async fn run_tui_with_trace_and_options(
     if let Some(trace) = trace.as_ref() {
         trace.mark(yach_trace::TraceScope::Startup, "run_tui_start");
     }
-    let mut app = App::new_with_theme(client_tx, options.theme);
-    if options.resume_session {
-        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
-    }
+    let mut app = App::new_with_options(client_tx, &options);
     if let Some(trace) = trace.as_ref() {
         trace.mark(yach_trace::TraceScope::Startup, "tui_app_created");
     }
@@ -4624,7 +4656,7 @@ fn render_dialog_overlay(
     dialog: &DialogRenderSnapshot,
     theme: &Theme,
 ) {
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::Modifier;
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -4633,13 +4665,9 @@ fn render_dialog_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(theme.colors.border))
+        .border_style(theme.border(false))
         .title(dialog_summary(&dialog.request))
-        .title_style(
-            Style::new()
-                .fg(theme.colors.accent)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(theme.accent().add_modifier(Modifier::BOLD));
 
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
@@ -4655,18 +4683,14 @@ fn render_dialog_overlay(
     match &dialog.request.kind {
         DialogKind::Confirm => {
             let yes_style = if dialog.confirm_accepted {
-                Style::new()
-                    .fg(theme.colors.selected_text)
-                    .bg(theme.colors.success)
+                theme.selected_on(theme.success())
             } else {
-                Style::new().fg(theme.colors.success)
+                theme.success()
             };
             let no_style = if dialog.confirm_accepted {
-                Style::new().fg(theme.colors.error)
+                theme.error()
             } else {
-                Style::new()
-                    .fg(theme.colors.selected_text)
-                    .bg(theme.colors.error)
+                theme.selected_on(theme.error())
             };
             lines.push(Line::from(vec![
                 Span::styled(" Yes ", yes_style),
@@ -4711,12 +4735,9 @@ fn render_dialog_overlay(
             for (idx, option) in options.iter().enumerate() {
                 let is_selected = idx == dialog.selected;
                 let style = if is_selected {
-                    Style::new()
-                        .fg(theme.colors.selected_text)
-                        .bg(theme.colors.selected_background)
-                        .add_modifier(Modifier::BOLD)
+                    theme.selected().add_modifier(Modifier::BOLD)
                 } else {
-                    Style::new().fg(theme.colors.muted)
+                    theme.muted()
                 };
                 let prefix = if is_selected { "▸ " } else { "  " };
                 lines.push(Line::from(vec![
@@ -4732,7 +4753,7 @@ fn render_dialog_overlay(
         }
     }
 
-    let paragraph = Paragraph::new(lines).style(Style::new().fg(theme.colors.text));
+    let paragraph = Paragraph::new(lines).style(theme.text());
     Widget::render(paragraph, inner, frame.buffer_mut());
 }
 
@@ -4742,7 +4763,7 @@ fn render_local_edit_compose_overlay(
     draft: &LocalEditDraft,
     theme: &Theme,
 ) {
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::Modifier;
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -4751,24 +4772,20 @@ fn render_local_edit_compose_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(theme.colors.border))
+        .border_style(theme.border(false))
         .title("local edit")
-        .title_style(
-            Style::new()
-                .fg(theme.colors.accent)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(theme.accent().add_modifier(Modifier::BOLD));
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
 
     let mut lines = Vec::new();
     if step == LocalEditComposeStep::Kind {
         lines.push(Line::from(vec![
-            Span::styled("1", Style::new().fg(theme.colors.warning)),
+            Span::styled("1", theme.warning()),
             Span::raw(" Modify existing file"),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("2", Style::new().fg(theme.colors.warning)),
+            Span::styled("2", theme.warning()),
             Span::raw(" Create new file"),
         ]));
         lines.push(Line::raw(""));
@@ -4787,7 +4804,7 @@ fn render_local_edit_compose_overlay(
     }
 
     Widget::render(
-        Paragraph::new(lines).style(Style::new().fg(theme.colors.text)),
+        Paragraph::new(lines).style(theme.text()),
         inner,
         frame.buffer_mut(),
     );
@@ -4810,7 +4827,7 @@ fn render_local_edit_review_overlay(
     selected: LocalEditReviewAction,
     theme: &Theme,
 ) {
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::Modifier;
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -4819,29 +4836,21 @@ fn render_local_edit_review_overlay(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(theme.colors.border))
+        .border_style(theme.border(false))
         .title("review local edit")
-        .title_style(
-            Style::new()
-                .fg(theme.colors.accent)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(theme.accent().add_modifier(Modifier::BOLD));
     let inner = block.inner(popup_area);
     block.render(popup_area, frame.buffer_mut());
 
     let apply_style = if selected == LocalEditReviewAction::Apply {
-        Style::new()
-            .fg(theme.colors.selected_text)
-            .bg(theme.colors.success)
+        theme.selected_on(theme.success())
     } else {
-        Style::new().fg(theme.colors.success)
+        theme.success()
     };
     let reject_style = if selected == LocalEditReviewAction::Reject {
-        Style::new()
-            .fg(theme.colors.selected_text)
-            .bg(theme.colors.error)
+        theme.selected_on(theme.error())
     } else {
-        Style::new().fg(theme.colors.error)
+        theme.error()
     };
     let mut lines = vec![
         Line::from(format!("Path: {}", preview.path)),
@@ -4886,28 +4895,26 @@ fn render_local_edit_review_overlay(
     lines.extend(action_lines);
 
     Widget::render(
-        Paragraph::new(lines).style(Style::new().fg(theme.colors.text)),
+        Paragraph::new(lines).style(theme.text()),
         inner,
         frame.buffer_mut(),
     );
 }
 
 fn review_diff_line_style(line: &str, theme: &Theme) -> ratatui::style::Style {
-    use ratatui::style::Style;
-
     if line.starts_with("+++ ") || line.starts_with("--- ") {
-        return Style::new().fg(theme.colors.muted).bold();
+        return theme.muted().add_modifier(ratatui::style::Modifier::BOLD);
     }
     if line.starts_with('+') {
-        return Style::new().fg(theme.colors.diff_added);
+        return theme.diff(crate::theme::DiffKind::Added);
     }
     if line.starts_with('-') {
-        return Style::new().fg(theme.colors.diff_removed);
+        return theme.diff(crate::theme::DiffKind::Removed);
     }
     if line.starts_with("@@") {
-        return Style::new().fg(theme.colors.accent);
+        return theme.accent();
     }
-    Style::new().fg(theme.colors.diff_context)
+    theme.diff(crate::theme::DiffKind::Context)
 }
 
 fn insert_dialog_newline(dialog: &mut PendingDialog) {
@@ -4942,7 +4949,7 @@ fn render_dialog_textarea(
         .split(area);
 
     if prompt_height > 0 {
-        let paragraph = Paragraph::new(prompt_lines).style(Style::new().fg(theme.colors.text));
+        let paragraph = Paragraph::new(prompt_lines).style(theme.text());
         Widget::render(paragraph, chunks[0], frame.buffer_mut());
     }
 
@@ -4950,18 +4957,18 @@ fn render_dialog_textarea(
     textarea.set_block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(theme.colors.border))
+            .border_style(theme.border(false))
             .title("input")
-            .title_style(Style::new().fg(theme.colors.warning)),
+            .title_style(theme.warning()),
     );
     textarea.set_wrap_mode(WrapMode::Word);
-    textarea.set_style(Style::new().fg(theme.colors.text));
+    textarea.set_style(theme.text());
     textarea.set_cursor_line_style(Style::default());
     textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
 
     Widget::render(&textarea, chunks[1], frame.buffer_mut());
     Widget::render(
-        Paragraph::new(Line::from(hint)).style(Style::new().fg(theme.colors.dim)),
+        Paragraph::new(Line::from(hint)).style(theme.dim()),
         chunks[2],
         frame.buffer_mut(),
     );
@@ -5019,11 +5026,13 @@ fn centered_rect(
 
 #[cfg(test)]
 mod tests {
+    use super::RunTuiOptions;
     use super::{
         App, AppMode, EMPTY_ASSISTANT_RESPONSE_MESSAGE, FullAccessConfirmationAction,
         LocalEditComposeStep, LocalEditDraft, LocalEditReview, LocalEditReviewAction,
         MAX_TOOL_ERROR_EXCERPT_CHARS, SessionMessageHydration, tool_output_summary,
     };
+    use crate::theme::Theme;
     use crate::thinking_level::ThinkingLevel;
     use crate::transcript::EntryKind;
     use crossterm::event::{Event, KeyCode, KeyModifiers};
@@ -5048,6 +5057,142 @@ mod tests {
                 &default_backend_handshake(),
             ),
         }
+    }
+
+    const LEGACY_NOTICE: &str = concat!(
+        "project themes are not supported; move it to `~/.yach/theme.json` ",
+        "or set `YACH_THEME`"
+    );
+
+    fn notice_options(resume_session: bool) -> RunTuiOptions {
+        RunTuiOptions {
+            resume_session,
+            theme: Theme::default(),
+            startup_notices: vec![
+                String::from(LEGACY_NOTICE),
+                String::from("unknown theme 'nope'; using auto"),
+            ],
+        }
+    }
+
+    fn status_contents(app: &App) -> Vec<&str> {
+        app.transcript
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.kind, EntryKind::Status))
+            .map(|entry| entry.content.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn startup_notices_land_in_the_transcript_before_the_first_event() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let app = App::new_with_options(tx, &notice_options(false));
+        assert_eq!(app.transcript.entries().len(), 2);
+        assert_eq!(
+            status_contents(&app),
+            vec![LEGACY_NOTICE, "unknown theme 'nope'; using auto"]
+        );
+    }
+
+    #[test]
+    fn startup_notices_survive_resume_hydration_once() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new_with_options(tx, &notice_options(true));
+        assert!(app.transcript.entries().is_empty());
+        assert_eq!(
+            app.session_message_hydration,
+            SessionMessageHydration::ExplicitResume
+        );
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![
+                session_message("user", "u1", "Start"),
+                session_message("assistant", "a1", "Answer"),
+            ],
+        });
+        assert_eq!(app.transcript.entries()[0].content, "Start");
+        assert_eq!(
+            status_contents(&app),
+            vec![LEGACY_NOTICE, "unknown theme 'nope'; using auto"]
+        );
+        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![session_message("user", "u2", "Other")],
+        });
+        assert!(status_contents(&app).is_empty());
+    }
+
+    #[test]
+    fn startup_notices_survive_empty_resume_hydration() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new_with_options(tx, &notice_options(true));
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: Vec::new(),
+        });
+        assert_eq!(
+            status_contents(&app),
+            vec![LEGACY_NOTICE, "unknown theme 'nope'; using auto"]
+        );
+    }
+
+    #[test]
+    fn startup_notices_failed_resume_flushes_once_then_success_hydrates() {
+        for message in [
+            "failed to load session log: permission denied",
+            "unknown session path /missing.jsonl",
+        ] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new_with_options(tx, &notice_options(true));
+            app.handle_server_event(ServerEvent::StatusUpdated {
+                message: message.to_owned(),
+            });
+            assert_eq!(
+                status_contents(&app),
+                vec![LEGACY_NOTICE, "unknown theme 'nope'; using auto"]
+            );
+            app.handle_server_event(ServerEvent::StatusUpdated {
+                message: message.to_owned(),
+            });
+            assert_eq!(
+                status_contents(&app).len(),
+                2,
+                "terminal/repeated failure preserves transcript"
+            );
+            assert_eq!(
+                app.session_message_hydration,
+                SessionMessageHydration::ExplicitResume
+            );
+            app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+                messages: vec![session_message("user", "u1", "Retry history")],
+            });
+            assert_eq!(app.transcript.entries()[0].content, "Retry history");
+            assert!(
+                status_contents(&app).is_empty(),
+                "flushed notices are never replayed"
+            );
+            app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+                messages: vec![session_message("user", "tree", "Tree request")],
+            });
+            assert_eq!(app.transcript.entries()[0].content, "Retry history");
+            assert!(status_contents(&app).is_empty());
+            app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+            app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+                messages: vec![session_message("user", "u2", "Later resume")],
+            });
+            assert!(status_contents(&app).is_empty());
+        }
+    }
+
+    #[test]
+    fn startup_notices_fresh_session_never_replays_on_later_resume() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new_with_options(tx, &notice_options(false));
+        assert_eq!(status_contents(&app).len(), 2);
+        app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+        app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+            messages: vec![session_message("user", "u1", "Later resume")],
+        });
+        assert!(status_contents(&app).is_empty());
     }
 
     #[test]
@@ -9789,5 +9934,243 @@ mod tests {
             .handle_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
         let rows = render_rows(&mut bench, &mut terminal);
         assert!(row_index(&rows, "more diff lines").is_some());
+    }
+
+    fn cell_on_row_containing<'a>(
+        buffer: &'a ratatui::buffer::Buffer,
+        needle: &str,
+        symbol: &str,
+    ) -> Option<&'a ratatui::buffer::Cell> {
+        let area = buffer.area;
+        for y in 0..area.height {
+            let row: String = (0..area.width).map(|x| buffer[(x, y)].symbol()).collect();
+            if !row.contains(needle) {
+                continue;
+            }
+            for x in 0..area.width {
+                if buffer[(x, y)].symbol() == symbol {
+                    return Some(&buffer[(x, y)]);
+                }
+            }
+        }
+        None
+    }
+
+    fn draw_overlay(
+        theme: &crate::theme::Theme,
+        draw: impl FnOnce(&mut ratatui::Frame<'_>, &crate::theme::Theme),
+    ) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = match ratatui::Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(infallible) => match infallible {},
+        };
+        let drawn = terminal.draw(|frame| draw(frame, theme));
+        assert!(drawn.is_ok());
+        terminal.backend().buffer().clone()
+    }
+
+    fn confirm_dialog() -> super::DialogRenderSnapshot {
+        super::DialogRenderSnapshot {
+            request: DialogRequest {
+                id: None,
+                title: Some(String::from("confirm")),
+                prompt: Some(String::from("Ship it?")),
+                kind: DialogKind::Confirm,
+            },
+            input_buffer: String::new(),
+            cursor_pos: 0,
+            selected: 0,
+            confirm_accepted: true,
+        }
+    }
+
+    fn local_edit_review() -> super::LocalEditReview {
+        super::LocalEditReview {
+            preview_id: String::from("preview-1"),
+            permission_decision_id: String::from("permission-1"),
+            path: String::from("src/lib.rs"),
+            operation: String::from("replace"),
+            review_state: LocalEditReviewState::NeedsUserApproval,
+            diff_summary: String::from("-old\n+new"),
+            diff_summary_truncated: false,
+        }
+    }
+
+    fn assert_unpainted_selection(cell: &ratatui::buffer::Cell, theme: &crate::theme::Theme) {
+        use ratatui::style::{Color, Modifier};
+        assert_eq!(
+            cell.bg,
+            Color::Reset,
+            "selection must not paint a background"
+        );
+        let selected = if theme.mode() == crate::theme::ThemeMode::Mono {
+            Modifier::REVERSED
+        } else {
+            Modifier::BOLD
+        };
+        assert!(
+            cell.modifier.contains(selected),
+            "selection cell {:?} missing {selected:?}",
+            cell.modifier
+        );
+    }
+
+    #[test]
+    fn system_and_mono_selection_is_an_unpainted_attribute() {
+        use crate::approval_selector::ApprovalModeSelector;
+        use crate::theme::{Theme, ThemeMode};
+
+        for theme in [Theme::system(), Theme::monochrome()] {
+            let dialog = draw_overlay(&theme, |frame, theme| {
+                super::render_dialog_overlay(frame, &confirm_dialog(), theme);
+            });
+            let yes = cell_on_row_containing(&dialog, "Yes", "Y");
+            assert!(
+                yes.is_some(),
+                "{:?} dialog confirm cell missing",
+                theme.mode()
+            );
+            let Some(yes) = yes else { return };
+            assert_unpainted_selection(yes, &theme);
+
+            let review = draw_overlay(&theme, |frame, theme| {
+                super::render_local_edit_review_overlay(
+                    frame,
+                    &local_edit_review(),
+                    LocalEditReviewAction::Apply,
+                    theme,
+                );
+            });
+            let approve = cell_on_row_containing(&review, "Approve", "A");
+            assert!(
+                approve.is_some(),
+                "{:?} review choice cell missing",
+                theme.mode()
+            );
+            let Some(approve) = approve else { return };
+            assert_unpainted_selection(approve, &theme);
+
+            let area = Rect::new(0, 0, 40, 8);
+            let mut picker = Buffer::empty(area);
+            Widget::render(
+                ApprovalModeSelector {
+                    current_mode: ApprovalMode::Review,
+                    selected_index: 0,
+                    theme: &theme,
+                },
+                area,
+                &mut picker,
+            );
+            let row = cell_on_row_containing(&picker, "▸", "▸");
+            assert!(row.is_some(), "{:?} approval row missing", theme.mode());
+            let Some(row) = row else { return };
+            assert_unpainted_selection(row, &theme);
+            if theme.mode() == ThemeMode::System {
+                assert!(
+                    !row.modifier.contains(ratatui::style::Modifier::REVERSED),
+                    "system selection is an attribute, not reversal"
+                );
+            }
+        }
+    }
+
+    fn assert_selected_action_cells(
+        buffer: &ratatui::buffer::Buffer,
+        background: ratatui::style::Color,
+        label: &str,
+    ) {
+        let selected: Vec<_> = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.bg == background)
+            .collect();
+        assert_eq!(
+            selected.len(),
+            label.chars().count(),
+            "only action label cells change"
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>(),
+            label
+        );
+        for cell in selected {
+            assert_painted_choice(cell, ratatui::style::Color::Rgb(0, 0, 0), background);
+        }
+    }
+
+    fn assert_painted_choice(
+        cell: &ratatui::buffer::Cell,
+        fg: ratatui::style::Color,
+        bg: ratatui::style::Color,
+    ) {
+        use ratatui::style::Modifier;
+        assert_eq!(cell.fg, fg);
+        assert_eq!(cell.bg, bg);
+        assert_eq!(cell.modifier, Modifier::empty());
+    }
+
+    #[test]
+    fn painted_confirm_and_review_labels_pin_legible_action_cells() {
+        use crate::theme::Theme;
+        use ratatui::style::Color;
+
+        let theme = Theme::dark();
+        let selected_text = Color::Rgb(0, 0, 0);
+        let success = Color::Rgb(181, 189, 104);
+        let error = Color::Rgb(204, 102, 102);
+
+        let accepted = draw_overlay(&theme, |frame, theme| {
+            super::render_dialog_overlay(frame, &confirm_dialog(), theme);
+        });
+        let yes = cell_on_row_containing(&accepted, "Yes", "Y");
+        assert!(yes.is_some(), "selected Yes cell missing");
+        let Some(yes) = yes else { return };
+        assert_painted_choice(yes, selected_text, success);
+        assert_selected_action_cells(&accepted, success, " Yes ");
+
+        let mut rejected = confirm_dialog();
+        rejected.confirm_accepted = false;
+        let declined = draw_overlay(&theme, |frame, theme| {
+            super::render_dialog_overlay(frame, &rejected, theme);
+        });
+        let no = cell_on_row_containing(&declined, "No", "N");
+        assert!(no.is_some(), "selected No cell missing");
+        let Some(no) = no else { return };
+        assert_painted_choice(no, selected_text, error);
+        assert_selected_action_cells(&declined, error, " No ");
+
+        let apply = draw_overlay(&theme, |frame, theme| {
+            super::render_local_edit_review_overlay(
+                frame,
+                &local_edit_review(),
+                LocalEditReviewAction::Apply,
+                theme,
+            );
+        });
+        let approve = cell_on_row_containing(&apply, "Approve", "A");
+        assert!(approve.is_some(), "selected Approve cell missing");
+        let Some(approve) = approve else { return };
+        assert_painted_choice(approve, selected_text, success);
+        assert_selected_action_cells(&apply, success, "› Approve");
+
+        let reject = draw_overlay(&theme, |frame, theme| {
+            super::render_local_edit_review_overlay(
+                frame,
+                &local_edit_review(),
+                LocalEditReviewAction::Reject,
+                theme,
+            );
+        });
+        let rejected_action = cell_on_row_containing(&reject, "Reject", "R");
+        assert!(rejected_action.is_some(), "selected Reject cell missing");
+        let Some(rejected_action) = rejected_action else {
+            return;
+        };
+        assert_painted_choice(rejected_action, selected_text, error);
+        assert_selected_action_cells(&reject, error, "› Reject");
     }
 }

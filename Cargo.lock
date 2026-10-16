@@ -3813,6 +3813,7 @@ name = "yach"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "ratatui",
  "reqwest",
  "serde",
  "serde_json",

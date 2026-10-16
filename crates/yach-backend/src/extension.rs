@@ -68,6 +68,7 @@ pub enum ExtensionActivationEvent {
 pub struct ExtensionContributions {
     pub tools: Vec<ExtensionToolContribution>,
     pub static_context: Vec<ExtensionStaticContextContribution>,
+    pub themes: Vec<ExtensionThemeContribution>,
     pub tool_replacement_bundles: Vec<ExtensionToolReplacementBundleContribution>,
     pub reviewer: Option<ExtensionReviewerContribution>,
 }
@@ -142,6 +143,28 @@ pub enum ExtensionStaticContextSource {
     ExtensionFile { path: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionThemeContribution {
+    pub id: String,
+    pub title: String,
+    pub source: ExtensionThemeSource,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionThemeSource {
+    ExtensionFile { path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionThemeFile {
+    pub extension_id: String,
+    pub theme_id: String,
+    pub package_root: PathBuf,
+    pub relative_path: String,
+    pub max_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionStaticContextPlacement {
     BackgroundContext,
@@ -161,6 +184,10 @@ pub enum ExtensionManifestError {
     UnsupportedStaticContextPlacement { placement: String },
     InvalidStaticContextId { id: String },
     InvalidStaticContextPath { path: String },
+    InvalidThemeId { id: String },
+    ReservedThemeId { id: String },
+    InvalidThemePath { path: String },
+    ThemeMaxBytesTooSmall,
     InvalidReplacementBundleId { id: String },
     DuplicateReplacementBundleId { id: String },
     InvalidReplacementBundle { id: String },
@@ -1667,6 +1694,8 @@ struct RawExtensionContributions {
     #[serde(default)]
     static_context: Vec<RawExtensionStaticContextContribution>,
     #[serde(default)]
+    themes: Vec<RawExtensionThemeContribution>,
+    #[serde(default)]
     tool_replacement_bundles: Vec<RawExtensionToolReplacementBundle>,
     #[serde(default)]
     reviewer: Option<RawExtensionReviewerContribution>,
@@ -1716,6 +1745,22 @@ struct RawExtensionStaticContextContribution {
 #[derive(Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 enum RawExtensionStaticContextSource {
+    #[serde(rename = "extension_file")]
+    ExtensionFile { path: String },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExtensionThemeContribution {
+    id: String,
+    title: String,
+    source: RawExtensionThemeSource,
+    max_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum RawExtensionThemeSource {
     #[serde(rename = "extension_file")]
     ExtensionFile { path: String },
 }
@@ -1892,6 +1937,13 @@ pub fn parse_extension_manifest(
         .map(parse_static_context_contribution)
         .collect::<Result<Vec<_>, _>>()?;
 
+    let themes = raw
+        .contributes
+        .themes
+        .into_iter()
+        .map(parse_theme_contribution)
+        .collect::<Result<Vec<_>, _>>()?;
+
     let reviewer = raw
         .contributes
         .reviewer
@@ -1915,6 +1967,7 @@ pub fn parse_extension_manifest(
         contributes: ExtensionContributions {
             tools,
             static_context,
+            themes,
             tool_replacement_bundles,
             reviewer,
         },
@@ -2718,6 +2771,30 @@ impl ExtensionManifestIndex {
         &self.records
     }
 
+    pub fn user_theme_files(&self) -> Vec<ExtensionThemeFile> {
+        self.records
+            .iter()
+            .filter(|record| record.scope == ExtensionInstallScope::User)
+            .flat_map(|record| {
+                record
+                    .manifest
+                    .contributes
+                    .themes
+                    .iter()
+                    .map(|contribution| {
+                        let ExtensionThemeSource::ExtensionFile { path } = &contribution.source;
+                        ExtensionThemeFile {
+                            extension_id: record.manifest.id.0.clone(),
+                            theme_id: contribution.id.clone(),
+                            package_root: record.package_root.clone(),
+                            relative_path: path.clone(),
+                            max_bytes: contribution.max_bytes,
+                        }
+                    })
+            })
+            .collect()
+    }
+
     pub fn static_context_files(&self) -> Vec<ExtensionStaticContextFile> {
         self.records
             .iter()
@@ -2996,6 +3073,38 @@ fn parse_tool_risk(risk: String) -> Result<ExtensionToolRisk, ExtensionManifestE
         "runs_process" => Ok(ExtensionToolRisk::RunsProcess),
         _ => Err(ExtensionManifestError::UnsupportedToolRisk { risk }),
     }
+}
+
+fn parse_theme_contribution(
+    contribution: RawExtensionThemeContribution,
+) -> Result<ExtensionThemeContribution, ExtensionManifestError> {
+    if !is_valid_static_context_id(&contribution.id) {
+        return Err(ExtensionManifestError::InvalidThemeId {
+            id: contribution.id,
+        });
+    }
+    if ["dark", "light", "system", "auto"].contains(&contribution.id.as_str()) {
+        return Err(ExtensionManifestError::ReservedThemeId {
+            id: contribution.id,
+        });
+    }
+    if contribution.max_bytes == 0 {
+        return Err(ExtensionManifestError::ThemeMaxBytesTooSmall);
+    }
+    let source = match contribution.source {
+        RawExtensionThemeSource::ExtensionFile { path } => {
+            if !is_valid_static_context_path(&path) {
+                return Err(ExtensionManifestError::InvalidThemePath { path });
+            }
+            ExtensionThemeSource::ExtensionFile { path }
+        }
+    };
+    Ok(ExtensionThemeContribution {
+        id: contribution.id,
+        title: contribution.title,
+        source,
+        max_bytes: contribution.max_bytes,
+    })
 }
 
 fn parse_static_context_contribution(
@@ -3623,6 +3732,7 @@ done
                         provider_visible: false,
                     }],
                     static_context: Vec::new(),
+                    themes: Vec::new(),
                     tool_replacement_bundles: Vec::new(),
                     reviewer: None,
                 },
@@ -4203,6 +4313,7 @@ done
                 contributes: ExtensionContributions {
                     tools: Vec::new(),
                     static_context: Vec::new(),
+                    themes: Vec::new(),
                     tool_replacement_bundles: Vec::new(),
                     reviewer: None,
                 },
@@ -4214,6 +4325,117 @@ done
         expect_equal(&catalog.host_start_count(), &0)?;
         expect_equal(&catalog.tool_candidates("toy_tool"), &None)?;
         Ok(())
+    }
+
+    fn theme_manifest(id: &str, path: &str, max_bytes: u64) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "yach.extension.v1",
+            "id": "example.themes",
+            "version": "0.1.0",
+            "main": { "command": "node", "args": ["./extension.js"] },
+            "contributes": {
+                "themes": [{
+                    "id": id,
+                    "title": "Night",
+                    "source": { "type": "extension_file", "path": path },
+                    "max_bytes": max_bytes
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn extension_manifest_accepts_a_theme_contribution() -> Result<(), String> {
+        let manifest = parse_valid_manifest(theme_manifest("night", "themes/night.json", 16384))?;
+        expect_equal(
+            &manifest.contributes.themes,
+            &vec![ExtensionThemeContribution {
+                id: String::from("night"),
+                title: String::from("Night"),
+                source: ExtensionThemeSource::ExtensionFile {
+                    path: String::from("themes/night.json"),
+                },
+                max_bytes: 16384,
+            }],
+        )
+    }
+
+    #[test]
+    fn extension_manifest_rejects_invalid_theme_contributions() {
+        for (id, path, cap, error) in [
+            (
+                "Night",
+                "themes/night.json",
+                16384,
+                ExtensionManifestError::InvalidThemeId {
+                    id: String::from("Night"),
+                },
+            ),
+            (
+                "night",
+                "../night.json",
+                16384,
+                ExtensionManifestError::InvalidThemePath {
+                    path: String::from("../night.json"),
+                },
+            ),
+            (
+                "night",
+                "/night.json",
+                16384,
+                ExtensionManifestError::InvalidThemePath {
+                    path: String::from("/night.json"),
+                },
+            ),
+            (
+                "night",
+                "themes/night.json",
+                0,
+                ExtensionManifestError::ThemeMaxBytesTooSmall,
+            ),
+        ] {
+            assert_eq!(
+                parse_extension_manifest(theme_manifest(id, path, cap)),
+                Err(error)
+            );
+        }
+        for id in ["dark", "light", "system", "auto"] {
+            assert_eq!(
+                parse_extension_manifest(theme_manifest(id, "themes/night.json", 16384)),
+                Err(ExtensionManifestError::ReservedThemeId {
+                    id: String::from(id)
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn user_theme_files_skip_project_scope() -> Result<(), String> {
+        let package = TestPackageRoot::new("user_theme_files")?;
+        package.write_json_file(
+            "yach.extension.json",
+            &theme_manifest("night", "themes/night.json", 16384),
+        )?;
+        let project = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::Project)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+        expect_equal(&project.user_theme_files(), &Vec::new())?;
+        let user = ExtensionManifestIndex::from_package_roots([
+            package.package_root(ExtensionInstallScope::User)
+        ])
+        .map_err(|error| format!("{error:?}"))?;
+        expect_equal(
+            &user.user_theme_files(),
+            &vec![ExtensionThemeFile {
+                extension_id: String::from("example.themes"),
+                theme_id: String::from("night"),
+                package_root: package.path.clone(),
+                relative_path: String::from("themes/night.json"),
+                max_bytes: 16384,
+            }],
+        )?;
+        expect_equal(&user.host_start_count(), &0)
     }
 
     #[test]

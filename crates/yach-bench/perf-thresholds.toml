@@ -53,6 +53,11 @@ id = "*#alloc_bytes"
 count = 0
 
 [[workload]]
+id = "keypress/active_stream_on_history_headless/100#alloc_bytes"
+count = 96
+comment = "theming engine PR #308: measured 63365664 -> 63365760 (+96 bytes) against main 4a751250, after removing tool-body Vec growth, intermediate wrapping/surface vectors and owned one-space padding. Inferred net remainder: the state rule and separate title/summary roles retain extra styled spans in cached and visible tool rows; the rule also narrows wrapping by one column. Allocation count improves 41898 -> 40566 (-1332). Budgeted at the measured byte delta exactly."
+
+[[workload]]
 id = "turn/scripted/text_only#alloc_bytes"
 count = 1144
 comment = "session diagnostics (PR #283): measured 333406 -> 334550 (+1144 bytes) against main. Inferred, not isolated: each provider attempt now builds an AttemptLabel and a ProviderAttemptFinished event (owned session, turn, and model strings) and appends it directly to the store as one serialized line. Budgeted at the measured delta exactly, so any further growth fails. Earlier rows: intent-aware auto-review (PR #278) +1536; session approval grants +128."

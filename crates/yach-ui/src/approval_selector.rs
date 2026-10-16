@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use yach_proto::ApprovalMode;
@@ -22,9 +22,9 @@ impl Widget for ApprovalModeSelector<'_> {
         );
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(self.theme.colors.border))
+            .border_style(self.theme.border(false))
             .title(" Approval Mode ")
-            .style(Style::new().fg(self.theme.colors.accent));
+            .style(self.theme.accent());
         let lines = ApprovalMode::ALL
             .iter()
             .enumerate()
@@ -32,13 +32,11 @@ impl Widget for ApprovalModeSelector<'_> {
                 let selected = index == self.selected_index;
                 let current = *mode == self.current_mode;
                 let style = if selected {
-                    Style::new()
-                        .fg(self.theme.colors.selected_text)
-                        .add_modifier(Modifier::BOLD)
+                    self.theme.selected_label()
                 } else if current {
-                    Style::new().fg(self.theme.colors.success)
+                    self.theme.success()
                 } else {
-                    Style::new().fg(self.theme.colors.muted)
+                    self.theme.muted()
                 };
                 Line::from(Span::styled(
                     format!(
@@ -66,27 +64,21 @@ impl Widget for FullAccessConfirmation<'_> {
         let popup_area = centered_rect(area, 76, 12);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(self.theme.colors.error))
+            .border_style(self.theme.error())
             .title(" Full Access — Host Access ")
-            .title_style(
-                Style::new()
-                    .fg(self.theme.colors.error)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .title_style(self.theme.error().add_modifier(Modifier::BOLD));
         let enable_style = if self.enable_selected {
-            Style::new()
-                .fg(self.theme.colors.selected_text)
-                .bg(self.theme.colors.error)
+            self.theme
+                .selected_on(self.theme.error())
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(self.theme.colors.error)
+            self.theme.error()
         };
         let cancel_style = if self.enable_selected {
-            Style::new().fg(self.theme.colors.muted)
+            self.theme.muted()
         } else {
-            Style::new()
-                .fg(self.theme.colors.selected_text)
-                .bg(self.theme.colors.success)
+            self.theme
+                .selected_on(self.theme.success())
                 .add_modifier(Modifier::BOLD)
         };
         let lines = vec![
@@ -131,27 +123,21 @@ impl Widget for AutoReviewConfirmation<'_> {
         let popup_area = centered_rect(area, 76, 14);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(self.theme.colors.warning))
+            .border_style(self.theme.warning())
             .title(" Auto Review — Delegated Approval ")
-            .title_style(
-                Style::new()
-                    .fg(self.theme.colors.warning)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .title_style(self.theme.warning().add_modifier(Modifier::BOLD));
         let enable_style = if self.enable_selected {
-            Style::new()
-                .fg(self.theme.colors.selected_text)
-                .bg(self.theme.colors.warning)
+            self.theme
+                .selected_on(self.theme.warning())
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(self.theme.colors.warning)
+            self.theme.warning()
         };
         let cancel_style = if self.enable_selected {
-            Style::new().fg(self.theme.colors.muted)
+            self.theme.muted()
         } else {
-            Style::new()
-                .fg(self.theme.colors.selected_text)
-                .bg(self.theme.colors.success)
+            self.theme
+                .selected_on(self.theme.success())
                 .add_modifier(Modifier::BOLD)
         };
         let lines = vec![

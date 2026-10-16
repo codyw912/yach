@@ -57,26 +57,29 @@ struct MarkdownStyles {
 
 impl MarkdownStyles {
     fn from_theme(theme: &Theme) -> Self {
-        let colors = theme.colors;
+        let text = theme.text();
+        let muted = theme.muted();
+        let dim = theme.dim();
+        let accent = theme.accent();
+        let warning = theme.warning();
+        let code_bg = theme.tool_surface(crate::theme::ToolState::Pending);
         Self {
-            text: Style::new().fg(colors.text),
-            quote_text: Style::new().fg(colors.muted),
-            quote_bar: Style::new().fg(colors.dim),
-            heading_major: Style::new().fg(colors.accent).bold(),
-            heading_minor: Style::new().bold(),
-            strong: Style::new().bold(),
-            emphasis: Style::new().italic(),
-            strikethrough: Style::new().crossed_out(),
-            inline_code: Style::new().fg(colors.warning),
-            code_block: Style::new()
-                .fg(colors.text)
-                .bg(colors.tool_pending_background),
-            link: Style::new().fg(colors.accent).underlined(),
-            link_url: Style::new().fg(colors.dim),
-            list_marker: Style::new().fg(colors.accent),
-            rule: Style::new().fg(colors.dim),
-            table_separator: Style::new().fg(colors.dim),
-            table_header: Style::new().bold(),
+            text,
+            quote_text: muted,
+            quote_bar: dim,
+            heading_major: accent.add_modifier(ratatui::style::Modifier::BOLD),
+            heading_minor: Style::new().add_modifier(ratatui::style::Modifier::BOLD),
+            strong: Style::new().add_modifier(ratatui::style::Modifier::BOLD),
+            emphasis: Style::new().add_modifier(ratatui::style::Modifier::ITALIC),
+            strikethrough: Style::new().add_modifier(ratatui::style::Modifier::CROSSED_OUT),
+            inline_code: warning,
+            code_block: text.bg(code_bg.bg.unwrap_or(ratatui::style::Color::Reset)),
+            link: accent.add_modifier(ratatui::style::Modifier::UNDERLINED),
+            link_url: dim,
+            list_marker: accent,
+            rule: dim,
+            table_separator: dim,
+            table_header: Style::new().add_modifier(ratatui::style::Modifier::BOLD),
         }
     }
 
@@ -876,8 +879,8 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::CROSSED_OUT)
         );
-        assert_eq!(style_at(&lines, "code").fg, Some(theme.colors.warning));
-        assert_eq!(style_at(&lines, "plain").fg, Some(theme.colors.text));
+        assert_eq!(style_at(&lines, "code").fg, theme.warning().fg);
+        assert_eq!(style_at(&lines, "plain").fg, theme.text().fg);
         assert!(
             !style_at(&lines, "plain")
                 .add_modifier
@@ -902,7 +905,7 @@ mod tests {
             ["Title", "", "Small", "", "body"]
         );
         let title = style_at(&lines, "Title");
-        assert_eq!(title.fg, Some(theme.colors.accent));
+        assert_eq!(title.fg, theme.accent().fg);
         assert!(title.add_modifier.contains(Modifier::BOLD));
         assert!(
             style_at(&lines, "Small")
@@ -973,7 +976,7 @@ mod tests {
         assert_eq!(text[3].width(), 40);
         assert_eq!(
             lines[3].spans[0].style.bg,
-            Some(theme.colors.tool_pending_background)
+            theme.tool_surface(crate::theme::ToolState::Pending).bg
         );
     }
 
@@ -1075,8 +1078,8 @@ mod tests {
             lines.iter().map(text_of).collect::<Vec<_>>(),
             ["│ quoted", "│ words", "│ here", "│", "│ second"]
         );
-        assert_eq!(lines[0].spans[0].style.fg, Some(theme.colors.dim));
-        assert_eq!(style_at(&lines, "quoted").fg, Some(theme.colors.muted));
+        assert_eq!(lines[0].spans[0].style.fg, theme.dim().fg);
+        assert_eq!(style_at(&lines, "quoted").fg, theme.muted().fg);
     }
 
     #[test]
@@ -1092,12 +1095,9 @@ mod tests {
             "docs (https://x.dev) and https://y.dev and https://z.dev"
         );
         let label = style_at(&lines, "docs");
-        assert_eq!(label.fg, Some(theme.colors.accent));
+        assert_eq!(label.fg, theme.accent().fg);
         assert!(label.add_modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(
-            style_at(&lines, " (https://x.dev)").fg,
-            Some(theme.colors.dim)
-        );
+        assert_eq!(style_at(&lines, " (https://x.dev)").fg, theme.dim().fg);
     }
 
     #[test]
@@ -1221,8 +1221,12 @@ mod tests {
 
     #[test]
     fn colors_come_from_the_theme() {
-        let mut theme = Theme::default();
-        theme.colors.accent = Color::Rgb(1, 2, 3);
+        let document = crate::theme::ThemeDocument::parse(r##"{"colors":{"accent":"#010203"}}"##);
+        assert!(document.is_ok());
+        let Ok(document) = document else { return };
+        let theme = document.apply(Theme::dark());
+        assert!(theme.is_ok());
+        let Ok(theme) = theme else { return };
         let lines = render("# Head", 20, &theme);
         assert_eq!(style_at(&lines, "Head").fg, Some(Color::Rgb(1, 2, 3)));
     }

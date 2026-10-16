@@ -2650,7 +2650,10 @@ async fn run_native_loop_with_requester_factory<MakeRequester, Requester>(
                 let selected_path = PathBuf::from(&selected_session_path);
                 if !session_path_is_selectable(&selected_path, &session_path) {
                     let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                        message: format!("unknown session path {selected_session_path}"),
+                        message: format!(
+                            "{}{selected_session_path}",
+                            yach_proto::UNKNOWN_SESSION_PATH_PREFIX
+                        ),
                     }));
                     continue;
                 }
@@ -3063,7 +3066,11 @@ async fn switch_native_session(
     } = state;
     let Some(selected_session_id) = session_id_from_log_path(&selected_path) else {
         let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-            message: format!("unknown session path {}", selected_path.display()),
+            message: format!(
+                "{}{}",
+                yach_proto::UNKNOWN_SESSION_PATH_PREFIX,
+                selected_path.display()
+            ),
         }));
         return false;
     };
@@ -3073,13 +3080,13 @@ async fn switch_native_session(
         Ok(Ok(load)) => session_state_from_load_result(tx, Ok(load)),
         Ok(Err(error)) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: format!("failed to load session log: {error}"),
+                message: format!("{} {error}", yach_proto::SESSION_LOAD_FAILED_PREFIX),
             }));
             return false;
         }
         Err(error) => {
             let _ = tx.send(BackendEvent::Server(ServerEvent::StatusUpdated {
-                message: format!("failed to load session log: {error}"),
+                message: format!("{} {error}", yach_proto::SESSION_LOAD_FAILED_PREFIX),
             }));
             return false;
         }
@@ -25809,6 +25816,32 @@ manual anchored summary"
             }))
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_load_failure_status_uses_shared_ui_prefix() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        super::session_state_from_load_result(
+            &tx,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            )),
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(BackendEvent::Server(ServerEvent::StatusUpdated {
+                message: format!("{} denied", yach_proto::SESSION_LOAD_FAILED_PREFIX),
+            }))
+        );
+        assert_eq!(
+            yach_proto::SESSION_LOAD_FAILED_PREFIX,
+            "failed to load session log:"
+        );
+        assert_eq!(
+            yach_proto::UNKNOWN_SESSION_PATH_PREFIX,
+            "unknown session path "
+        );
     }
 
     #[test]

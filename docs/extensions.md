@@ -57,6 +57,45 @@ deletes its install record and remembers the id in `[bundled] removed` in
 restores it (`--reset` reinstalls only the bundled components that preset
 includes); see [presets.md](presets.md).
 
+## Contributing themes
+
+An enabled **user-scope** extension can contribute JSON themes without starting
+its host process or requesting a capability grant:
+
+```json
+"contributes": {
+  "themes": [{
+    "id": "night",
+    "title": "Night",
+    "source": { "type": "extension_file", "path": "themes/night.json" },
+    "max_bytes": 16384
+  }]
+}
+```
+
+Theme ids contain lowercase ASCII letters, digits, and hyphens, starting with
+a letter or digit. `dark`, `light`, `system`, and `auto` are reserved. The path
+must be relative, with no `..` components; symlinks must resolve inside the
+package root. `max_bytes` must be positive and limits how much theme data is
+read. The file uses the user theme JSON schema: `base`, `vars`, `colors`, and
+`spacing` (see [TUI appearance in the README](../README.md#tui-appearance)). Its
+`base`, when present, must name a built-in preset or bundled palette, not another
+extension theme.
+
+Installing a theme does not select it. Extension themes are selected **only
+through a theme file's `base`**. Set it in `~/.yach/theme.json` (or in a file
+selected by `YACH_THEME`) to `<extension-id>:<theme-id>`, for example
+`{"base":"example.themes:night"}`. Setting `YACH_THEME=example.themes:night`
+directly does not select the extension theme: bare names select built-in themes
+only. Project-scope themes are never offered, and project install records and
+manifests cannot affect user theme resolution. Built-in selections do not read
+extension install records.
+
+If the extension is disabled or removed, or its theme is missing, oversized,
+non-regular, outside the package root, or invalid, startup reports one notice naming the
+theme and uses the user file's overrides over `auto`. The selection remains
+unchanged, so re-enabling the extension restores it on the next startup.
+
 ## Activation without a grant
 
 If the derived set includes `uses_network` or `runs_process` and no covering

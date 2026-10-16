@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -29,13 +29,9 @@ impl Widget for SlashPopup<'_> {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(self.theme.colors.border))
+            .border_style(self.theme.border(false))
             .title("Commands · Tab accepts")
-            .title_style(
-                Style::new()
-                    .fg(self.theme.colors.accent)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .title_style(self.theme.accent().add_modifier(Modifier::BOLD));
 
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
@@ -47,27 +43,21 @@ impl Widget for SlashPopup<'_> {
             .map(|(i, cmd)| {
                 let is_selected = i == self.selected;
                 let style = if is_selected {
-                    Style::new()
-                        .fg(self.theme.colors.selected_text)
-                        .add_modifier(Modifier::BOLD)
+                    self.theme.selected_label()
                 } else {
-                    Style::new().fg(self.theme.colors.muted)
+                    self.theme.muted()
                 };
                 let prefix = if is_selected { "▸ " } else { "  " };
                 Line::from(vec![
                     Span::styled(prefix, style),
-                    Span::styled(cmd.name, Style::new().fg(self.theme.colors.accent)),
-                    Span::styled(" - ", Style::new().fg(self.theme.colors.dim)),
+                    Span::styled(cmd.name, self.theme.accent()),
+                    Span::styled(" - ", self.theme.dim()),
                     Span::styled(cmd.description, style),
                 ])
             })
             .collect();
 
-        Widget::render(
-            Paragraph::new(lines).style(Style::new().fg(self.theme.colors.text)),
-            inner,
-            buf,
-        );
+        Widget::render(Paragraph::new(lines).style(self.theme.text()), inner, buf);
     }
 }
 

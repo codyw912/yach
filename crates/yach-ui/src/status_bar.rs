@@ -222,29 +222,29 @@ fn segment_style(
     approval_mode: &str,
     theme: &Theme,
 ) -> Style {
-    let colors = theme.colors;
     match id {
-        SegmentId::Connection => Style::new().fg(if is_connected {
-            colors.success
-        } else {
-            colors.error
-        }),
-        SegmentId::Model | SegmentId::Reviewer => Style::new().fg(colors.accent),
-        SegmentId::Approval => Style::new().fg(if approval_mode == "full-access" {
-            colors.error
-        } else {
-            colors.warning
-        }),
-        SegmentId::Context => {
-            let color = match context_used_percent.unwrap_or_default().min(100) {
-                0..=69 => colors.dim,
-                70..=89 => colors.warning,
-                _ => colors.error,
-            };
-            Style::new().fg(color)
+        SegmentId::Connection => {
+            if is_connected {
+                theme.success()
+            } else {
+                theme.error()
+            }
         }
-        SegmentId::Compaction => Style::new().fg(colors.harness),
-        SegmentId::Tokens | SegmentId::Status => Style::new().fg(colors.muted),
+        SegmentId::Model | SegmentId::Reviewer => theme.accent(),
+        SegmentId::Approval => {
+            if approval_mode == "full-access" {
+                theme.error()
+            } else {
+                theme.warning()
+            }
+        }
+        SegmentId::Context => match context_used_percent.unwrap_or_default().min(100) {
+            0..=69 => theme.dim(),
+            70..=89 => theme.warning(),
+            _ => theme.error(),
+        },
+        SegmentId::Compaction => theme.harness(),
+        SegmentId::Tokens | SegmentId::Status => theme.muted(),
     }
 }
 
@@ -426,7 +426,7 @@ mod tests {
     fn full_access_approval_segment_uses_danger_color() {
         let theme = Theme::default();
         let style = segment_style(SegmentId::Approval, true, None, "full-access", &theme);
-        assert_eq!(style.fg, Some(theme.colors.error));
+        assert_eq!(style.fg, theme.error().fg);
     }
 
     #[test]

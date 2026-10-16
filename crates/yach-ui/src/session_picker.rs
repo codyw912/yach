@@ -21,13 +21,9 @@ impl Widget for SessionPicker<'_> {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::new().fg(self.theme.colors.border))
+            .border_style(self.theme.border(false))
             .title("Select Session")
-            .title_style(
-                Style::new()
-                    .fg(self.theme.colors.accent)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .title_style(self.theme.accent().add_modifier(Modifier::BOLD));
 
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
@@ -43,13 +39,11 @@ impl Widget for SessionPicker<'_> {
                 let prefix = if is_selected { "▸ " } else { "  " };
                 let suffix = if is_current { " (current)" } else { "" };
                 let style = if is_selected {
-                    Style::new()
-                        .fg(self.theme.colors.selected_text)
-                        .add_modifier(Modifier::BOLD)
+                    self.theme.selected_label()
                 } else if is_current {
-                    Style::new().fg(self.theme.colors.warning)
+                    self.theme.warning()
                 } else {
-                    Style::new().fg(self.theme.colors.muted)
+                    self.theme.muted()
                 };
                 Line::from(vec![
                     Span::styled(prefix, style),
@@ -62,14 +56,11 @@ impl Widget for SessionPicker<'_> {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::new()),
-                Span::styled(
-                    "Ctrl+F to fork current session",
-                    Style::new().fg(self.theme.colors.dim),
-                ),
+                Span::styled("Ctrl+F to fork current session", self.theme.dim()),
             ]));
         }
 
-        let paragraph = Paragraph::new(lines).style(Style::new().fg(self.theme.colors.text));
+        let paragraph = Paragraph::new(lines).style(self.theme.text());
         Widget::render(paragraph, inner, buf);
     }
 }
