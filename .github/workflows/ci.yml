@@ -183,7 +183,8 @@ jobs:
       # error/regressed fails the job. Exit 2 (inconclusive) is recorded and
       # does not: on a shared runner a within-budget delta with a wide base
       # spread is noise, not a regression. A missing document is a harness
-      # failure, not a verdict.
+      # failure, not a verdict. Exit codes are ranked by severity, not by
+      # value: one row's inconclusive 2 must not hide another row's 1.
       - name: Compare
         id: compare
         if: steps.base.outputs.available == 'true'
@@ -196,6 +197,14 @@ jobs:
             startup/backend_ready_to_first_interactive_headless
           )
           worst=0
+          severity() {
+            case "$1" in
+              0) echo 0 ;;
+              2) echo 1 ;;
+              1) echo 2 ;;
+              *) echo 3 ;;
+            esac
+          }
           for row in "${rows[@]}"; do
             slug="${row//\//_}"
             ./target/release-root/release/yach-bench perf ab \
@@ -210,7 +219,7 @@ jobs:
               echo "no document for $row" >&2
               exit 1
             fi
-            if [[ "$rc" -gt "$worst" ]]; then
+            if (( $(severity "$rc") > $(severity "$worst") )); then
               worst=$rc
             fi
           done
