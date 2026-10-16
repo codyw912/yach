@@ -93,7 +93,7 @@ The measurement harness is `yach-bench perf`. Every former `*-report` command is
 just dev cargo run -p yach-bench --release -- perf run --list
 ```
 
-Each line is `id | class | isolation | requires`. In-process serial latency workloads also emit derived `#alloc_count` and `#alloc_bytes` rows (class `count`), marked `derived`. Filters, thresholds, `--deterministic`, and CI treat those like any other `count` workload.
+Each line is `id | class | isolation | requires`. In-process serial latency workloads also emit derived `#alloc_count` and `#alloc_bytes` rows (class `count`), marked `derived`. Filters, thresholds, `--deterministic`, and CI treat those like any other `count` workload. Their values are always one sample's allocations: a latency run with `--samples N` takes them from a separate one-sample measurement, so a `count` budget means the same thing in `Perf (deterministic)` and `Perf (latency)`.
 
 `cargo bench` remains the Criterion path for exploratory microbenchmarks and is not part of the gate.
 
