@@ -18,6 +18,11 @@ is unaffected.
 ## Version Control workflow
 
 - After opening a PR, make sure you include the full PR URL in your reply.
+- A PR that changes what the TUI shows must include before/after screenshots:
+  run `just tui-themes before` on the base and `just tui-themes after` on the
+  change, then embed the affected grids in the PR description (see "TUI design
+  review" in `README.md`). Host the images on the `pr-screenshots` branch,
+  linked by commit ID, not in the change itself.
 
 This repo uses Jujutsu (`jj`) for local development.
 
