@@ -201,13 +201,20 @@ fn tool_output_summary(
     metadata: Option<&ToolResultMetadata>,
     outcome_kind: Option<HarnessOutcomeKind>,
 ) -> String {
+    // The row title already labels harness outcomes. Lead with the reason,
+    // not model-facing line/byte bookkeeping, and retain the complete output
+    // so the collapsed preview can deduplicate it without losing guidance.
+    if outcome_kind.is_some() {
+        return if output.is_empty() {
+            String::from("no output")
+        } else {
+            output.trim_end_matches('\n').to_owned()
+        };
+    }
     if metadata.is_none() && is_tool_display_output(output) {
         return output.to_string();
     }
-    let status = outcome_kind.map_or_else(
-        || if is_error { "failed" } else { "completed" },
-        HarnessOutcomeKind::label,
-    );
+    let status = if is_error { "failed" } else { "completed" };
     if output.is_empty() {
         return format!("{status} with no output");
     }
@@ -9737,8 +9744,23 @@ mod tests {
                 Some(&metadata),
                 Some(HarnessOutcomeKind::Denied),
             ),
-            "denied: 1 line, 2048 bytes, truncated; permission denied"
+            "permission denied"
         );
+    }
+
+    #[test]
+    fn harness_summary_is_the_reason_without_size_or_repeated_outcome() {
+        let reason = "malformed hashline patch: every PUT body row must begin with '+'";
+        for kind in [
+            HarnessOutcomeKind::Blocked,
+            HarnessOutcomeKind::Denied,
+            HarnessOutcomeKind::Cancelled,
+            HarnessOutcomeKind::Limit,
+            HarnessOutcomeKind::Failed,
+        ] {
+            assert_eq!(tool_output_summary(reason, true, None, Some(kind)), reason);
+            assert_eq!(tool_output_summary("", true, None, Some(kind)), "no output");
+        }
     }
 
     #[test]

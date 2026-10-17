@@ -871,14 +871,20 @@ fn collapsed_tool_output(
     let omitted = line_count - max_lines;
     if is_command {
         let tail = detail.lines().skip(omitted).collect::<Vec<_>>().join("\n");
-        Some((format!("… {omitted} earlier lines\n{tail}"), Some(0)))
+        Some((
+            format!("… {omitted} earlier lines · ctrl+o expand\n{tail}"),
+            Some(0),
+        ))
     } else {
         let head = detail
             .lines()
             .take(max_lines)
             .collect::<Vec<_>>()
             .join("\n");
-        Some((format!("{head}\n… {omitted} more lines"), Some(max_lines)))
+        Some((
+            format!("{head}\n… {omitted} more lines · ctrl+o expand"),
+            Some(max_lines),
+        ))
     }
 }
 
@@ -1315,7 +1321,12 @@ fn render_tool_entry_lines(
             outcome_kind: Some(kind),
             ..
         } => {
-            let (label, style) = harness_outcome_style(*kind, theme);
+            let label = kind.label();
+            let style = if *kind == HarnessOutcomeKind::Failed {
+                theme.error().add_modifier(Modifier::BOLD)
+            } else {
+                theme.harness().add_modifier(Modifier::BOLD)
+            };
             (
                 Span::styled("! ", style),
                 std::borrow::Cow::Owned(format!("{label} {name}")),
@@ -1332,7 +1343,24 @@ fn render_tool_entry_lines(
         _ => unreachable!(),
     };
     let (display_text, omission_line) = entry_display_text_with_omission(entry);
-    let content = name_and_detail(&title, &display_text);
+    let harness = matches!(
+        entry.kind,
+        EntryKind::ToolResult {
+            outcome_kind: Some(_),
+            ..
+        }
+    );
+    let content = if harness && !display_text.is_empty() {
+        format!("{title}\n{display_text}")
+    } else {
+        name_and_detail(&title, &display_text)
+    };
+    let omission_line = omission_line.map(|line| line + usize::from(harness));
+    let title_style = if state == crate::theme::ToolState::Success {
+        theme.tool_title()
+    } else {
+        theme.tool_title().add_modifier(Modifier::BOLD)
+    };
     let width_usize = usize::from(width.max(1));
     let available_width = width_usize
         .saturating_sub(TOOL_RULE_WIDTH)
@@ -1367,22 +1395,20 @@ fn render_tool_entry_lines(
             Span::raw("  ")
         });
         title_remaining -= title_len;
-        let default =
-            if (source_index == 0 && !entry.expanded) || omission_line == Some(source_index) {
-                theme.muted()
-            } else {
-                theme.tool_output(state)
-            };
+        let default = if (source_index == 0 && !entry.expanded && !harness)
+            || omission_line == Some(source_index)
+        {
+            theme.muted()
+        } else {
+            theme.tool_output(state)
+        };
         let style = transcript_line_style(entry, line, default, theme);
         if title_len == 0 {
             spans.push(Span::styled(line.to_owned(), style));
         } else if title_len == line.len() {
-            spans.push(Span::styled(line.to_owned(), theme.tool_title()));
+            spans.push(Span::styled(line.to_owned(), title_style));
         } else {
-            spans.push(Span::styled(
-                line[..title_len].to_owned(),
-                theme.tool_title(),
-            ));
+            spans.push(Span::styled(line[..title_len].to_owned(), title_style));
             spans.push(Span::styled(line[title_len..].to_owned(), style));
         }
         result.push(Line::from(spans));
@@ -1488,6 +1514,10 @@ fn render_tool_surface(
 
 fn tool_state(entry: &TranscriptEntry) -> crate::theme::ToolState {
     match entry.kind {
+        EntryKind::ToolResult {
+            outcome_kind: Some(HarnessOutcomeKind::Failed),
+            ..
+        } => crate::theme::ToolState::Error,
         EntryKind::ToolResult {
             outcome_kind: Some(_),
             ..
@@ -1652,17 +1682,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_panel_draws_one_rule_on_every_row_including_padding() {
+    fn tool_panel_draws_one_rule_on_every_content_row_without_padding() {
         let mut transcript = Transcript::new();
         transcript.append_tool_call(Some("call-1"), "bash", Some("cargo test"));
         transcript.append_tool_call_output("call-1", "line one\nline two\n");
         let lines = render_lines_with_theme(transcript.entries(), 40, &Theme::dark());
-        assert_eq!(lines.len(), 5);
-        assert_eq!(
-            panel_rows(&lines).len(),
-            5,
-            "every panel row must carry a rule, including padding"
-        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(panel_rows(&lines).len(), 3, "no internal panel padding");
         let text: Vec<_> = lines
             .iter()
             .map(|line| {
@@ -1675,13 +1701,7 @@ mod tests {
             .collect();
         assert_eq!(
             text,
-            [
-                "┃",
-                "┃ ⚙ bash cargo test",
-                "┃   line one",
-                "┃   line two",
-                "┃"
-            ]
+            ["┃ ⚙ bash cargo test", "┃   line one", "┃   line two",]
         );
     }
 
@@ -1694,13 +1714,13 @@ mod tests {
             (
                 false,
                 Some(HarnessOutcomeKind::Denied),
-                "! denied read completed",
+                "! denied read",
                 ToolState::Harness,
             ),
             (
                 true,
                 Some(HarnessOutcomeKind::Denied),
-                "! denied read completed",
+                "! denied read",
                 ToolState::Harness,
             ),
         ] {
@@ -1713,9 +1733,10 @@ mod tests {
                 outcome_kind,
             );
             let lines = render_lines_with_theme(transcript.entries(), 40, &theme);
-            assert_eq!(lines.len(), 3);
-            assert_eq!(panel_rows(&lines).len(), 3);
-            assert_eq!(lines[1].to_string().trim_end(), format!("┃ {marker}"));
+            let expected_rows = if outcome_kind.is_some() { 2 } else { 1 };
+            assert_eq!(lines.len(), expected_rows);
+            assert_eq!(panel_rows(&lines).len(), expected_rows);
+            assert_eq!(lines[0].to_string().trim_end(), format!("┃ {marker}"));
             for line in &lines {
                 assert_eq!(line.width(), 40);
                 assert_eq!(line.spans[0].style, theme.tool_rule(state));
@@ -1729,7 +1750,7 @@ mod tests {
         let mut pending = Transcript::new();
         pending.append_tool_call(None, "read", Some("src/lib.rs"));
         let lines = render_lines_with_theme(pending.entries(), 40, &theme);
-        assert_eq!(lines[1].to_string().trim_end(), "┃ ⚙ read src/lib.rs");
+        assert_eq!(lines[0].to_string().trim_end(), "┃ ⚙ read src/lib.rs");
         assert!(
             lines
                 .iter()
@@ -1754,6 +1775,153 @@ mod tests {
             let Some(span) = span else { return };
             assert_eq!(span.style.fg, style.fg, "{text}");
             assert_eq!(span.style.add_modifier, style.add_modifier, "{text}");
+        }
+    }
+
+    #[test]
+    fn compact_tool_panels_have_exactly_one_blank_gap_in_every_preset() {
+        for theme in [
+            Theme::dark(),
+            Theme::light(),
+            Theme::system(),
+            Theme::monochrome(),
+        ] {
+            let mut transcript = Transcript::new();
+            transcript.append_tool_result(None, "read", "first", false);
+            transcript.append_tool_result(None, "read", "second", false);
+            let lines = render_lines_with_theme(transcript.entries(), 80, &theme);
+            assert_eq!(lines.len(), 3);
+            assert!(lines[0].to_string().contains("first"));
+            assert!(lines[1].to_string().trim().is_empty());
+            assert!(lines[2].to_string().contains("second"));
+        }
+    }
+
+    #[test]
+    fn tool_title_weight_follows_state_including_mono() {
+        use ratatui::style::Modifier;
+        for theme in [Theme::dark(), Theme::monochrome()] {
+            let mut transcript = Transcript::new();
+            transcript.append_tool_call(None, "pending", None);
+            transcript.append_tool_result(None, "success", "", false);
+            transcript.append_tool_result(None, "error", "", true);
+            transcript.append_tool_result_with_kind(
+                None,
+                "harness",
+                "",
+                true,
+                Some(HarnessOutcomeKind::Blocked),
+            );
+            let lines = render_lines_with_theme(transcript.entries(), 80, &theme);
+            for (title, bold) in [
+                ("pending", true),
+                ("success", false),
+                ("error", true),
+                ("blocked harness", true),
+            ] {
+                let span = lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .find(|span| span.content == title);
+                assert!(span.is_some(), "missing title {title}");
+                let Some(span) = span else { return };
+                assert_eq!(
+                    span.style.add_modifier.contains(Modifier::BOLD),
+                    bold,
+                    "{title}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn harness_rows_show_reason_below_title_on_the_correct_surface() {
+        let theme = Theme::dark();
+        let reason = "malformed hashline patch: every PUT body row must begin with '+'";
+        for kind in [
+            HarnessOutcomeKind::Blocked,
+            HarnessOutcomeKind::Denied,
+            HarnessOutcomeKind::Cancelled,
+            HarnessOutcomeKind::Limit,
+            HarnessOutcomeKind::Failed,
+        ] {
+            let mut transcript = Transcript::new();
+            transcript.append_tool_result_record(
+                None,
+                "edit_text_file src/lib.rs",
+                reason,
+                reason,
+                true,
+                Some(kind),
+                None,
+            );
+            let lines = render_lines_with_theme(transcript.entries(), 120, &theme);
+            assert_eq!(lines.len(), 2);
+            assert_eq!(
+                lines[0].to_string().trim_end(),
+                format!("┃ ! {} edit_text_file src/lib.rs", kind.label())
+            );
+            assert_eq!(lines[1].to_string().trim_end(), format!("┃   {reason}"));
+            let state = if kind == HarnessOutcomeKind::Failed {
+                ToolState::Error
+            } else {
+                ToolState::Pending
+            };
+            let rule_state = if kind == HarnessOutcomeKind::Failed {
+                ToolState::Error
+            } else {
+                ToolState::Harness
+            };
+            for line in &lines {
+                assert_eq!(line.spans[0].style, theme.tool_rule(rule_state));
+                assert!(
+                    line.spans[1..]
+                        .iter()
+                        .all(|span| span.style.bg == theme.tool_surface(state).bg)
+                );
+            }
+            let marker = lines[0].spans.iter().find(|span| span.content == "! ");
+            assert!(marker.is_some(), "missing marker");
+            let Some(marker) = marker else { return };
+            assert_eq!(
+                marker.style.fg,
+                if kind == HarnessOutcomeKind::Failed {
+                    theme.error().fg
+                } else {
+                    theme.harness().fg
+                }
+            );
+            let body = lines[1].spans.iter().find(|span| span.content == reason);
+            assert!(body.is_some(), "missing reason");
+            let Some(body) = body else { return };
+            assert_eq!(body.style.fg, theme.tool_output(state).fg);
+        }
+    }
+
+    #[test]
+    fn user_and_assistant_text_align_while_tool_panels_stay_inset() {
+        for theme in [Theme::dark(), Theme::monochrome()] {
+            let mut transcript = Transcript::new();
+            transcript.append_user_message("user text");
+            transcript.append_assistant_message("assistant text");
+            transcript.append_tool_result(None, "tool title", "body", false);
+            let lines = render_lines_with_theme(transcript.entries(), 80, &theme);
+            for (text, column) in [("user text", 2), ("assistant text", 2), ("tool title", 4)] {
+                let line = lines
+                    .iter()
+                    .map(ToString::to_string)
+                    .find(|line| line.contains(text));
+                assert!(line.is_some(), "missing text row {text}");
+                let Some(line) = line else { return };
+                let start = line.find(text);
+                assert!(start.is_some(), "missing text {text}");
+                let Some(start) = start else { return };
+                assert_eq!(
+                    unicode_width::UnicodeWidthStr::width(&line[..start]),
+                    column,
+                    "{text}"
+                );
+            }
         }
     }
 
@@ -1800,8 +1968,8 @@ mod tests {
         );
         transcript.append_tool_call_output("call-1", "0123456789abcdefghijkl");
         let lines = render_lines_with_theme(transcript.entries(), 20, &Theme::dark());
-        assert_eq!(lines.len(), 7);
-        assert_eq!(panel_rows(&lines).len(), 7);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(panel_rows(&lines).len(), 5);
         for line in &lines {
             assert_eq!(line.width(), 20);
         }
@@ -1812,13 +1980,11 @@ mod tests {
         assert_eq!(
             text,
             [
-                "┃",
                 "┃ ⚙ read_text_file ",
                 "┃   abcdefghijklmno",
                 "┃   pqrstuv",
                 "┃   0123456789abcde",
                 "┃   fghijkl",
-                "┃"
             ]
             .map(|line| line.trim_end().to_owned())
         );
@@ -1829,7 +1995,7 @@ mod tests {
         let mut transcript = Transcript::new();
         transcript.append_tool_call(None, "read", Some("界界界abc界界"));
         let lines = render_lines_with_theme(transcript.entries(), 12, &Theme::dark());
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 3);
         for line in &lines {
             assert_eq!(line.width(), 12);
             assert_eq!(line.spans[0].content, "┃");
@@ -1840,7 +2006,7 @@ mod tests {
                 .iter()
                 .map(|line| line.to_string().trim_end().to_owned())
                 .collect::<Vec<_>>(),
-            ["┃", "┃ ⚙ read 界", "┃   界界abc", "┃   界界", "┃"]
+            ["┃ ⚙ read 界", "┃   界界abc", "┃   界界"]
         );
     }
 
@@ -2523,7 +2689,10 @@ mod tests {
         assert!(read.contains("… 2 more lines"));
         let theme = Theme::dark();
         let lines = render_lines_with_theme(transcript.entries(), 80, &theme);
-        for marker in ["… 3 earlier lines", "… 2 more lines"] {
+        for marker in [
+            "… 3 earlier lines · ctrl+o expand",
+            "… 2 more lines · ctrl+o expand",
+        ] {
             let span = lines
                 .iter()
                 .flat_map(|line| &line.spans)
@@ -2603,7 +2772,7 @@ mod tests {
 
         let lines = render_lines(transcript.entries(), 80);
         let theme = Theme::default();
-        assert_eq!(lines.len(), 9);
+        assert_eq!(lines.len(), 7);
         assert!(
             lines[0]
                 .spans
@@ -2713,21 +2882,16 @@ mod tests {
 
         let lines = render_lines(transcript.entries(), 80);
         let background = Theme::dark().tool_surface(ToolState::Success).bg;
-        assert_eq!(lines.len(), 11);
+        assert_eq!(lines.len(), 7);
         assert!(lines[3].spans.is_empty());
-        assert!(lines[7].spans.is_empty());
-        for line in lines[4..=6].iter().chain(&lines[8..=10]) {
+        assert!(lines[5].spans.is_empty());
+        for line in [&lines[4], &lines[6]] {
             assert_eq!(
                 line.spans[0].style,
                 Theme::dark().tool_rule(ToolState::Success)
             );
         }
-        assert!(lines[4..=6].iter().all(|line| {
-            line.spans[1..]
-                .iter()
-                .all(|span| span.style.bg == background)
-        }));
-        assert!(lines[8..=10].iter().all(|line| {
+        assert!([&lines[4], &lines[6]].iter().all(|line| {
             line.spans[1..]
                 .iter()
                 .all(|span| span.style.bg == background)
