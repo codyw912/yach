@@ -250,7 +250,7 @@ impl Theme {
 
     #[must_use]
     pub fn tool_title(&self) -> Style {
-        Self::foreground(self.colors.tool_title, Modifier::BOLD)
+        Self::foreground(self.colors.tool_title, Modifier::empty())
     }
 
     #[must_use]
@@ -278,9 +278,9 @@ impl Theme {
 
     fn tool_background(&self, state: ToolState) -> Color {
         match state {
-            ToolState::Pending => self.colors.tool_pending_background,
+            ToolState::Pending | ToolState::Harness => self.colors.tool_pending_background,
             ToolState::Success => self.colors.tool_success_background,
-            ToolState::Error | ToolState::Harness => self.colors.tool_error_background,
+            ToolState::Error => self.colors.tool_error_background,
         }
     }
 
@@ -659,10 +659,10 @@ mod tests {
         assert_eq!(theme.colors.diff_context, Color::Rgb(128, 128, 128));
         assert_eq!(theme.colors.diff_hunk, Color::Rgb(0, 215, 255));
         assert_eq!(theme.colors.harness, Color::Rgb(178, 148, 187));
-        assert_eq!(theme.spacing.user_message_horizontal_padding, 1);
+        assert_eq!(theme.spacing.user_message_horizontal_padding, 0);
         assert_eq!(theme.spacing.user_message_vertical_padding, 1);
         assert_eq!(theme.spacing.tool_horizontal_padding, 1);
-        assert_eq!(theme.spacing.tool_vertical_padding, 1);
+        assert_eq!(theme.spacing.tool_vertical_padding, 0);
         assert_eq!(theme.spacing.tool_gap, 1);
 
         assert_eq!(
@@ -957,7 +957,7 @@ mod tests {
         assert!(theme.muted().add_modifier.contains(Modifier::DIM));
         assert!(theme.dim().add_modifier.contains(Modifier::DIM));
         assert!(theme.accent().add_modifier.contains(Modifier::BOLD));
-        assert!(theme.tool_title().add_modifier.contains(Modifier::BOLD));
+        assert!(!theme.tool_title().add_modifier.contains(Modifier::BOLD));
         assert!(theme.error().add_modifier.contains(Modifier::BOLD));
         assert!(theme.selected().add_modifier.contains(Modifier::REVERSED));
         assert!(is_reset(bg(theme.selected())));
@@ -1028,7 +1028,7 @@ mod tests {
         );
         assert_eq!(
             bg(theme.tool_surface(ToolState::Harness)),
-            theme.colors.tool_error_background
+            theme.colors.tool_pending_background
         );
         assert_eq!(
             fg(theme.tool_surface(ToolState::Pending)),
@@ -1046,7 +1046,7 @@ mod tests {
             theme.colors.harness
         );
 
-        assert!(theme.tool_title().add_modifier.contains(Modifier::BOLD));
+        assert!(!theme.tool_title().add_modifier.contains(Modifier::BOLD));
         assert_eq!(fg(theme.tool_title()), theme.colors.tool_title);
         assert_eq!(
             fg(theme.tool_output(ToolState::Success)),

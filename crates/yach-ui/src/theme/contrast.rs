@@ -38,6 +38,7 @@ pub(crate) fn assert_preset_contrast(theme: &Theme, page: Option<Color>) {
         ("tool_pending", theme.tool_surface(ToolState::Pending)),
         ("tool_success", theme.tool_surface(ToolState::Success)),
         ("tool_error", theme.tool_surface(ToolState::Error)),
+        ("tool_harness", theme.tool_surface(ToolState::Harness)),
     ] {
         let foreground = surface.fg.unwrap_or(Color::Reset);
         let background = surface.bg.unwrap_or(Color::Reset);

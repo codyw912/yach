@@ -10197,6 +10197,20 @@ pub(crate) fn harness_outcome_kind(
             Some("user_rejected" | "permission_denied" | "sensitive_path_denied") => {
                 HarnessOutcomeKind::Denied
             }
+            // The request itself is malformed: its shape is wrong regardless of
+            // the file's contents. Errors where the edit does not match the
+            // current file (stale or unknown snapshot, hunk not found, hash
+            // mismatch, no-op) stay Failed: the model must re-read and retry.
+            Some(
+                "invalid_request"
+                | "malformed_patch"
+                | "empty_transaction"
+                | "too_many_operations"
+                | "transaction_too_large"
+                | "duplicate_target"
+                | "empty_hunks"
+                | "empty_find",
+            ) => HarnessOutcomeKind::Blocked,
             _ => HarnessOutcomeKind::Failed,
         }),
         ToolOutcome::Denied => Some(HarnessOutcomeKind::Denied),
@@ -36685,5 +36699,54 @@ manual anchored summary"
             }
         )));
         assert!(loaded.next_turn_index() > 9);
+    }
+    #[test]
+    fn harness_outcome_classifies_malformed_requests_as_blocked_and_mismatches_as_failed() {
+        for reason in [
+            "invalid_request",
+            "malformed_patch",
+            "empty_transaction",
+            "too_many_operations",
+            "transaction_too_large",
+            "duplicate_target",
+            "empty_hunks",
+            "empty_find",
+        ] {
+            assert_eq!(
+                super::harness_outcome_kind(crate::ToolOutcome::Failed, Some(reason)),
+                Some(yach_proto::HarnessOutcomeKind::Blocked),
+                "{reason}"
+            );
+        }
+        for reason in [
+            "unknown_snapshot",
+            "ambiguous_snapshot",
+            "snapshot_path_mismatch",
+            "snapshot_stale",
+            "invalid_line_range",
+            "no_op",
+            "hunk_not_found",
+            "hunk_ambiguous",
+            "target_missing",
+            "target_exists",
+            "io",
+            "hash_mismatch",
+            "malformed_resource_result",
+            "unknown_failure",
+        ] {
+            assert_eq!(
+                super::harness_outcome_kind(crate::ToolOutcome::Failed, Some(reason)),
+                Some(yach_proto::HarnessOutcomeKind::Failed),
+                "{reason}"
+            );
+        }
+        assert_eq!(
+            super::harness_outcome_kind(crate::ToolOutcome::Failed, Some("user_rejected")),
+            Some(yach_proto::HarnessOutcomeKind::Denied)
+        );
+        assert_eq!(
+            super::harness_outcome_kind(crate::ToolOutcome::Completed, Some("malformed_patch")),
+            None
+        );
     }
 }

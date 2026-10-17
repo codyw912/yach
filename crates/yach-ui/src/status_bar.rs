@@ -153,7 +153,7 @@ impl StatusBar<'_> {
         if let Some(total) = self.total_tokens {
             segments.push(Segment::new(
                 SegmentId::Tokens,
-                format!("Σ{}", format_token_capacity(total)),
+                format!("tok:{}", format_token_capacity(total)),
                 PRIORITY_TOKENS,
             ));
         }
@@ -487,6 +487,11 @@ mod tests {
                     context_window: Some((200_000, false)),
                     theme: &theme,
                 };
+                if width == 80 {
+                    assert!(bar.segments().iter().any(
+                        |segment| segment.id == SegmentId::Tokens && segment.text == "tok:554"
+                    ));
+                }
                 let fitted = fit_segments(bar.segments(), width);
                 assert!(
                     segment_width(&fitted) <= usize::from(width),
