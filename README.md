@@ -275,6 +275,13 @@ appearance. When the guess is wrong, set `YACH_THEME=light`,
 `YACH_THEME=dark`, or `YACH_THEME=system`. `system` paints no panel surfaces
 and uses the terminal's default text colors.
 
+Status messages use muted text for information, warning text when user action
+is needed, and error text for failures or invalid provider configuration. A
+connected backend with an error status uses a warning connection dot. On narrow
+panes, status text truncates before the approval indicator is removed. Approval
+outlasts context and every other non-model segment, keeping full-access visible
+whenever another non-model segment could fit. Model identity is retained longest.
+
 | Preset | Surfaces |
 | --- | --- |
 | `dark` | Painted dark panels; the fallback behind `auto` when detection says dark. |

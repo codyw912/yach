@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::input::{InputComposer, input_metrics};
-use crate::status_bar::StatusBar;
+use crate::status_bar::{StatusBar, StatusMessage};
 use crate::theme::Theme;
 use crate::transcript;
 use crate::transcript::{Transcript, TranscriptAlignment, TranscriptRenderCache};
@@ -20,7 +20,7 @@ pub struct RenderParams<'a> {
     pub thinking_level: &'a str,
     pub approval_mode: &'a str,
     pub reviewer_id: Option<&'a str>,
-    pub status_message: &'a str,
+    pub status_message: &'a StatusMessage,
     pub is_connected: bool,
     pub compaction_count: u64,
     pub total_tokens: Option<u64>,
@@ -95,6 +95,7 @@ mod tests {
     use ratatui_textarea::TextArea;
 
     use super::{RenderParams, render, transcript_viewport_size};
+    use crate::status_bar::StatusMessage;
     use crate::theme::Theme;
     use crate::transcript::{Transcript, TranscriptAlignment, TranscriptRenderCache};
 
@@ -120,7 +121,7 @@ mod tests {
                     thinking_level: "high",
                     approval_mode: "review",
                     reviewer_id: None,
-                    status_message: "ready",
+                    status_message: &StatusMessage::info("ready"),
                     is_connected: true,
                     compaction_count: 0,
                     total_tokens: None,

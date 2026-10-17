@@ -26,6 +26,7 @@ use crate::slash_commands::{
     SlashAction, SlashCommand, SlashParseResult, match_slash_commands, parse_slash_command,
     suggest_slash_command,
 };
+use crate::status_bar::{StatusMessage, StatusSeverity};
 use crate::theme::Theme;
 use crate::thinking_level::ThinkingLevel;
 use crate::transcript::{self, Transcript, TranscriptAlignment, TranscriptRenderCache};
@@ -35,6 +36,31 @@ pub struct RunTuiOptions {
     pub resume_session: bool,
     pub theme: Theme,
     pub startup_notices: Vec<String>,
+}
+
+fn backend_status_severity(message: &str) -> StatusSeverity {
+    // StatusUpdated carries only text, not ModelTargetResolutionReason. Match
+    // the backend's setup-error envelope or the exact failure-label boundary,
+    // never an arbitrary mention of configuration inside another notice.
+    if let Some(label) = message.strip_prefix("model selection required: ") {
+        // Follows ModelSelectionRequired; keep the severity that event set
+        // instead of downgrading it when the plain-text echo arrives.
+        return if label == "invalid_config" {
+            StatusSeverity::Error
+        } else {
+            StatusSeverity::Warning
+        };
+    }
+    if message == "invalid_config"
+        || message.starts_with("invalid_config; ")
+        || message.starts_with("provider setup failed: ")
+        || message.ends_with("; set the provider environment and relaunch yach tui")
+        || message == "native provider: prompt already in progress"
+    {
+        StatusSeverity::Error
+    } else {
+        StatusSeverity::Info
+    }
 }
 
 fn lifecycle_action_verb(action: ExtensionLifecycleAction) -> &'static str {
@@ -741,7 +767,7 @@ pub struct App {
     discovered_models: Vec<ModelInfo>,
     model_availability_refresh: ModelAvailabilityRefresh,
     session_id: String,
-    status_message: String,
+    status_message: StatusMessage,
     is_connected: bool,
     terminal_focused: bool,
     is_streaming: bool,
@@ -815,7 +841,7 @@ impl App {
             discovered_models: Vec::new(),
             model_availability_refresh: ModelAvailabilityRefresh::Idle,
             session_id: String::from("default"),
-            status_message: String::from("connecting..."),
+            status_message: StatusMessage::info("connecting..."),
             is_connected: false,
             terminal_focused: true,
             is_streaming: false,
@@ -904,10 +930,10 @@ impl App {
         self.context_used_percent = stats.context_used_percent;
         let message_count = stats.message_count;
         self.session_stats = Some(stats);
-        self.status_message = message_count.map_or_else(
+        self.status_message = StatusMessage::info(message_count.map_or_else(
             || String::from("session stats loaded"),
             |count| format!("session messages: {count}"),
-        );
+        ));
     }
 
     /// Compaction checkpoints reported by the backend for this session.
@@ -1082,7 +1108,7 @@ impl App {
             session_id: session_id.clone(),
         });
         let _sent = self.send_client_event(ClientEvent::PromptCancelled { session_id });
-        self.status_message = String::from(INVALID_PROMPT_ATTEMPT_RESET_MESSAGE);
+        self.status_message = StatusMessage::error(INVALID_PROMPT_ATTEMPT_RESET_MESSAGE);
     }
 
     fn handle_prompt_attempt_reset(
@@ -1142,13 +1168,13 @@ impl App {
     fn request_connections(&mut self) {
         self.clear_input();
         if !self.is_connected || !self.supports(Capability::ProviderConnections) {
-            self.status_message = String::from("provider connections unavailable");
+            self.status_message = StatusMessage::info("provider connections unavailable");
             return;
         }
 
         if self.send_client_event(ClientEvent::ConnectionsRequested) {
             self.pending_thinking_handoff = None;
-            self.status_message = String::from("loading provider connections");
+            self.status_message = StatusMessage::info("loading provider connections");
         }
     }
 
@@ -1164,7 +1190,7 @@ impl App {
         let requested = self.send_client_event(ClientEvent::AvailableModelsRefreshRequested);
         if requested {
             self.model_availability_refresh = ModelAvailabilityRefresh::Pending;
-            self.status_message = String::from("refreshing models");
+            self.status_message = StatusMessage::info("refreshing models");
         }
         requested
     }
@@ -1188,11 +1214,11 @@ impl App {
         self.queued_dialogs.clear();
         self.mode = AppMode::Normal;
         self.set_stream_state(StreamState::Idle);
-        self.status_message = if reason.is_empty() {
+        self.status_message = StatusMessage::error(if reason.is_empty() {
             String::from("disconnected")
         } else {
             reason
-        };
+        });
     }
 
     fn send_client_event(&mut self, event: ClientEvent) -> bool {
@@ -1216,7 +1242,8 @@ impl App {
             BackendEvent::Connected { negotiated } => {
                 self.is_connected = true;
                 self.negotiated = Some(negotiated.clone());
-                self.status_message = format!("connected: {}", negotiated.adapter_agent_name);
+                self.status_message =
+                    StatusMessage::info(format!("connected: {}", negotiated.adapter_agent_name));
             }
             BackendEvent::Server(event) => {
                 self.handle_server_event(event);
@@ -1247,10 +1274,11 @@ impl App {
             ServerEvent::StateUpdated(state) => self.apply_backend_state(*state),
             ServerEvent::ApprovalModeChanged { mode, .. } => {
                 self.approval_mode = mode;
-                self.status_message = format!("approval mode: {}", mode.as_str());
+                self.status_message =
+                    StatusMessage::info(format!("approval mode: {}", mode.as_str()));
             }
             ServerEvent::ApprovalModeChangeFailed { message, .. } => {
-                self.status_message = message;
+                self.status_message = StatusMessage::error(message);
             }
             ServerEvent::PromptDelta { session_id, delta } => {
                 let was_at_bottom = self.at_transcript_bottom();
@@ -1311,7 +1339,13 @@ impl App {
                 self.set_stream_state(StreamState::Idle);
                 self.active_tools.clear();
                 self.transcript.interrupt_pending_reviews();
-                self.status_message = message.unwrap_or_else(|| format!("prompt {outcome:?}"));
+                self.status_message = StatusMessage {
+                    text: message.unwrap_or_else(|| format!("prompt {outcome:?}")),
+                    severity: match outcome {
+                        PromptOutcome::Failed => StatusSeverity::Error,
+                        PromptOutcome::Completed | PromptOutcome::Cancelled => StatusSeverity::Info,
+                    },
+                };
             }
             ServerEvent::ToolCallStarted {
                 tool_call_id,
@@ -1415,7 +1449,8 @@ impl App {
                     Some(StatusLifecycle::Internal) | None => {}
                 }
                 if !is_lifecycle_status(&message) {
-                    self.status_message.clone_from(&message);
+                    self.status_message.text.clone_from(&message);
+                    self.status_message.severity = backend_status_severity(&message);
                     self.note_assumed_context_window(&message);
                 }
             }
@@ -1461,18 +1496,21 @@ impl App {
                     }
                 }
                 if let Some(message) = result.message {
-                    self.status_message = message;
+                    self.status_message = StatusMessage::info(message);
                 }
             }
             ServerEvent::ModelSelectionRequired { requested, reason } => {
                 self.pending_thinking_handoff = None;
-                self.status_message = format!(
+                self.status_message = StatusMessage::warning(format!(
                     "model selection required: {} ({reason:?})",
                     requested.map_or_else(
                         || String::from("unknown target"),
                         |target| { format!("{}/{}", target.provider, target.model_id) }
                     )
-                );
+                ));
+                if reason == yach_proto::ModelTargetResolutionReason::InvalidConfig {
+                    self.status_message.severity = StatusSeverity::Error;
+                }
             }
             ServerEvent::SessionChanged { session_id } => {
                 if !self.sessions.contains(&session_id) {
@@ -1482,14 +1520,15 @@ impl App {
                 }
                 if self.backend_busy() {
                     self.pending_session_id = Some(session_id.clone());
-                    self.status_message = format!("session pending: {session_id}");
+                    self.status_message =
+                        StatusMessage::info(format!("session pending: {session_id}"));
                 } else {
                     self.session_id.clone_from(&session_id);
                 }
             }
             ServerEvent::ThinkingLevelApplied { level } => {
                 self.thinking_level = level;
-                self.status_message = format!("thinking: {}", level.as_str());
+                self.status_message = StatusMessage::info(format!("thinking: {}", level.as_str()));
             }
             ServerEvent::DiscoveredModelsUpdated { models } => {
                 self.discovered_models = models;
@@ -1505,9 +1544,11 @@ impl App {
                 );
                 self.available_models = models;
                 if self.available_models.is_empty() {
-                    self.status_message = String::from("no available models reported");
-                } else if refresh_was_pending && self.status_message == "loading available models" {
-                    self.status_message = String::from("available models loaded");
+                    self.status_message = StatusMessage::info("no available models reported");
+                } else if refresh_was_pending
+                    && self.status_message.text == "loading available models"
+                {
+                    self.status_message = StatusMessage::info("available models loaded");
                 }
                 self.clamp_model_select_selection();
             }
@@ -1516,10 +1557,11 @@ impl App {
                 self.fork_messages = messages;
                 if count == 0 {
                     self.mode = AppMode::Normal;
-                    self.status_message = String::from("no fork points available");
+                    self.status_message = StatusMessage::info("no fork points available");
                 } else {
                     self.mode = AppMode::ForkSelect { selected: 0 };
-                    self.status_message = format!("fork points loaded: {count}");
+                    self.status_message =
+                        StatusMessage::info(format!("fork points loaded: {count}"));
                 }
             }
             ServerEvent::SessionMessagesUpdated { messages } => {
@@ -1528,7 +1570,7 @@ impl App {
                     self.hydrate_transcript_from_session_messages(&messages);
                     self.session_message_hydration = SessionMessageHydration::None;
                 }
-                self.status_message = branch_summary_line(&tree);
+                self.status_message = StatusMessage::info(branch_summary_line(&tree));
                 self.session_tree = Some(tree);
             }
             ServerEvent::SessionStatsUpdated(stats) => {
@@ -1552,8 +1594,9 @@ impl App {
                 }
                 self.transcript
                     .begin_tool_review(&request_id, &tool_name, payload);
-                self.status_message =
-                    String::from("review pending · ↑/↓ or j/k select · Enter confirm");
+                self.status_message = StatusMessage::warning(String::from(
+                    "review pending · ↑/↓ or j/k select · Enter confirm",
+                ));
                 self.scroll_to_bottom();
             }
             ServerEvent::ToolReviewResolved {
@@ -1561,11 +1604,11 @@ impl App {
                 resolution,
             } => {
                 if self.transcript.resolve_tool_review(&request_id, resolution) {
-                    self.status_message = match resolution {
+                    self.status_message = StatusMessage::info(match resolution {
                         ToolReviewResolution::Approved => String::from("review approved"),
                         ToolReviewResolution::Rejected => String::from("review rejected"),
                         ToolReviewResolution::Interrupted => String::from("review interrupted"),
-                    };
+                    });
                     self.scroll_to_bottom();
                 }
             }
@@ -1580,7 +1623,11 @@ impl App {
                 self.pending_local_edit_request_id = None;
                 self.active_local_edit_preview_id = Some(preview.preview_id.clone());
                 self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
-                self.status_message = String::from(status_message);
+                self.status_message = if preview.review_state == LocalEditReviewState::Allowed {
+                    StatusMessage::info(status_message)
+                } else {
+                    StatusMessage::warning(status_message)
+                };
                 self.mode = AppMode::LocalEditReview {
                     preview: LocalEditReview {
                         preview_id: preview.preview_id,
@@ -1606,11 +1653,11 @@ impl App {
                 self.active_local_edit_preview_id = None;
                 self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
                 self.mode = AppMode::Normal;
-                self.status_message = if message.is_empty() {
+                self.status_message = StatusMessage::info(if message.is_empty() {
                     format!("local edit {outcome:?}")
                 } else {
                     message
-                };
+                });
             }
             ServerEvent::ExtensionLifecycleFinished {
                 request_id,
@@ -1637,7 +1684,7 @@ impl App {
                 } else {
                     message
                 };
-                self.status_message = status_message;
+                self.status_message = StatusMessage::info(status_message);
                 if !selector.is_empty() {
                     self.request_extension_diagnostics(Some(&selector), false);
                 }
@@ -1652,8 +1699,11 @@ impl App {
                     return;
                 }
                 self.pending_extension_diagnostic_request_id = None;
-                self.status_message =
-                    extension_diagnostic_snapshot_summary(outcome, &records, message.as_deref());
+                self.status_message = StatusMessage::info(extension_diagnostic_snapshot_summary(
+                    outcome,
+                    &records,
+                    message.as_deref(),
+                ));
                 self.transcript.append_tool_result(
                     None,
                     "extension_status",
@@ -1663,17 +1713,20 @@ impl App {
                 self.scroll_to_bottom();
             }
             ServerEvent::NotificationRaised(notification) => {
-                self.status_message = format!("[{}] {}", notification.level, notification.message);
+                self.status_message = StatusMessage::info(format!(
+                    "[{}] {}",
+                    notification.level, notification.message
+                ));
             }
             ServerEvent::WidgetUpdated(widget) => {
-                self.status_message = if widget.body.is_empty() {
+                self.status_message = StatusMessage::info(if widget.body.is_empty() {
                     format!("[widget: {}]", widget.title)
                 } else {
                     format!("[widget: {}] {}", widget.title, widget.body)
-                };
+                });
             }
             ServerEvent::TitleChanged { title } => {
-                self.status_message = title;
+                self.status_message = StatusMessage::info(title);
             }
         }
     }
@@ -1695,9 +1748,9 @@ impl App {
         self.active_tools.clear();
         if self.supports_backend_cancel() {
             let _sent = self.send_client_event(ClientEvent::PromptCancelled { session_id });
-            self.status_message = String::from("cancelling prompt...");
+            self.status_message = StatusMessage::info("cancelling prompt...");
         } else {
-            self.status_message = String::from("cancelled locally; waiting for backend");
+            self.status_message = StatusMessage::info("cancelled locally; waiting for backend");
         }
     }
 
@@ -1791,11 +1844,11 @@ impl App {
         // it appears. "compacting" is backend-owned, so it must be replaced
         // once compaction ends or it would linger indefinitely.
         if state.is_compacting {
-            self.status_message = String::from("compacting");
-        } else if self.status_message.is_empty()
-            || BACKEND_OWNED_STATUS.contains(&self.status_message.as_str())
+            self.status_message = StatusMessage::info("compacting");
+        } else if self.status_message.text.is_empty()
+            || BACKEND_OWNED_STATUS.contains(&self.status_message.text.as_str())
         {
-            self.status_message = String::from("state loaded");
+            self.status_message = StatusMessage::info("state loaded");
         }
     }
     fn model_label_for(&self, model_id: &str, connection_id: Option<&str>) -> String {
@@ -1827,7 +1880,7 @@ impl App {
         });
         if self.active_dialog.is_some() && !replaces_active {
             if self.queued_dialogs.len() >= MAX_QUEUED_DIALOGS {
-                self.status_message = String::from("dialog queue full");
+                self.status_message = StatusMessage::info("dialog queue full");
                 let dialog_id = pending.request.id.clone().unwrap_or_default();
                 self.send_client_event(ClientEvent::DialogResolved {
                     dialog_id,
@@ -1836,7 +1889,7 @@ impl App {
                 return;
             }
             self.queued_dialogs.push_back(pending);
-            self.status_message = String::from("dialog queued");
+            self.status_message = StatusMessage::info("dialog queued");
             return;
         }
         self.activate_dialog(pending);
@@ -1896,7 +1949,7 @@ impl App {
     }
 
     fn activate_dialog(&mut self, pending: PendingDialog) {
-        self.status_message = dialog_summary(&pending.request);
+        self.status_message = StatusMessage::warning(dialog_summary(&pending.request));
         self.mode = match &pending.request.kind {
             DialogKind::Confirm | DialogKind::DeviceCode { .. } => AppMode::DialogConfirm,
             DialogKind::Input { .. } | DialogKind::Editor { .. } => AppMode::DialogInput,
@@ -1926,7 +1979,7 @@ impl App {
             dialog_id,
             response,
         }) {
-            self.status_message = String::from("dialog resolved");
+            self.status_message = StatusMessage::info("dialog resolved");
         }
         self.clear_dialog();
     }
@@ -1981,7 +2034,7 @@ impl App {
                 && self.transcript.has_unresolved_review()
                 && !matches!(self.mode, AppMode::SlashComplete { .. })
             {
-                self.status_message = String::from("tool running · Ctrl+C cancels the turn");
+                self.status_message = StatusMessage::info("tool running · Ctrl+C cancels the turn");
                 return true;
             }
             return false;
@@ -2009,7 +2062,7 @@ impl App {
             }
             _ => {
                 self.status_message =
-                    String::from("review pending · ↑/↓ or j/k select · Enter confirm");
+                    StatusMessage::warning("review pending · ↑/↓ or j/k select · Enter confirm");
             }
         }
         true
@@ -2058,13 +2111,13 @@ impl App {
             permission_decision_id,
             decision,
         });
-        self.status_message = match decision {
+        self.status_message = StatusMessage::info(match decision {
             ToolReviewDecision::Approve => String::from("review approval submitted"),
             ToolReviewDecision::ApproveForSession => {
                 String::from("approved for this session; identical commands will not re-prompt")
             }
             ToolReviewDecision::Reject => String::from("review rejection submitted"),
-        };
+        });
         self.scroll_to_bottom();
     }
 
@@ -2122,7 +2175,8 @@ impl App {
                 self.submit_input();
             }
             (KeyCode::Enter, _) if self.prompt_has_text() => {
-                self.status_message = String::from("wait for current response before submitting");
+                self.status_message =
+                    StatusMessage::info("wait for current response before submitting");
             }
             (KeyCode::Enter, _) if !self.prompt.is_empty() => self.clear_input(),
             (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
@@ -2291,7 +2345,7 @@ impl App {
         if self.transcript.has_pending_review()
             && matches!(self.mode, AppMode::Normal | AppMode::SlashComplete { .. })
         {
-            self.status_message = String::from("review pending; paste ignored");
+            self.status_message = StatusMessage::warning("review pending; paste ignored");
             return;
         }
         match self.mode {
@@ -2352,12 +2406,13 @@ impl App {
 
     fn open_model_selector(&mut self, forced: bool) {
         if self.backend_busy() {
-            self.status_message = String::from("wait for current response before changing model");
+            self.status_message =
+                StatusMessage::info("wait for current response before changing model");
         } else {
             if forced {
                 self.request_forced_model_refresh();
             } else if self.request_available_models() {
-                self.status_message = String::from("loading available models");
+                self.status_message = StatusMessage::info("loading available models");
             }
             self.mode = AppMode::ModelSelect {
                 selected: 0,
@@ -2369,13 +2424,14 @@ impl App {
 
     fn open_session_selector(&mut self) {
         if self.backend_busy() {
-            self.status_message = String::from("wait for current response before changing session");
+            self.status_message =
+                StatusMessage::info("wait for current response before changing session");
         } else {
             if self.send_client_event(ClientEvent::RecentSessionsRequested) {
                 self.sessions.clear();
                 self.session_labels.clear();
                 self.session_is_path.clear();
-                self.status_message = String::from("loading recent sessions");
+                self.status_message = StatusMessage::info("loading recent sessions");
             }
             self.mode = AppMode::SessionSelect { selected: 0 };
         }
@@ -2401,13 +2457,13 @@ impl App {
             .iter()
             .map(|(path, _)| has_current_path || path != &self.session_id)
             .collect();
-        self.status_message = format!("recent sessions: {count}");
+        self.status_message = StatusMessage::info(format!("recent sessions: {count}"));
     }
 
     fn open_thinking_selector(&mut self) {
         if self.backend_busy() {
             self.status_message =
-                String::from("wait for current response before changing thinking");
+                StatusMessage::info("wait for current response before changing thinking");
         } else {
             let selected = ThinkingLevel::ALL
                 .iter()
@@ -2427,17 +2483,17 @@ impl App {
 
     fn open_local_edit_composer(&mut self) {
         if self.backend_busy() {
-            self.status_message = String::from("wait for current response before editing");
+            self.status_message = StatusMessage::info("wait for current response before editing");
             return;
         }
 
         if self.has_local_edit_in_flight() {
-            self.status_message = String::from("wait for current local edit");
+            self.status_message = StatusMessage::info("wait for current local edit");
             return;
         }
 
         if !self.supports(Capability::LocalEdit) {
-            self.status_message = String::from("local edit unavailable");
+            self.status_message = StatusMessage::info("local edit unavailable");
             return;
         }
 
@@ -2445,29 +2501,30 @@ impl App {
             step: LocalEditComposeStep::Kind,
             draft: LocalEditDraft::default(),
         };
-        self.status_message = String::from("choose edit kind");
+        self.status_message = StatusMessage::info("choose edit kind");
     }
 
     fn submit_extension_lifecycle(&mut self, action: ExtensionLifecycleAction, selector: &str) {
         if self.backend_busy() {
             self.status_message =
-                String::from("wait for current response before changing extensions");
+                StatusMessage::info("wait for current response before changing extensions");
             return;
         }
 
         if self.pending_extension_lifecycle_request_id.is_some() {
-            self.status_message = String::from("wait for current extension lifecycle request");
+            self.status_message =
+                StatusMessage::info("wait for current extension lifecycle request");
             return;
         }
 
         if !self.supports(Capability::ExtensionLifecycle) {
-            self.status_message = String::from("extension lifecycle unavailable");
+            self.status_message = StatusMessage::info("extension lifecycle unavailable");
             return;
         }
 
         let selector = selector.trim();
         if selector.is_empty() {
-            self.status_message = String::from("extension selector required");
+            self.status_message = StatusMessage::warning("extension selector required");
             return;
         }
 
@@ -2485,7 +2542,10 @@ impl App {
         }) {
             self.pending_extension_lifecycle_request_id = Some(request_id);
             self.clear_input();
-            self.status_message = format!("{} extension {selector}", lifecycle_action_verb(action));
+            self.status_message = StatusMessage::info(format!(
+                "{} extension {selector}",
+                lifecycle_action_verb(action)
+            ));
         }
     }
 
@@ -2495,12 +2555,12 @@ impl App {
 
     fn request_extension_diagnostics(&mut self, selector: Option<&str>, clear_input: bool) {
         if self.pending_extension_diagnostic_request_id.is_some() {
-            self.status_message = String::from("wait for current extension status request");
+            self.status_message = StatusMessage::info("wait for current extension status request");
             return;
         }
 
         if !self.supports(Capability::ExtensionLifecycle) {
-            self.status_message = String::from("extension lifecycle unavailable");
+            self.status_message = StatusMessage::info("extension lifecycle unavailable");
             return;
         }
 
@@ -2522,10 +2582,10 @@ impl App {
             self.pending_extension_diagnostic_request_id = Some(request_id);
             if clear_input {
                 self.clear_input();
-                self.status_message = selector.map_or_else(
+                self.status_message = StatusMessage::info(selector.map_or_else(
                     || String::from("loading extension status"),
                     |selector| format!("loading extension status {selector}"),
-                );
+                ));
             }
         }
     }
@@ -2628,7 +2688,7 @@ impl App {
             (KeyCode::Char('r'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.backend_busy() {
                     self.status_message =
-                        String::from("wait for current response before refreshing models");
+                        StatusMessage::info("wait for current response before refreshing models");
                 } else {
                     self.request_forced_model_refresh();
                 }
@@ -2648,7 +2708,7 @@ impl App {
             (KeyCode::Enter, _) => {
                 if self.backend_busy() {
                     self.status_message =
-                        String::from("wait for current response before changing model");
+                        StatusMessage::info("wait for current response before changing model");
                     self.mode = AppMode::Normal;
                     return;
                 }
@@ -2669,7 +2729,8 @@ impl App {
                     )
                 };
                 if save_default && !self.supports(Capability::ModelState) {
-                    self.status_message = String::from("saving a model default is unavailable");
+                    self.status_message =
+                        StatusMessage::info("saving a model default is unavailable");
                     return;
                 }
                 let Some(model) = selected_model else {
@@ -2677,11 +2738,11 @@ impl App {
                         AppMode::ModelSelect { query, .. } => query.clone(),
                         _ => String::new(),
                     };
-                    self.status_message = if query.is_empty() {
+                    self.status_message = StatusMessage::info(if query.is_empty() {
                         String::from("available models not loaded yet")
                     } else {
                         format!("no models match: {query}")
-                    };
+                    });
                     return;
                 };
                 let connection_id = model
@@ -2705,11 +2766,11 @@ impl App {
                     },
                     request_id,
                 }) {
-                    self.status_message = if save_default {
+                    self.status_message = StatusMessage::info(if save_default {
                         format!("model and default requested: {}", model.label())
                     } else {
                         format!("model requested: {}", model.label())
-                    };
+                    });
                     self.pending_thinking_handoff = Some(PendingThinkingHandoff {
                         request_id,
                         activation_succeeded: false,
@@ -2739,19 +2800,20 @@ impl App {
             (KeyCode::Enter, _) => {
                 if self.backend_busy() {
                     self.status_message =
-                        String::from("wait for current response before changing session");
+                        StatusMessage::info("wait for current response before changing session");
                 } else if !self.session_is_path.get(selected).copied().unwrap_or(false) {
-                    self.status_message = String::from("recent sessions not loaded yet");
+                    self.status_message = StatusMessage::info("recent sessions not loaded yet");
                 } else if let Some(session_path) = self.sessions.get(selected).cloned() {
                     // Reselecting the current session is a no-op: the
                     // transcript must not be mutated.
                     if self.session_file.as_deref() == Some(session_path.as_str()) {
-                        self.status_message = String::from("already on this session");
+                        self.status_message = StatusMessage::info("already on this session");
                     } else if self.send_client_event(ClientEvent::SessionPathSelected {
                         session_path: session_path.clone(),
                     }) {
                         self.session_message_hydration = SessionMessageHydration::ExplicitResume;
-                        self.status_message = format!("switching session: {session_path}");
+                        self.status_message =
+                            StatusMessage::info(format!("switching session: {session_path}"));
                     }
                 }
                 self.mode = AppMode::Normal;
@@ -2779,7 +2841,8 @@ impl App {
             }
             (KeyCode::Enter, _) => {
                 if self.backend_busy() {
-                    self.status_message = String::from("wait for current response before forking");
+                    self.status_message =
+                        StatusMessage::info("wait for current response before forking");
                 } else if let Some(message) = self.fork_messages.get(selected).cloned()
                     && self.send_client_event(ClientEvent::SessionForkRequested {
                         session_id: self.session_id.clone(),
@@ -2787,7 +2850,8 @@ impl App {
                         position: ForkPosition::Before,
                     })
                 {
-                    self.status_message = format!("forking from: {}", message.entry_id);
+                    self.status_message =
+                        StatusMessage::info(format!("forking from: {}", message.entry_id));
                 }
                 self.mode = AppMode::Normal;
             }
@@ -2816,12 +2880,13 @@ impl App {
             (KeyCode::Enter, _) => {
                 if self.backend_busy() {
                     self.status_message =
-                        String::from("wait for current response before changing thinking");
+                        StatusMessage::info("wait for current response before changing thinking");
                 } else if let Some(level) = ThinkingLevel::ALL.get(selected)
                     && self.send_client_event(ClientEvent::ThinkingLevelSelected { level: *level })
                 {
                     self.thinking_level = *level;
-                    self.status_message = format!("thinking: {}", level.as_str());
+                    self.status_message =
+                        StatusMessage::info(format!("thinking: {}", level.as_str()));
                 }
                 self.mode = AppMode::Normal;
             }
@@ -2867,12 +2932,13 @@ impl App {
         self.mode = AppMode::FullAccessConfirm {
             selected: FullAccessConfirmationAction::Cancel,
         };
-        self.status_message = String::from("full-access confirmation required");
+        self.status_message = StatusMessage::warning("full-access confirmation required");
     }
 
     fn open_auto_review_confirmation(&mut self) {
         let Some(status) = self.reviewer_status.as_ref() else {
-            self.status_message = String::from("auto-review unavailable: no reviewer selected");
+            self.status_message =
+                StatusMessage::info("auto-review unavailable: no reviewer selected");
             self.mode = AppMode::Normal;
             return;
         };
@@ -2881,7 +2947,7 @@ impl App {
             reviewer_id: status.reviewer_id.clone(),
             disclosure_summary: status.disclosure_summary.clone(),
         };
-        self.status_message = String::from("auto-review confirmation required");
+        self.status_message = StatusMessage::warning("auto-review confirmation required");
     }
 
     fn handle_auto_review_confirm_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
@@ -2915,7 +2981,7 @@ impl App {
                 self.mode = AppMode::Normal;
             }
             (KeyCode::Enter | KeyCode::Esc, _) => {
-                self.status_message = String::from("auto-review cancelled");
+                self.status_message = StatusMessage::info("auto-review cancelled");
                 self.mode = AppMode::Normal;
             }
             _ => {}
@@ -2942,7 +3008,7 @@ impl App {
                 self.mode = AppMode::Normal;
             }
             (KeyCode::Enter | KeyCode::Esc, _) => {
-                self.status_message = String::from("full-access cancelled");
+                self.status_message = StatusMessage::info("full-access cancelled");
                 self.mode = AppMode::Normal;
             }
             _ => {}
@@ -2953,7 +3019,8 @@ impl App {
         self.approval_mode_request_counter = self.approval_mode_request_counter.wrapping_add(1);
         let request_id = self.approval_mode_request_counter;
         if self.send_client_event(ClientEvent::ApprovalModeSelected { request_id, mode }) {
-            self.status_message = format!("changing approval mode to {}", mode.as_str());
+            self.status_message =
+                StatusMessage::info(format!("changing approval mode to {}", mode.as_str()));
         }
     }
 
@@ -2982,7 +3049,7 @@ impl App {
                 _ => None,
             };
             if let Some(message) = copy_status {
-                self.status_message = String::from(message);
+                self.status_message = StatusMessage::info(message);
                 return;
             }
         }
@@ -3232,7 +3299,7 @@ impl App {
         match (key, modifiers) {
             (KeyCode::Esc, _) => {
                 self.mode = AppMode::Normal;
-                self.status_message = String::from("local edit cancelled");
+                self.status_message = StatusMessage::info("local edit cancelled");
             }
             (KeyCode::Char('j'), modifiers)
                 if modifiers == KeyModifiers::CONTROL
@@ -3264,7 +3331,7 @@ impl App {
                     step: LocalEditComposeStep::Path,
                     draft,
                 };
-                self.status_message = String::from("enter path");
+                self.status_message = StatusMessage::info("enter path");
             }
             (KeyCode::Char('2'), modifiers)
                 if modifiers.is_empty() && step == LocalEditComposeStep::Kind =>
@@ -3275,7 +3342,7 @@ impl App {
                     step: LocalEditComposeStep::Path,
                     draft,
                 };
-                self.status_message = String::from("enter path");
+                self.status_message = StatusMessage::info("enter path");
             }
             (KeyCode::Char(ch), modifiers) if accepts_plain_text_modifier(modifiers) => {
                 draft.buffer.push(ch);
@@ -3292,13 +3359,13 @@ impl App {
 
         match step {
             LocalEditComposeStep::Kind => {
-                self.status_message = String::from("choose 1 modify or 2 create");
+                self.status_message = StatusMessage::info("choose 1 modify or 2 create");
                 self.mode = AppMode::LocalEditCompose { step, draft };
             }
             LocalEditComposeStep::Path => {
                 let path = draft.buffer.trim().to_string();
                 if path.is_empty() {
-                    self.status_message = String::from("path required");
+                    self.status_message = StatusMessage::warning("path required");
                     self.mode = AppMode::LocalEditCompose { step, draft };
                     return;
                 }
@@ -3309,11 +3376,11 @@ impl App {
                     Some(LocalEditOperationKind::Create) => LocalEditComposeStep::Content,
                     None => LocalEditComposeStep::Kind,
                 };
-                self.status_message = match next_step {
+                self.status_message = StatusMessage::info(match next_step {
                     LocalEditComposeStep::ExpectedSha256 => String::from("enter expected sha256"),
                     LocalEditComposeStep::Content => String::from("enter file content"),
                     _ => String::from("choose edit kind"),
-                };
+                });
                 self.mode = AppMode::LocalEditCompose {
                     step: next_step,
                     draft,
@@ -3322,7 +3389,7 @@ impl App {
             LocalEditComposeStep::ExpectedSha256 => {
                 draft.expected_sha256 = Some(draft.buffer.trim().to_string());
                 draft.buffer.clear();
-                self.status_message = String::from("enter text to find");
+                self.status_message = StatusMessage::info("enter text to find");
                 self.mode = AppMode::LocalEditCompose {
                     step: LocalEditComposeStep::Find,
                     draft,
@@ -3331,7 +3398,7 @@ impl App {
             LocalEditComposeStep::Find => {
                 draft.find = Some(draft.buffer.clone());
                 draft.buffer.clear();
-                self.status_message = String::from("enter replacement text");
+                self.status_message = StatusMessage::info("enter replacement text");
                 self.mode = AppMode::LocalEditCompose {
                     step: LocalEditComposeStep::Replace,
                     draft,
@@ -3350,11 +3417,11 @@ impl App {
 
     fn submit_local_edit_prepare(&mut self, draft: LocalEditDraft) {
         let Some(path) = draft.path else {
-            self.status_message = String::from("enter path");
+            self.status_message = StatusMessage::info("enter path");
             return;
         };
         let Some(kind) = draft.kind else {
-            self.status_message = String::from("choose edit kind");
+            self.status_message = StatusMessage::info("choose edit kind");
             return;
         };
 
@@ -3381,7 +3448,7 @@ impl App {
             self.active_local_edit_preview_id = None;
             self.local_edit_decision_submission = LocalEditDecisionSubmission::Idle;
             self.mode = AppMode::Normal;
-            self.status_message = String::from("preparing local edit");
+            self.status_message = StatusMessage::info("preparing local edit");
         }
     }
 
@@ -3401,7 +3468,7 @@ impl App {
                 self.handle_normal_key(key, modifiers);
                 return;
             }
-            self.status_message = String::from("local edit decision already submitted");
+            self.status_message = StatusMessage::info("local edit decision already submitted");
             return;
         }
 
@@ -3447,7 +3514,7 @@ impl App {
         }) {
             self.pending_local_edit_request_id = None;
             self.local_edit_decision_submission = LocalEditDecisionSubmission::Submitted;
-            self.status_message = String::from("submitting local edit decision");
+            self.status_message = StatusMessage::info("submitting local edit decision");
         }
     }
 
@@ -3550,7 +3617,7 @@ impl App {
                 if args == "refresh" {
                     self.open_model_selector(true);
                 } else {
-                    self.status_message = String::from("usage: /model [refresh]");
+                    self.status_message = StatusMessage::info("usage: /model [refresh]");
                 }
                 return;
             }
@@ -3587,7 +3654,7 @@ impl App {
                     "accept-edits" => self.request_approval_mode(ApprovalMode::AcceptEdits),
                     "full-access" => self.open_full_access_confirmation(),
                     _ => {
-                        self.status_message = String::from(
+                        self.status_message = StatusMessage::info(
                             "approval mode must be review, accept-edits, or full-access",
                         );
                     }
@@ -3624,7 +3691,7 @@ impl App {
                 | SlashAction::ExtensionRevoke,
             ) => {
                 self.clear_input();
-                self.status_message = String::from("extension selector required");
+                self.status_message = StatusMessage::warning("extension selector required");
                 return;
             }
             SlashParseResult::Command(SlashAction::ExtensionStatus) => {
@@ -3681,14 +3748,15 @@ impl App {
                 return;
             }
             SlashParseResult::CommandWithArgs { .. } | SlashParseResult::ArgumentsUnsupported => {
-                self.status_message = String::from("slash command arguments are not supported yet");
+                self.status_message =
+                    StatusMessage::info("slash command arguments are not supported yet");
                 return;
             }
             // A mistyped command previously fell through to the provider as
             // an ordinary prompt, silently spending a turn and leaving the
             // user's intent unexecuted.
             SlashParseResult::Unknown { typed } => {
-                self.status_message = match suggest_slash_command(&typed) {
+                self.status_message = StatusMessage::info(match suggest_slash_command(&typed) {
                     Some(suggestion) => {
                         format!(
                             "unknown command {typed} — did you mean {}?",
@@ -3696,7 +3764,7 @@ impl App {
                         )
                     }
                     None => format!("unknown command {typed}"),
-                };
+                });
                 return;
             }
             SlashParseResult::NotSlash => {}
@@ -3715,7 +3783,7 @@ impl App {
             self.scrollback_archive_count = self.transcript.entries().len();
             self.transcript.append_user_message(&input);
             self.scroll_to_bottom();
-            self.status_message = String::from("sending...");
+            self.status_message = StatusMessage::info("sending...");
             self.set_stream_state(StreamState::streaming(self.session_id.clone()));
         }
     }
@@ -3745,9 +3813,10 @@ impl App {
 
     fn request_session_tree(&mut self) {
         if self.backend_busy() {
-            self.status_message = String::from("wait for current response before loading branches");
+            self.status_message =
+                StatusMessage::info("wait for current response before loading branches");
         } else if self.send_client_event(ClientEvent::SessionMessagesRequested) {
-            self.status_message = String::from("loading session tree");
+            self.status_message = StatusMessage::info("loading session tree");
         }
     }
 
@@ -3757,45 +3826,45 @@ impl App {
             session_id,
             instructions,
         }) {
-            self.status_message = String::from("compaction requested");
+            self.status_message = StatusMessage::info("compaction requested");
         }
     }
 
     fn fork_current_session(&mut self) {
         if self.backend_busy() {
-            self.status_message = String::from("wait for current response before forking");
+            self.status_message = StatusMessage::info("wait for current response before forking");
             return;
         }
 
         if !self.supports(Capability::SessionForking) {
-            self.status_message = String::from("session forking unavailable");
+            self.status_message = StatusMessage::info("session forking unavailable");
             return;
         }
 
         if !self.has_forkable_history() {
-            self.status_message = String::from("send a message before cloning the session");
+            self.status_message = StatusMessage::info("send a message before cloning the session");
             return;
         }
 
         if self.send_client_event(ClientEvent::ForkMessagesRequested) {
-            self.status_message = String::from("loading fork points");
+            self.status_message = StatusMessage::info("loading fork points");
         }
     }
 
     #[cfg(test)]
     fn fork_session(&mut self, session_id: &str) {
         if self.backend_busy() {
-            self.status_message = String::from("wait for current response before forking");
+            self.status_message = StatusMessage::info("wait for current response before forking");
             return;
         }
 
         if !self.supports(Capability::SessionForking) {
-            self.status_message = String::from("session forking unavailable");
+            self.status_message = StatusMessage::info("session forking unavailable");
             return;
         }
 
         if !self.has_forkable_history() {
-            self.status_message = String::from("send a message before cloning the session");
+            self.status_message = StatusMessage::info("send a message before cloning the session");
             return;
         }
 
@@ -3804,7 +3873,8 @@ impl App {
             entry_id: None,
             position: ForkPosition::Before,
         }) {
-            self.status_message = format!("cloning current branch from: {session_id}");
+            self.status_message =
+                StatusMessage::info(format!("cloning current branch from: {session_id}"));
         }
     }
 
@@ -5032,6 +5102,7 @@ mod tests {
         LocalEditComposeStep, LocalEditDraft, LocalEditReview, LocalEditReviewAction,
         MAX_TOOL_ERROR_EXCERPT_CHARS, SessionMessageHydration, tool_output_summary,
     };
+    use crate::status_bar::{StatusMessage, StatusSeverity};
     use crate::theme::Theme;
     use crate::thinking_level::ThinkingLevel;
     use crate::transcript::EntryKind;
@@ -5057,6 +5128,106 @@ mod tests {
                 &default_backend_handshake(),
             ),
         }
+    }
+
+    #[test]
+    fn backend_status_classifies_only_config_error_envelopes_and_resets_severity() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(connected_event());
+        for (message, expected) in [
+            (
+                "invalid_config; set the provider environment and relaunch yach tui",
+                StatusSeverity::Error,
+            ),
+            (
+                "provider setup failed: missing required env var API_KEY",
+                StatusSeverity::Error,
+            ),
+            (
+                "native provider: prompt already in progress",
+                StatusSeverity::Error,
+            ),
+            (
+                "connection_missing; set the provider environment and relaunch yach tui",
+                StatusSeverity::Error,
+            ),
+            (
+                "model selection required: invalid_config",
+                StatusSeverity::Error,
+            ),
+            (
+                "model selection required: connection_missing",
+                StatusSeverity::Warning,
+            ),
+            ("invalid_configuration loaded", StatusSeverity::Info),
+            (
+                "session loaded; previous notice was invalid_config",
+                StatusSeverity::Info,
+            ),
+        ] {
+            app.handle_server_event(ServerEvent::StatusUpdated {
+                message: String::from(message),
+            });
+            assert_eq!(app.status_message.severity, expected);
+            assert!(app.is_connected);
+        }
+    }
+
+    #[test]
+    fn failed_prompt_is_an_error_but_completion_resets_it() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        for (outcome, expected) in [
+            (PromptOutcome::Failed, StatusSeverity::Error),
+            (PromptOutcome::Completed, StatusSeverity::Info),
+        ] {
+            app.handle_server_event(ServerEvent::PromptFinished {
+                session_id: String::from("default"),
+                outcome,
+                message: None,
+            });
+            assert_eq!(app.status_message.severity, expected);
+        }
+    }
+
+    #[test]
+    fn model_selection_uses_structured_config_failure_and_otherwise_warns() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        for (reason, expected) in [
+            (
+                yach_proto::ModelTargetResolutionReason::InvalidConfig,
+                StatusSeverity::Error,
+            ),
+            (
+                yach_proto::ModelTargetResolutionReason::ModelUnavailable,
+                StatusSeverity::Warning,
+            ),
+        ] {
+            app.handle_server_event(ServerEvent::ModelSelectionRequired {
+                requested: None,
+                reason,
+            });
+            assert_eq!(app.status_message.severity, expected);
+        }
+    }
+
+    #[test]
+    fn disconnection_and_approval_change_failure_are_error_statuses() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.handle_backend_event(BackendEvent::Disconnected {
+            reason: String::from("connection lost"),
+        });
+        assert_eq!(app.status_message.severity, StatusSeverity::Error);
+        app.handle_backend_event(connected_event());
+        app.handle_server_event(ServerEvent::ApprovalModeChangeFailed {
+            request_id: 1,
+            mode: ApprovalMode::FullAccess,
+            message: String::from("mode change refused"),
+        });
+        assert_eq!(app.status_message.severity, StatusSeverity::Error);
     }
 
     const LEGACY_NOTICE: &str = concat!(
@@ -5707,7 +5878,8 @@ mod tests {
 
         app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(
-            app.status_message.contains("copied") || app.status_message.contains("could not copy")
+            app.status_message.text.contains("copied")
+                || app.status_message.text.contains("could not copy")
         );
         assert!(matches!(app.mode, AppMode::DialogConfirm));
         assert!(rx.try_recv().is_err());
@@ -5719,13 +5891,13 @@ mod tests {
         let mut app = App::new(tx);
 
         app.fork_session("default");
-        assert_eq!(app.status_message, "session forking unavailable");
+        assert_eq!(app.status_message.text, "session forking unavailable");
         assert!(rx.try_recv().is_err());
 
         app.handle_backend_event(connected_event());
         app.fork_session("default");
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "send a message before cloning the session"
         );
         assert!(rx.try_recv().is_err());
@@ -5749,7 +5921,7 @@ mod tests {
 
         app.handle_key(KeyCode::Char('b'), KeyModifiers::CONTROL);
         assert_eq!(rx.try_recv(), Ok(ClientEvent::SessionMessagesRequested));
-        assert_eq!(app.status_message, "loading session tree");
+        assert_eq!(app.status_message.text, "loading session tree");
 
         app.handle_server_event(ServerEvent::SessionMessagesUpdated {
             messages: vec![
@@ -5760,7 +5932,10 @@ mod tests {
             ],
         });
 
-        assert_eq!(app.status_message, "session tree: 2 branches · 4 messages");
+        assert_eq!(
+            app.status_message.text,
+            "session tree: 2 branches · 4 messages"
+        );
         assert_eq!(
             app.session_tree.as_ref().map(|tree| tree.branches.len()),
             Some(2)
@@ -5900,7 +6075,10 @@ mod tests {
         });
 
         assert!(app.transcript.entries().is_empty());
-        assert_eq!(app.status_message, "session tree: 1 branches · 1 messages");
+        assert_eq!(
+            app.status_message.text,
+            "session tree: 1 branches · 1 messages"
+        );
     }
 
     #[test]
@@ -5933,7 +6111,7 @@ mod tests {
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(app.session_message_hydration, SessionMessageHydration::None);
-        assert_eq!(app.status_message, "already on this session");
+        assert_eq!(app.status_message.text, "already on this session");
         assert_eq!(app.transcript.entries().len(), 1);
         assert_eq!(app.transcript.entries()[0].content, "keep me");
         assert!(rx.try_recv().is_err());
@@ -6039,13 +6217,13 @@ mod tests {
     fn lifecycle_events_do_not_overwrite_status_text() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
-        app.status_message = String::from("state loaded");
+        app.status_message = StatusMessage::info("state loaded");
 
         app.handle_server_event(ServerEvent::StatusUpdated {
             message: String::from("agent_end"),
         });
 
-        assert_eq!(app.status_message, "state loaded");
+        assert_eq!(app.status_message.text, "state loaded");
         assert!(!app.is_streaming);
     }
 
@@ -6088,7 +6266,10 @@ mod tests {
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
-        assert_eq!(app.status_message, "cancelled locally; waiting for backend");
+        assert_eq!(
+            app.status_message.text,
+            "cancelled locally; waiting for backend"
+        );
     }
 
     #[test]
@@ -6108,7 +6289,7 @@ mod tests {
                 session_id: String::from("default"),
             })
         );
-        assert_eq!(app.status_message, "cancelling prompt...");
+        assert_eq!(app.status_message.text, "cancelling prompt...");
     }
 
     #[test]
@@ -6129,7 +6310,7 @@ mod tests {
                 session_id: String::from("default"),
             })
         );
-        assert_eq!(app.status_message, "cancelling prompt...");
+        assert_eq!(app.status_message.text, "cancelling prompt...");
         assert!(app.prompt_has_text(), "esc-cancel keeps the drafted input");
     }
 
@@ -6163,7 +6344,7 @@ mod tests {
         });
 
         assert!(!app.backend_busy());
-        assert_eq!(app.status_message, "cancelled by backend");
+        assert_eq!(app.status_message.text, "cancelled by backend");
     }
 
     #[test]
@@ -6335,11 +6516,11 @@ mod tests {
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
 
         assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
-        assert_eq!(app.status_message, "loading available models");
+        assert_eq!(app.status_message.text, "loading available models");
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
 
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.status_message, "available models not loaded yet");
+        assert_eq!(app.status_message.text, "available models not loaded yet");
         assert!(rx.try_recv().is_err());
     }
 
@@ -6350,7 +6531,7 @@ mod tests {
         app.set_prompt_text("/model refresh");
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
-        assert_eq!(app.status_message, "refreshing models");
+        assert_eq!(app.status_message.text, "refreshing models");
         assert_eq!(
             rx.try_recv(),
             Ok(ClientEvent::AvailableModelsRefreshRequested)
@@ -6365,7 +6546,7 @@ mod tests {
         app.set_prompt_text("/model gpt-5");
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(app.mode, AppMode::Normal));
-        assert_eq!(app.status_message, "usage: /model [refresh]");
+        assert_eq!(app.status_message.text, "usage: /model [refresh]");
         assert!(rx.try_recv().is_err());
     }
 
@@ -6395,7 +6576,7 @@ mod tests {
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
 
         assert_eq!(app.available_models, vec![stale]);
-        assert_eq!(app.status_message, "loading available models");
+        assert_eq!(app.status_message.text, "loading available models");
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
 
         app.handle_server_event(ServerEvent::AvailableModelsUpdated {
@@ -6405,7 +6586,7 @@ mod tests {
             app.available_models,
             vec![model("anthropic", "fresh-model", "Fresh Model")]
         );
-        assert_eq!(app.status_message, "available models loaded");
+        assert_eq!(app.status_message.text, "available models loaded");
     }
 
     #[test]
@@ -6440,13 +6621,13 @@ mod tests {
 
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
 
-        assert_eq!(app.status_message, "loading available models");
+        assert_eq!(app.status_message.text, "loading available models");
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
         app.handle_server_event(ServerEvent::AvailableModelsUpdated {
             models: vec![active.clone()],
         });
         assert_eq!(app.available_models, vec![active]);
-        assert_eq!(app.status_message, "available models loaded");
+        assert_eq!(app.status_message.text, "available models loaded");
     }
 
     #[test]
@@ -6467,7 +6648,7 @@ mod tests {
 
         assert_eq!(app.model, "default");
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "model requested: anthropic/claude-sonnet-4-20250514"
         );
         assert_eq!(
@@ -6662,14 +6843,14 @@ mod tests {
                 level: ThinkingLevel::Medium,
             })
         );
-        assert_eq!(app.status_message, "thinking: medium");
+        assert_eq!(app.status_message.text, "thinking: medium");
 
         app.handle_server_event(ServerEvent::ThinkingLevelApplied {
             level: ThinkingLevel::Medium,
         });
 
         assert_eq!(app.thinking_level.as_str(), "medium");
-        assert_eq!(app.status_message, "thinking: medium");
+        assert_eq!(app.status_message.text, "thinking: medium");
     }
 
     #[test]
@@ -6889,7 +7070,7 @@ mod tests {
 
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
 
-        assert_eq!(app.status_message, "loading available models");
+        assert_eq!(app.status_message.text, "loading available models");
         assert_eq!(rx.try_recv(), Ok(ClientEvent::AvailableModelsRequested));
         let (rows, selected, query, _) = app.model_select_view();
         assert!(query.is_empty());
@@ -6961,7 +7142,10 @@ mod tests {
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert!(matches!(app.mode, AppMode::Normal));
-        assert_eq!(app.status_message, "model requested: opencode-zen/kimi-k3");
+        assert_eq!(
+            app.status_message.text,
+            "model requested: opencode-zen/kimi-k3"
+        );
         assert_eq!(
             rx.try_recv(),
             Ok(ClientEvent::ModelActivationRequested {
@@ -7057,7 +7241,7 @@ mod tests {
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert!(matches!(app.mode, AppMode::ModelSelect { .. }));
-        assert_eq!(app.status_message, "no models match: zzz");
+        assert_eq!(app.status_message.text, "no models match: zzz");
         assert!(rx.try_recv().is_err());
 
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
@@ -7141,7 +7325,7 @@ mod tests {
         assert_eq!(app.prompt_text(), "");
         assert_eq!(rx.try_recv(), Ok(ClientEvent::RecentSessionsRequested));
         assert!(matches!(app.mode, AppMode::SessionSelect { selected: 0 }));
-        assert_eq!(app.status_message, "loading recent sessions");
+        assert_eq!(app.status_message.text, "loading recent sessions");
     }
 
     #[test]
@@ -7178,7 +7362,7 @@ mod tests {
 
         assert!(matches!(app.mode, AppMode::Normal));
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "auto-review unavailable: no reviewer selected"
         );
         assert!(rx.try_recv().is_err());
@@ -7232,7 +7416,7 @@ mod tests {
 
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(app.mode, AppMode::Normal));
-        assert_eq!(app.status_message, "full-access cancelled");
+        assert_eq!(app.status_message.text, "full-access cancelled");
         assert!(rx.try_recv().is_err());
     }
     #[test]
@@ -7255,7 +7439,7 @@ mod tests {
             mode: ApprovalMode::AcceptEdits,
         });
         assert_eq!(app.approval_mode, ApprovalMode::AcceptEdits);
-        assert_eq!(app.status_message, "approval mode: accept-edits");
+        assert_eq!(app.status_message.text, "approval mode: accept-edits");
     }
     #[test]
     fn connect_command_requests_backend_flow() {
@@ -7293,7 +7477,7 @@ mod tests {
         app.submit_input();
 
         assert!(app.prompt.is_empty());
-        assert_eq!(app.status_message, "provider connections unavailable");
+        assert_eq!(app.status_message.text, "provider connections unavailable");
         assert!(rx.try_recv().is_err());
     }
     #[test]
@@ -7309,7 +7493,7 @@ mod tests {
         app.submit_input();
 
         assert!(app.prompt.is_empty());
-        assert_eq!(app.status_message, "provider connections unavailable");
+        assert_eq!(app.status_message.text, "provider connections unavailable");
         assert!(rx.try_recv().is_err());
     }
 
@@ -7343,7 +7527,7 @@ mod tests {
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(app.session_select_index(), 0);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.status_message, "recent sessions not loaded yet");
+        assert_eq!(app.status_message.text, "recent sessions not loaded yet");
 
         app.handle_server_event(ServerEvent::RecentSessionsUpdated {
             sessions: vec![RecentSession {
@@ -7433,7 +7617,7 @@ mod tests {
         app.submit_input();
 
         assert!(matches!(app.mode, AppMode::Normal));
-        assert_eq!(app.status_message, "local edit unavailable");
+        assert_eq!(app.status_message.text, "local edit unavailable");
         assert!(app.prompt.is_empty());
         assert!(rx.try_recv().is_err());
     }
@@ -7458,7 +7642,7 @@ mod tests {
                 },
             }
         ));
-        assert_eq!(app.status_message, "choose edit kind");
+        assert_eq!(app.status_message.text, "choose edit kind");
         assert!(app.prompt.is_empty());
     }
 
@@ -7471,7 +7655,7 @@ mod tests {
 
         app.submit_input();
 
-        assert_eq!(app.status_message, "extension lifecycle unavailable");
+        assert_eq!(app.status_message.text, "extension lifecycle unavailable");
         assert!(rx.try_recv().is_err());
     }
 
@@ -7484,7 +7668,10 @@ mod tests {
 
         app.submit_input();
 
-        assert_eq!(app.status_message, "stopping extension example.toy-tools");
+        assert_eq!(
+            app.status_message.text,
+            "stopping extension example.toy-tools"
+        );
         assert!(app.prompt.is_empty());
         assert_eq!(
             rx.try_recv(),
@@ -7505,7 +7692,10 @@ mod tests {
 
         app.submit_input();
 
-        assert_eq!(app.status_message, "reloading extension example.toy-tools");
+        assert_eq!(
+            app.status_message.text,
+            "reloading extension example.toy-tools"
+        );
         assert!(app.prompt.is_empty());
         assert_eq!(
             rx.try_recv(),
@@ -7526,7 +7716,10 @@ mod tests {
 
         app.submit_input();
 
-        assert_eq!(app.status_message, "granting extension example.toy-tools");
+        assert_eq!(
+            app.status_message.text,
+            "granting extension example.toy-tools"
+        );
         assert!(app.prompt.is_empty());
         assert_eq!(
             rx.try_recv(),
@@ -7547,7 +7740,10 @@ mod tests {
 
         app.submit_input();
 
-        assert_eq!(app.status_message, "revoking extension example.toy-tools");
+        assert_eq!(
+            app.status_message.text,
+            "revoking extension example.toy-tools"
+        );
         assert!(app.prompt.is_empty());
         assert_eq!(
             rx.try_recv(),
@@ -7576,7 +7772,10 @@ mod tests {
         });
 
         assert_eq!(app.pending_extension_lifecycle_request_id, None);
-        assert_eq!(app.status_message, "extension stopped: example.toy-tools");
+        assert_eq!(
+            app.status_message.text,
+            "extension stopped: example.toy-tools"
+        );
         assert_eq!(
             rx.try_recv(),
             Ok(ClientEvent::ExtensionDiagnosticSnapshotRequested {
@@ -7600,7 +7799,7 @@ mod tests {
         app.submit_input();
 
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "loading extension status example.toy-tools"
         );
         assert!(app.prompt.is_empty());
@@ -7646,7 +7845,7 @@ mod tests {
 
         assert_eq!(app.pending_extension_diagnostic_request_id, None);
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "extensions: count=1 active=1 stopped=0 failed=0"
         );
         let last_entry = app.transcript.entries().last();
@@ -7742,7 +7941,8 @@ mod tests {
                 selected: LocalEditReviewAction::Apply,
             } if preview_id == "preview-1" && path == "src/lib.rs"
         ));
-        assert_eq!(app.status_message, "review local edit");
+        assert_eq!(app.status_message.text, "review local edit");
+        assert_eq!(app.status_message.severity, StatusSeverity::Warning);
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
             app.mode,
@@ -7788,7 +7988,7 @@ mod tests {
         assert!(app.transcript.has_pending_review());
         assert_eq!(app.prompt_text(), "/m");
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "review pending · ↑/↓ or j/k select · Enter confirm"
         );
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
@@ -7842,7 +8042,7 @@ mod tests {
 
         assert!(matches!(app.mode, AppMode::LocalEditReview { .. }));
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "auto-review unavailable; user approval required"
         );
     }
@@ -7864,7 +8064,7 @@ mod tests {
         });
 
         assert!(matches!(app.mode, AppMode::Normal));
-        assert_eq!(app.status_message, "local edit finished");
+        assert_eq!(app.status_message.text, "local edit finished");
     }
 
     #[test]
@@ -7885,7 +8085,7 @@ mod tests {
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
         assert!(matches!(app.mode, AppMode::Normal));
-        assert_eq!(app.status_message, "preparing local edit");
+        assert_eq!(app.status_message.text, "preparing local edit");
         assert_eq!(
             rx.try_recv(),
             Ok(ClientEvent::LocalEditPrepareRequested {
@@ -7977,7 +8177,7 @@ mod tests {
         });
 
         assert!(matches!(app.mode, AppMode::LocalEditReview { .. }));
-        assert_eq!(app.status_message, "review local edit");
+        assert_eq!(app.status_message.text, "review local edit");
     }
 
     #[test]
@@ -7992,7 +8192,7 @@ mod tests {
 
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
-        assert_eq!(app.status_message, "submitting local edit decision");
+        assert_eq!(app.status_message.text, "submitting local edit decision");
         assert_eq!(
             rx.try_recv(),
             Ok(ClientEvent::LocalEditDecisionSubmitted {
@@ -8026,7 +8226,7 @@ mod tests {
         });
 
         assert!(matches!(app.mode, AppMode::Normal));
-        assert_eq!(app.status_message, "local edit applied");
+        assert_eq!(app.status_message.text, "local edit applied");
         assert!(app.active_local_edit_preview_id.is_none());
     }
 
@@ -8050,7 +8250,7 @@ mod tests {
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
-        assert_eq!(app.status_message, "review rejection submitted");
+        assert_eq!(app.status_message.text, "review rejection submitted");
         assert!(!app.transcript.has_pending_review());
         assert!(app.transcript.has_unresolved_review());
         assert!(matches!(app.mode, AppMode::Normal));
@@ -8092,14 +8292,17 @@ mod tests {
                 decision: ToolReviewDecision::Reject,
             })
         );
-        assert_eq!(app.status_message, "review rejection submitted");
+        assert_eq!(app.status_message.text, "review rejection submitted");
 
         // The decision is final, and while the reviewed tool still runs a
         // second Esc neither re-decides nor cancels the turn.
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
         assert!(rx.try_recv().is_err());
         assert!(!app.transcript.has_pending_review());
-        assert_eq!(app.status_message, "tool running · Ctrl+C cancels the turn");
+        assert_eq!(
+            app.status_message.text,
+            "tool running · Ctrl+C cancels the turn"
+        );
     }
 
     #[test]
@@ -8137,12 +8340,12 @@ mod tests {
                 session_id: String::from("default"),
             })
         );
-        assert_eq!(app.status_message, "cancelling prompt...");
+        assert_eq!(app.status_message.text, "cancelling prompt...");
         app.handle_server_event(ServerEvent::ToolReviewResolved {
             request_id: String::from("tool-review-request-1"),
             resolution: ToolReviewResolution::Interrupted,
         });
-        assert_eq!(app.status_message, "review interrupted");
+        assert_eq!(app.status_message.text, "review interrupted");
         assert!(matches!(
             app.transcript.entries()[0]
                 .review
@@ -8291,7 +8494,7 @@ mod tests {
         assert_eq!(app.prompt_text(), "draft");
         assert!(rx.try_recv().is_err());
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "wait for current response before submitting"
         );
     }
@@ -8340,7 +8543,7 @@ mod tests {
         assert_eq!(app.prompt_text(), "/sta");
         assert!(rx.try_recv().is_err());
         assert!(app.backend_busy());
-        assert_ne!(app.status_message, "cancelling prompt...");
+        assert_ne!(app.status_message.text, "cancelling prompt...");
     }
 
     #[test]
@@ -8364,7 +8567,7 @@ mod tests {
                 session_id: String::from("default"),
             })
         );
-        assert_eq!(app.status_message, "cancelling prompt...");
+        assert_eq!(app.status_message.text, "cancelling prompt...");
         assert_eq!(app.prompt_text(), "/sta");
     }
 
@@ -8383,7 +8586,7 @@ mod tests {
                 session_id: String::from("default"),
             })
         );
-        assert_eq!(app.status_message, "cancelling prompt...");
+        assert_eq!(app.status_message.text, "cancelling prompt...");
         assert_eq!(app.prompt_text(), "/sta");
     }
 
@@ -8462,7 +8665,10 @@ mod tests {
 
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
 
-        assert_eq!(app.status_message, "local edit decision already submitted");
+        assert_eq!(
+            app.status_message.text,
+            "local edit decision already submitted"
+        );
         assert!(rx.try_recv().is_err());
     }
 
@@ -8493,13 +8699,13 @@ mod tests {
         app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT);
         assert!(matches!(app.mode, AppMode::Normal));
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "wait for current response before changing model"
         );
 
         app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "wait for current response before forking"
         );
         assert!(rx.try_recv().is_err());
@@ -8948,7 +9154,7 @@ mod tests {
             kind: DialogKind::Confirm,
         }));
 
-        assert_eq!(app.status_message, "dialog queue full");
+        assert_eq!(app.status_message.text, "dialog queue full");
         assert_eq!(app.queued_dialogs.len(), super::MAX_QUEUED_DIALOGS);
         assert_eq!(
             rx.try_recv(),
@@ -9144,7 +9350,7 @@ mod tests {
                 message: Some(String::from("model changed to gpt-5.6-sol")),
             },
         ));
-        assert_eq!(app.status_message, "model changed to gpt-5.6-sol");
+        assert_eq!(app.status_message.text, "model changed to gpt-5.6-sol");
         assert_eq!(
             app.transcript
                 .entries()
@@ -9304,19 +9510,20 @@ mod tests {
         let mut app = App::new(tx);
 
         app.apply_backend_state(compacting_state(true));
-        assert_eq!(app.status_message, "compacting");
+        assert_eq!(app.status_message.text, "compacting");
 
         // Backend-owned, so it must be replaced once compaction ends;
         // otherwise it lingers for the rest of the session.
         app.apply_backend_state(compacting_state(false));
-        assert_eq!(app.status_message, "state loaded");
+        assert_eq!(app.status_message.text, "state loaded");
 
         // A message answering the user's last action is not backend-owned
         // and must survive periodic state updates.
-        app.status_message = String::from("unknown command /aproval — did you mean /approval?");
+        app.status_message =
+            StatusMessage::info("unknown command /aproval — did you mean /approval?");
         app.apply_backend_state(compacting_state(false));
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             "unknown command /aproval — did you mean /approval?"
         );
     }
@@ -9338,9 +9545,9 @@ mod tests {
             "a mistyped command must not reach the provider"
         );
         assert!(
-            app.status_message.contains("/clear"),
+            app.status_message.text.contains("/clear"),
             "status should name the nearest command, got: {}",
-            app.status_message
+            app.status_message.text
         );
     }
 
@@ -9643,7 +9850,7 @@ mod tests {
             super::StreamState::Desynchronized { .. }
         ));
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             super::INVALID_PROMPT_ATTEMPT_RESET_MESSAGE
         );
         let mut cancels = 0;
@@ -9661,7 +9868,7 @@ mod tests {
         });
         assert!(matches!(app.stream_state, super::StreamState::Idle));
         assert_eq!(
-            app.status_message,
+            app.status_message.text,
             super::INVALID_PROMPT_ATTEMPT_RESET_MESSAGE
         );
         let after_terminal: Vec<String> = app
