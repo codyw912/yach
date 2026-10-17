@@ -380,6 +380,21 @@ nocolor`; `just dev bash tests/visual/check-nocolor.sh` checks the raw TUI
 bytes independently of VHS. Release size is checked by the relative per-PR
 size gate: `just perf --filter 'binary/size_bytes' --deterministic`.
 
+#### TUI design review
+
+1. On the base revision, run `just tui-themes before`; on the change, run
+   `just tui-themes after`. Keep both `target/tui-themes/<label>/` directories.
+   The capture needs `tmux`, `jq`, Node.js (also used by the raw-byte visual
+   check), and Chromium on `PATH` (or `CHROMIUM=/path/to/chromium`). It embeds
+   the monospace font found by `fc-match`; use `YACH_SHOT_FONT=/path/to/font.ttf`
+   to supply one explicitly. Chromium is not part of the default dev shell.
+2. Give both sets of labeled grid PNGs and raw `.ansi` captures to two
+   reviewers: one for color/contrast (palette fidelity, WCAG ratios computed
+   from SGR values, role semantics), one for layout/wording (hierarchy,
+   spacing, status bar, wording). Reviewers mark inferences rather than
+   presenting them as observations.
+3. The maintainer picks which findings to act on before any fix lands.
+
 ### Session logs and privacy
 
 Sessions are append-only JSONL under
