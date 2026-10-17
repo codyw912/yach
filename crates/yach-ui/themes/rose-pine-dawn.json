@@ -23,9 +23,9 @@
     "border": "base04",
     "success": "base0B",
     "error": "base08",
-    "warning": "#c47b7d",
+    "warning": "#a17857",
     "muted": "base04",
-    "dim": "base03",
+    "dim": "base04",
     "text": "base05",
     "selectedBackground": "base02",
     "selectedText": "base05",
@@ -40,6 +40,6 @@
     "diffRemoved": "base08",
     "diffContext": "base04",
     "diffHunk": "base0D",
-    "harness": "base0C"
+    "harness": "#568a99"
   }
 }

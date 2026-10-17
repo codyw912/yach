@@ -9,24 +9,24 @@ pub(super) const fn dark() -> Theme {
             border: Color::Rgb(95, 135, 255),
             success: Color::Rgb(181, 189, 104),
             error: Color::Rgb(204, 102, 102),
-            warning: Color::Yellow,
+            warning: Color::Rgb(240, 198, 116),
             muted: Color::Rgb(128, 128, 128),
-            dim: Color::Rgb(102, 102, 102),
-            text: Color::White,
+            dim: Color::Rgb(110, 110, 110),
+            text: Color::Rgb(234, 234, 234),
             selected_background: Color::Rgb(58, 58, 74),
-            selected_text: Color::White,
+            selected_text: Color::Rgb(234, 234, 234),
             user_message_background: Color::Rgb(52, 53, 65),
-            user_message_text: Color::White,
+            user_message_text: Color::Rgb(234, 234, 234),
             tool_pending_background: Color::Rgb(40, 40, 50),
             tool_success_background: Color::Rgb(40, 40, 50),
             tool_error_background: Color::Rgb(60, 40, 40),
-            tool_title: Color::White,
+            tool_title: Color::Rgb(234, 234, 234),
             tool_output: Color::Rgb(192, 192, 192),
             diff_added: Color::Rgb(181, 189, 104),
             diff_removed: Color::Rgb(204, 102, 102),
             diff_context: Color::Rgb(128, 128, 128),
             diff_hunk: Color::Rgb(0, 215, 255),
-            harness: Color::Magenta,
+            harness: Color::Rgb(178, 148, 187),
         },
         spacing: ThemeSpacing {
             user_message_horizontal_padding: 1,
@@ -41,13 +41,13 @@ pub(super) const fn dark() -> Theme {
 
 /// Measured against WCAG relative luminance, 2026-10-06. Every body-text
 /// role is at least 4.5:1 on every painted surface; accents are at least
-/// 3:1 on the panel. Do not "tidy" a channel without re-measuring.
+/// 3:1 on both tool panels. Do not "tidy" a channel without re-measuring.
 pub(super) const fn light() -> Theme {
     Theme {
         colors: ThemeColors {
             text: Color::Rgb(36, 36, 48),
             muted: Color::Rgb(98, 98, 112),
-            dim: Color::Rgb(150, 150, 160),
+            dim: Color::Rgb(136, 136, 146),
             accent: Color::Rgb(0, 95, 175),
             border: Color::Rgb(120, 130, 170),
             success: Color::Rgb(30, 120, 50),

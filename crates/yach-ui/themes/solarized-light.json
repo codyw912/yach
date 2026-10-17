@@ -23,9 +23,9 @@
     "border": "base04",
     "success": "#788c23",
     "error": "base08",
-    "warning": "#9e821d",
+    "warning": "#907e2f",
     "muted": "base04",
-    "dim": "base03",
+    "dim": "base04",
     "text": "base06",
     "selectedBackground": "base02",
     "selectedText": "base06",
@@ -33,13 +33,13 @@
     "userMessageText": "base06",
     "toolPendingBackground": "base01",
     "toolSuccessBackground": "base01",
-    "toolErrorBackground": "#ebcdbc",
+    "toolErrorBackground": "#fae2d1",
     "toolTitle": "base06",
     "toolOutput": "base06",
     "diffAdded": "#788c23",
     "diffRemoved": "base08",
     "diffContext": "base04",
     "diffHunk": "base0D",
-    "harness": "#38928e"
+    "harness": "#3c8d8a"
   }
 }

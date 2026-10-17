@@ -89,7 +89,7 @@ mod tests {
     use crate::theme::palette_test::{
         COLOR_TOKENS, LIGHT_PALETTES, assert_appearance, notice_attributes, themes_dir,
     };
-    use crate::theme::{Theme, ThemeDocument};
+    use crate::theme::{ColorValue, Theme, ThemeDocument, resolve_color};
 
     #[test]
     fn bundled_palette_files_parse_and_cover_every_token() -> Result<(), String> {
@@ -151,7 +151,13 @@ mod tests {
                 .apply(preset)
                 .map_err(|error| format!("{}: apply {error}", palette.name))?;
             assert_appearance(&theme, palette.name, light)?;
-            assert_preset_contrast(&theme);
+            let page = resolve_color(
+                &ColorValue::Name(String::from("base00")),
+                &document.vars,
+                &mut BTreeSet::new(),
+            )
+            .map_err(|error| format!("{}: page {error}", palette.name))?;
+            assert_preset_contrast(&theme, Some(page));
         }
         Ok(())
     }
