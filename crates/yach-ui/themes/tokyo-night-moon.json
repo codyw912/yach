@@ -24,8 +24,8 @@
     "success": "base0B",
     "error": "base08",
     "warning": "base0A",
-    "muted": "base04",
-    "dim": "base03",
+    "muted": "base05",
+    "dim": "base05",
     "text": "base06",
     "selectedBackground": "base02",
     "selectedText": "base06",
@@ -38,7 +38,7 @@
     "toolOutput": "base06",
     "diffAdded": "base0B",
     "diffRemoved": "base08",
-    "diffContext": "base04",
+    "diffContext": "base05",
     "diffHunk": "base0D",
     "harness": "base0C"
   }

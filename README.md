@@ -275,6 +275,13 @@ appearance. When the guess is wrong, set `YACH_THEME=light`,
 `YACH_THEME=dark`, or `YACH_THEME=system`. `system` paints no panel surfaces
 and uses the terminal's default text colors.
 
+Status messages use muted text for information, warning text when user action
+is needed, and error text for failures or invalid provider configuration. A
+connected backend with an error status uses a warning connection dot. On narrow
+panes, status text truncates before the approval indicator is removed. Approval
+outlasts context and every other non-model segment, keeping full-access visible
+whenever another non-model segment could fit. Model identity is retained longest.
+
 | Preset | Surfaces |
 | --- | --- |
 | `dark` | Painted dark panels; the fallback behind `auto` when detection says dark. |
@@ -290,6 +297,15 @@ or `"base": "nord"`). They are 24-bit; on a limited-color terminal use
 `tokyo-night-storm`, `tokyo-night-moon`, `tokyo-night-light`,
 `solarized-dark`, `solarized-light`, `dracula`, `nord`, and `monokai`.
 Attribution is in [the palette NOTICE](crates/yach-ui/themes/NOTICE.md).
+
+Bundled palettes and painted presets are tested for body-text contrast of
+at least 4.5:1 on their painted surfaces. Muted, success, warning, error,
+and harness colors clear 3:1 on both pending and error panels; accent clears
+3:1 on pending and user-message panels. Bundled palettes also require muted
+and dim colors to clear 3:1 on the scheme's page background (`base00`).
+Presets leave the page color to the terminal, so that pair cannot be tested.
+The `dark` preset uses explicit RGB foregrounds on its painted panels rather
+than relying on the terminal's ANSI palette.
 
 A theme file is strict JSON. `base` names the theme its overrides apply to
 and defaults to `dark`, so an existing file without `base` keeps its meaning.

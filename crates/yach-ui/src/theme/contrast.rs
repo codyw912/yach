@@ -18,11 +18,11 @@ pub(crate) fn contrast_ratio(a: Color, b: Color) -> Option<f64> {
     Some((lighter + 0.05) / (darker + 0.05))
 }
 
-/// Body text on every painted surface is at least 4.5:1. `muted`,
-/// `success`, `warning`, `error`, and `harness` are at least 3:1 against
-/// the tool panel. Presets and palettes share this bar.
+/// Body text on every painted surface is at least 4.5:1. Secondary and
+/// semantic roles clear 3:1 on both tool panels; accent clears the pending
+/// and user panels. Palettes also check muted and dim on their page color.
 #[cfg(test)]
-pub(crate) fn assert_preset_contrast(theme: &Theme) {
+pub(crate) fn assert_preset_contrast(theme: &Theme, page: Option<Color>) {
     assert_eq!(theme.mode(), ThemeMode::Painted);
     let panel = theme
         .tool_surface(ToolState::Pending)
@@ -67,7 +67,35 @@ pub(crate) fn assert_preset_contrast(theme: &Theme) {
         ("harness", theme.harness()),
     ] {
         let foreground = style.fg.unwrap_or(Color::Reset);
-        assert_contrast_at_least(name, foreground, panel, 3.0);
+        assert_contrast_at_least(&format!("{name} on pending panel"), foreground, panel, 3.0);
+        assert_contrast_at_least(
+            &format!("{name} on error panel"),
+            foreground,
+            error_panel,
+            3.0,
+        );
+    }
+    let accent = theme.accent().fg.unwrap_or(Color::Reset);
+    assert_contrast_at_least("accent on pending panel", accent, panel, 3.0);
+    assert_contrast_at_least(
+        "accent on user panel",
+        accent,
+        theme.user_message().bg.unwrap_or(Color::Reset),
+        3.0,
+    );
+    if let Some(page) = page {
+        assert_contrast_at_least(
+            "muted on page",
+            theme.muted().fg.unwrap_or(Color::Reset),
+            page,
+            3.0,
+        );
+        assert_contrast_at_least(
+            "dim on page",
+            theme.dim().fg.unwrap_or(Color::Reset),
+            page,
+            3.0,
+        );
     }
 }
 

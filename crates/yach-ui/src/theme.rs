@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn dark_preset_keeps_todays_pi_dark_values() {
+    fn dark_preset_keeps_explicit_rgb_palette_values() {
         let theme = Theme::dark();
         assert_eq!(theme.mode(), ThemeMode::Painted);
         assert_eq!(Theme::default(), theme);
@@ -641,24 +641,24 @@ mod tests {
         assert_eq!(theme.colors.border, Color::Rgb(95, 135, 255));
         assert_eq!(theme.colors.success, Color::Rgb(181, 189, 104));
         assert_eq!(theme.colors.error, Color::Rgb(204, 102, 102));
-        assert_eq!(theme.colors.warning, Color::Yellow);
+        assert_eq!(theme.colors.warning, Color::Rgb(240, 198, 116));
         assert_eq!(theme.colors.muted, Color::Rgb(128, 128, 128));
-        assert_eq!(theme.colors.dim, Color::Rgb(102, 102, 102));
-        assert_eq!(theme.colors.text, Color::White);
+        assert_eq!(theme.colors.dim, Color::Rgb(110, 110, 110));
+        assert_eq!(theme.colors.text, Color::Rgb(234, 234, 234));
         assert_eq!(theme.colors.selected_background, Color::Rgb(58, 58, 74));
-        assert_eq!(theme.colors.selected_text, Color::White);
+        assert_eq!(theme.colors.selected_text, Color::Rgb(234, 234, 234));
         assert_eq!(theme.colors.user_message_background, Color::Rgb(52, 53, 65));
-        assert_eq!(theme.colors.user_message_text, Color::White);
+        assert_eq!(theme.colors.user_message_text, Color::Rgb(234, 234, 234));
         assert_eq!(theme.colors.tool_pending_background, Color::Rgb(40, 40, 50));
         assert_eq!(theme.colors.tool_success_background, Color::Rgb(40, 40, 50));
         assert_eq!(theme.colors.tool_error_background, Color::Rgb(60, 40, 40));
-        assert_eq!(theme.colors.tool_title, Color::White);
+        assert_eq!(theme.colors.tool_title, Color::Rgb(234, 234, 234));
         assert_eq!(theme.colors.tool_output, Color::Rgb(192, 192, 192));
         assert_eq!(theme.colors.diff_added, Color::Rgb(181, 189, 104));
         assert_eq!(theme.colors.diff_removed, Color::Rgb(204, 102, 102));
         assert_eq!(theme.colors.diff_context, Color::Rgb(128, 128, 128));
         assert_eq!(theme.colors.diff_hunk, Color::Rgb(0, 215, 255));
-        assert_eq!(theme.colors.harness, Color::Magenta);
+        assert_eq!(theme.colors.harness, Color::Rgb(178, 148, 187));
         assert_eq!(theme.spacing.user_message_horizontal_padding, 1);
         assert_eq!(theme.spacing.user_message_vertical_padding, 1);
         assert_eq!(theme.spacing.tool_horizontal_padding, 1);
@@ -856,8 +856,13 @@ mod tests {
 
     #[test]
     fn dark_and_light_paint_explicit_pairs_at_spec_contrast() {
-        for theme in [Theme::dark(), Theme::light()] {
-            assert_preset_contrast(&theme);
+        // Presets paint no page of their own; measure muted and dim against a
+        // typical terminal background for each appearance.
+        for (theme, page) in [
+            (Theme::dark(), Color::Rgb(28, 28, 28)),
+            (Theme::light(), Color::Rgb(250, 250, 250)),
+        ] {
+            assert_preset_contrast(&theme, Some(page));
             for (name, surface) in painted_surfaces(&theme) {
                 assert!(!is_reset(fg(surface)), "{name} fg is Reset");
                 assert!(!is_reset(bg(surface)), "{name} bg is Reset");

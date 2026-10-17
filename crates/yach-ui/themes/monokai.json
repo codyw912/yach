@@ -33,7 +33,7 @@
     "userMessageText": "base05",
     "toolPendingBackground": "base01",
     "toolSuccessBackground": "base01",
-    "toolErrorBackground": "#55353a",
+    "toolErrorBackground": "#47282e",
     "toolTitle": "base06",
     "toolOutput": "base05",
     "diffAdded": "base0B",

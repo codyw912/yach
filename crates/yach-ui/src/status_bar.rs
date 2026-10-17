@@ -7,15 +7,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::Theme;
 
-const PRIORITY_CONTEXT: u8 = 100;
-const PRIORITY_MODEL: u8 = 99;
-// A status message answers the user's last action -- a suggestion for a
-// mistyped command, a refused submission, a review hint -- and is the only
-// segment that is transient. Ranking it below the ambient segments meant it
-// was dropped first on a narrow bar, exactly when the user needed it, while
-// the always-visible mode indicators kept their space.
+// Keep model identity longest, so even a model-only bar identifies the active
+// provider. Approval is the last non-model segment: permission safety matters
+// more than context health or transient feedback, especially in full-access.
+const PRIORITY_MODEL: u8 = 100;
+const PRIORITY_APPROVAL: u8 = 99;
+const PRIORITY_CONTEXT: u8 = 98;
+// A status answers the user's last action. Keep it above ambient details and
+// truncate it before sacrificing approval, rather than losing that feedback.
 const PRIORITY_STATUS: u8 = 95;
-const PRIORITY_APPROVAL: u8 = 90;
 const PRIORITY_REVIEWER: u8 = 85;
 const PRIORITY_CONNECTION: u8 = 80;
 const PRIORITY_COMPACTION: u8 = 60;
@@ -23,6 +23,42 @@ const PRIORITY_COMPACTION: u8 = 60;
 // the context-health meter, which is the actionable number.
 const PRIORITY_TOKENS: u8 = 50;
 const SEGMENT_SEPARATOR: &str = "  ";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusMessage {
+    pub text: String,
+    pub severity: StatusSeverity,
+}
+
+impl StatusMessage {
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            severity: StatusSeverity::Info,
+        }
+    }
+
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            severity: StatusSeverity::Warning,
+        }
+    }
+
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            severity: StatusSeverity::Error,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentId {
@@ -62,7 +98,7 @@ pub struct StatusBar<'a> {
     pub approval_mode: &'a str,
     /// Active reviewer id when `approval_mode == "auto-review"`.
     pub reviewer_id: Option<&'a str>,
-    pub status_message: &'a str,
+    pub status_message: &'a StatusMessage,
     pub is_connected: bool,
     pub compaction_count: u64,
     /// Provider-reported tokens summed across the session, when any turn
@@ -121,10 +157,10 @@ impl StatusBar<'_> {
                 PRIORITY_TOKENS,
             ));
         }
-        if !self.status_message.is_empty() {
+        if !self.status_message.text.is_empty() {
             segments.push(Segment::new(
                 SegmentId::Status,
-                self.status_message,
+                self.status_message.text.as_str(),
                 PRIORITY_STATUS,
             ));
         }
@@ -146,6 +182,7 @@ impl Widget for StatusBar<'_> {
                 self.is_connected,
                 self.context_used_percent,
                 self.approval_mode,
+                self.status_message.severity,
                 self.theme,
             );
             spans.push(Span::styled(segment.text, style));
@@ -220,11 +257,14 @@ fn segment_style(
     is_connected: bool,
     context_used_percent: Option<u8>,
     approval_mode: &str,
+    severity: StatusSeverity,
     theme: &Theme,
 ) -> Style {
     match id {
         SegmentId::Connection => {
-            if is_connected {
+            if is_connected && severity == StatusSeverity::Error {
+                theme.warning()
+            } else if is_connected {
                 theme.success()
             } else {
                 theme.error()
@@ -244,7 +284,12 @@ fn segment_style(
             _ => theme.error(),
         },
         SegmentId::Compaction => theme.harness(),
-        SegmentId::Tokens | SegmentId::Status => theme.muted(),
+        SegmentId::Tokens => theme.muted(),
+        SegmentId::Status => match severity {
+            StatusSeverity::Info => theme.muted(),
+            StatusSeverity::Warning => theme.warning(),
+            StatusSeverity::Error => theme.error(),
+        },
     }
 }
 
@@ -293,11 +338,126 @@ pub(crate) fn format_token_capacity(tokens: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Segment, SegmentId, StatusBar, fit_segments, format_context_meter, format_token_capacity,
-        model_segment_text, segment_style, segment_width,
+        Segment, SegmentId, StatusBar, StatusMessage, StatusSeverity, fit_segments,
+        format_context_meter, format_token_capacity, model_segment_text, segment_style,
+        segment_width,
     };
     use crate::theme::Theme;
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+    #[test]
+    fn status_severity_colors_text_and_warns_on_connected_errors() {
+        let theme = Theme::default();
+        for (severity, expected) in [
+            (StatusSeverity::Info, theme.muted()),
+            (StatusSeverity::Warning, theme.warning()),
+            (StatusSeverity::Error, theme.error()),
+        ] {
+            let status = StatusMessage {
+                text: String::from("notice"),
+                severity,
+            };
+            let area = Rect::new(0, 0, 120, 1);
+            let mut buffer = Buffer::empty(area);
+            Widget::render(
+                StatusBar {
+                    model: "default",
+                    thinking_level: "off",
+                    approval_mode: "review",
+                    reviewer_id: None,
+                    status_message: &status,
+                    is_connected: true,
+                    compaction_count: 0,
+                    total_tokens: None,
+                    context_used_percent: None,
+                    context_window: None,
+                    theme: &theme,
+                },
+                area,
+                &mut buffer,
+            );
+            let rendered = (0..area.width)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect::<String>();
+            assert!(rendered.contains("notice"));
+            for x in 0..area.width.saturating_sub(5) {
+                // Match cells rather than treating UTF-8 bytes as columns.
+                if (x..x + 6)
+                    .zip(["n", "o", "t", "i", "c", "e"])
+                    .all(|(cell, symbol)| buffer[(cell, 0)].symbol() == symbol)
+                {
+                    for cell in x..x + 6 {
+                        assert_eq!(Some(buffer[(cell, 0)].fg), expected.fg);
+                    }
+                }
+            }
+            let dot_style = if severity == StatusSeverity::Error {
+                theme.warning()
+            } else {
+                theme.success()
+            };
+            assert_eq!(Some(buffer[(0, 0)].fg), dot_style.fg);
+        }
+    }
+
+    #[test]
+    fn approval_survives_a_long_status_at_fixture_and_narrow_widths() {
+        let theme = Theme::default();
+        let bar = StatusBar {
+            model: "default",
+            thinking_level: "off",
+            approval_mode: "review",
+            reviewer_id: None,
+            status_message: &StatusMessage::info(
+                "invalid_config; set the provider environment and relaunch yach tui",
+            ),
+            is_connected: true,
+            compaction_count: 0,
+            total_tokens: Some(554),
+            context_used_percent: None,
+            context_window: None,
+            theme: &theme,
+        };
+        for width in [100, 60] {
+            let fitted = fit_segments(bar.segments(), width);
+            assert!(
+                fitted
+                    .iter()
+                    .any(|segment| segment.text == "approval:review")
+            );
+            assert!(fitted.iter().any(|segment| segment.id == SegmentId::Status));
+            assert!(segment_width(&fitted) <= usize::from(width));
+        }
+    }
+
+    #[test]
+    fn full_access_outlasts_every_non_model_segment() {
+        let theme = Theme::default();
+        let bar = StatusBar {
+            model: "default",
+            thinking_level: "off",
+            approval_mode: "full-access",
+            reviewer_id: Some("reviewer"),
+            status_message: &StatusMessage::info("an actionable status that needs truncation"),
+            is_connected: true,
+            compaction_count: 3,
+            total_tokens: Some(554),
+            context_used_percent: Some(92),
+            context_window: Some((200_000, false)),
+            theme: &theme,
+        };
+        for width in 0..=180 {
+            let fitted = fit_segments(bar.segments(), width);
+            if fitted.iter().any(|segment| segment.id != SegmentId::Model) {
+                assert!(
+                    fitted
+                        .iter()
+                        .any(|segment| segment.text == "approval:full-access"),
+                    "full-access was lost at width {width}: {fitted:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn truncated_status_respects_terminal_cells_for_wide_glyphs() {
@@ -319,7 +479,7 @@ mod tests {
                     thinking_level: "off",
                     approval_mode: "review",
                     reviewer_id: None,
-                    status_message: message,
+                    status_message: &StatusMessage::info(message),
                     is_connected: true,
                     compaction_count: 0,
                     total_tokens: Some(554),
@@ -349,7 +509,9 @@ mod tests {
             thinking_level: "off",
             approval_mode: "review",
             reviewer_id: None,
-            status_message: "unknown command /aproval \u{2014} did you mean /approval?",
+            status_message: &StatusMessage::info(
+                "unknown command /aproval \u{2014} did you mean /approval?",
+            ),
             is_connected: true,
             compaction_count: 3,
             total_tokens: Some(554),
@@ -402,7 +564,7 @@ mod tests {
                 thinking_level: "high",
                 approval_mode: "review",
                 reviewer_id: None,
-                status_message: "ready",
+                status_message: &StatusMessage::info("ready"),
                 is_connected: true,
                 compaction_count: 0,
                 total_tokens: None,
@@ -425,7 +587,14 @@ mod tests {
     #[test]
     fn full_access_approval_segment_uses_danger_color() {
         let theme = Theme::default();
-        let style = segment_style(SegmentId::Approval, true, None, "full-access", &theme);
+        let style = segment_style(
+            SegmentId::Approval,
+            true,
+            None,
+            "full-access",
+            StatusSeverity::Info,
+            &theme,
+        );
         assert_eq!(style.fg, theme.error().fg);
     }
 
