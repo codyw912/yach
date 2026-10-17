@@ -519,6 +519,9 @@ pub struct SessionMessage {
     pub entry_id: Option<String>,
     #[serde(default)]
     pub tool_name: Option<String>,
+    /// Argument-derived call target, reconstructed from the session log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_preview: Option<String>,
     #[serde(default)]
     pub is_error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
