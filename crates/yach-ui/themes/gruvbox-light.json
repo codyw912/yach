@@ -21,11 +21,11 @@
   "colors": {
     "accent": "base0D",
     "border": "base04",
-    "success": "#817f21",
+    "success": "#79740e",
     "error": "base08",
     "warning": "#997229",
     "muted": "base04",
-    "dim": "base03",
+    "dim": "base04",
     "text": "base05",
     "selectedBackground": "base02",
     "selectedText": "base05",
@@ -33,13 +33,13 @@
     "userMessageText": "base05",
     "toolPendingBackground": "base01",
     "toolSuccessBackground": "base01",
-    "toolErrorBackground": "#e6c09c",
+    "toolErrorBackground": "#f4d2ae",
     "toolTitle": "base06",
     "toolOutput": "base05",
-    "diffAdded": "#817f21",
+    "diffAdded": "#79740e",
     "diffRemoved": "base08",
     "diffContext": "base04",
     "diffHunk": "base0D",
-    "harness": "#5d845d"
+    "harness": "#427b58"
   }
 }
