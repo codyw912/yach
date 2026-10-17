@@ -147,6 +147,7 @@ mod tests {
             text: text.to_owned(),
             entry_id: Some(entry_id.to_owned()),
             tool_name: None,
+            tool_preview: None,
             is_error: None,
             outcome_kind: None,
             tool_result_metadata: None,

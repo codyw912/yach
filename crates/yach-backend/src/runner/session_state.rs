@@ -94,7 +94,7 @@ pub(super) fn send_native_session_messages_from_log(
         }
     }
 
-    let mut tool_names_by_request_id = BTreeMap::new();
+    let mut tool_calls_by_request_id = BTreeMap::new();
     let messages = log
         .events
         .iter()
@@ -109,6 +109,7 @@ pub(super) fn send_native_session_messages_from_log(
                 text: text.clone(),
                 entry_id: Some(entry_id.0.clone()),
                 tool_name: None,
+                tool_preview: None,
                 is_error: None,
                 outcome_kind: None,
                 tool_result_metadata: None,
@@ -118,11 +119,16 @@ pub(super) fn send_native_session_messages_from_log(
                 turn_id,
                 tool_request_id,
                 tool_name,
+                argument_content,
                 ..
             } => {
-                tool_names_by_request_id.insert(
+                let preview = argument_content
+                    .as_deref()
+                    .and_then(|content| serde_json::from_str(content).ok())
+                    .and_then(|arguments| super::provider_tool_call_preview(tool_name, &arguments));
+                tool_calls_by_request_id.insert(
                     (turn_id.0.clone(), tool_request_id.0.clone()),
-                    tool_name.clone(),
+                    (tool_name.clone(), preview),
                 );
                 None
             }
@@ -136,10 +142,10 @@ pub(super) fn send_native_session_messages_from_log(
                 ..
             } => {
                 let review_key = (turn_id.0.clone(), tool_request_id.0.clone());
-                let tool_name = tool_names_by_request_id
+                let (tool_name, tool_preview) = tool_calls_by_request_id
                     .get(&review_key)
                     .cloned()
-                    .unwrap_or_else(|| String::from("tool"));
+                    .unwrap_or_else(|| (String::from("tool"), None));
                 let text = if let Some(bytes_freed) =
                     masked_result_bytes.get(&(turn_id.clone(), tool_request_id.clone()))
                 {
@@ -171,6 +177,7 @@ pub(super) fn send_native_session_messages_from_log(
                     text,
                     entry_id: Some(tool_request_id.0.clone()),
                     tool_name: Some(tool_name),
+                    tool_preview,
                     is_error: Some(*outcome != ToolOutcome::Completed),
                     outcome_kind: super::harness_outcome_kind(*outcome, reason.as_deref()),
                     tool_result_metadata: result_summary.as_ref().map(|summary| {
@@ -211,6 +218,9 @@ pub(super) fn send_native_session_messages_from_log(
                     text,
                     entry_id: Some(tool_request_id.0.clone()),
                     tool_name: Some(tool_name.clone()),
+                    tool_preview: tool_calls_by_request_id
+                        .get(&(turn_id.0.clone(), tool_request_id.0.clone()))
+                        .and_then(|(_, preview)| preview.clone()),
                     is_error: Some(true),
                     outcome_kind: Some(outcome_kind),
                     tool_result_metadata: None,
@@ -236,6 +246,7 @@ pub(super) fn send_native_session_messages_from_log(
                 ),
                 entry_id: Some(checkpoint_id.0.clone()),
                 tool_name: None,
+                tool_preview: None,
                 is_error: None,
                 outcome_kind: None,
                 tool_result_metadata: None,
@@ -253,6 +264,7 @@ pub(super) fn send_native_session_messages_from_log(
                     .unwrap_or_else(|| String::from("turn failed")),
                 entry_id: Some(turn_id.0.clone()),
                 tool_name: None,
+                tool_preview: None,
                 is_error: Some(true),
                 outcome_kind: Some(kind),
                 tool_result_metadata: None,
@@ -613,4 +625,60 @@ fn count_native_role(messages: &[Role], role: Role) -> Option<u64> {
             .count(),
     )
     .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::send_native_session_messages_from_log;
+    use crate::{SessionEvent, SessionLog};
+    use tokio::sync::mpsc;
+    use yach_proto::{BackendEvent, ServerEvent};
+
+    #[test]
+    fn resumed_tool_previews_use_persisted_arguments_and_accept_legacy_logs() {
+        for (argument_content, expected_preview) in [
+            (Some(r#"{"path":"src/lib.rs"}"#), Some("src/lib.rs")),
+            (None, None),
+            (Some("invalid JSON"), None),
+        ] {
+            let mut log = SessionLog::default();
+            for line in include_str!("../../../../tests/visual/session.jsonl").lines() {
+                let mut event: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(event) => event,
+                    Err(error) => unreachable!("fixture JSON should load: {error}"),
+                };
+                if event["type"] == "tool_request_recorded" {
+                    if let Some(arguments) = argument_content {
+                        event["argument_content"] = serde_json::json!(arguments);
+                    } else if let Some(fields) = event.as_object_mut() {
+                        fields.remove("argument_content");
+                    }
+                }
+                let event = match serde_json::from_value::<SessionEvent>(event) {
+                    Ok(event) => event,
+                    Err(error) => unreachable!("session event should load: {error}"),
+                };
+                log.push(event);
+            }
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            send_native_session_messages_from_log(&tx, &log);
+            let Ok(BackendEvent::Server(ServerEvent::SessionMessagesUpdated { messages })) =
+                rx.try_recv()
+            else {
+                unreachable!("session messages expected");
+            };
+            let tools: Vec<_> = messages
+                .iter()
+                .filter(|message| message.role == "tool")
+                .collect();
+            assert_eq!(tools.len(), 3);
+            for message in tools {
+                assert_eq!(message.tool_preview.as_deref(), expected_preview);
+                assert!(matches!(
+                    message.tool_name.as_deref(),
+                    Some("read_text_file" | "edit_text_file")
+                ));
+            }
+        }
+    }
 }

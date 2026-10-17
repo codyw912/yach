@@ -50,7 +50,8 @@ Works today:
   `ClientEvent`/`ServerEvent` surface as UTF-8 JSONL over stdin/stdout;
   malformed lines are recoverable and diagnostics stay on stderr.
 - Sessions persisted as inspectable JSONL; `/resume` and `--resume` restore
-  the transcript (including tool output) and the model's context.
+  the transcript (including tool output and argument-derived tool targets) and
+  the model's context. Older logs without tool arguments show bare tool names.
 - Sensitive files (`.env*`, key material, credential stores) denied to all
   file tools by default, overridable in config.
 - Early extension runtime: manifest-based, process-hosted extension tools
