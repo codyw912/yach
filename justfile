@@ -39,6 +39,10 @@ run *args:
 tui-visual *tapes:
   just --justfile "{{justfile()}}" dev bash tests/visual/render.sh {{tapes}}
 
+# Capture every bundled palette and preset as ANSI, HTML, and labeled PNG grids.
+tui-themes out-label="capture":
+  just --justfile "{{justfile()}}" dev bash tests/visual/theme-grid.sh {{quote(out-label)}}
+
 build:
   just --justfile "{{justfile()}}" dev cargo build
 
