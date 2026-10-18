@@ -495,17 +495,31 @@ fn auto_theme(appearance: yach_ui::Appearance) -> Theme {
     }
 }
 
+/// `NO_COLOR` removes color, not layout (https://no-color.org/): the theme
+/// is resolved as usual, so its errors and notices still surface, and only
+/// its colors are replaced.
 fn resolve_theme(
     env: &ThemeEnv,
     extensions: &dyn yach_ui::ExtensionThemes,
 ) -> Result<(Theme, Vec<String>), String> {
+    let (theme, notices) = resolve_theme_sources(env, extensions)?;
     if env
         .no_color
         .as_deref()
         .is_some_and(|value| !value.is_empty())
     {
-        return Ok((Theme::monochrome(), Vec::new()));
+        let mut monochrome = Theme::monochrome();
+        monochrome.spacing = theme.spacing;
+        monochrome.composer = theme.composer;
+        return Ok((monochrome, notices));
     }
+    Ok((theme, notices))
+}
+
+fn resolve_theme_sources(
+    env: &ThemeEnv,
+    extensions: &dyn yach_ui::ExtensionThemes,
+) -> Result<(Theme, Vec<String>), String> {
     let appearance = yach_ui::appearance_from_colorfgbg(env.colorfgbg.as_deref());
     let auto = auto_theme(appearance);
     if let Some(requested) = env.yach_theme.as_deref().filter(|value| !value.is_empty()) {
@@ -6248,7 +6262,7 @@ mod tests {
         NewConnectionDraft, ProviderKind, ProviderSecret,
     };
     use yach_proto::{BackendEvent, ClientEvent, PromptOutcome, ServerEvent};
-    use yach_ui::{Theme, ThemeMode, negotiate_with};
+    use yach_ui::{ComposerStyle, Theme, ThemeMode, negotiate_with};
 
     trait TestUnwrap {
         type Output;
@@ -6563,26 +6577,43 @@ mod tests {
     }
 
     #[test]
-    fn resolve_theme_no_color_overrides_every_source() -> Result<(), String> {
+    fn resolve_theme_no_color_keeps_layout_and_drops_color() -> Result<(), String> {
         let root = TestTempDir::new("theme-no-color")?;
         let home = root.path().join("home");
-        theme_file(&home, "not json")?;
-        for requested in [
-            None,
-            Some("light"),
-            Some("unknown:theme"),
-            Some("./missing.json"),
-        ] {
-            for no_color in ["1", "0", " "] {
-                let (theme, notices) = resolve_theme(
-                    &theme_env(requested, Some(no_color), Some("0;15"), Some(&home)),
-                    &(),
-                )?;
-                expect_equal(&theme, &Theme::monochrome())?;
-                expect_equal(&theme.mode(), &ThemeMode::Mono)?;
-                expect_true(notices.is_empty(), "NO_COLOR is silent")?;
-            }
+        theme_file(
+            &home,
+            r#"{"base":"nord","composer":{"style":"rule"},"spacing":{"toolGap":3}}"#,
+        )?;
+        let (painted, _) = resolve_theme(&theme_env(None, None, Some("0;15"), Some(&home)), &())?;
+        expect_equal(&painted.spacing.tool_gap, &3)?;
+        let mut expected = Theme::monochrome();
+        expected.spacing = painted.spacing;
+        expected.composer = ComposerStyle::Rule;
+        for no_color in ["1", "0", " "] {
+            let (theme, notices) = resolve_theme(
+                &theme_env(None, Some(no_color), Some("0;15"), Some(&home)),
+                &(),
+            )?;
+            expect_equal(&theme, &expected)?;
+            expect_equal(&theme.mode(), &ThemeMode::Mono)?;
+            expect_true(notices.is_empty(), "a valid file under NO_COLOR is silent")?;
         }
+        // An explicit name that does not resolve still explains itself.
+        let (theme, notices) = resolve_theme(
+            &theme_env(Some("unknown:theme"), Some("1"), Some("0;15"), Some(&home)),
+            &(),
+        )?;
+        expect_equal(&theme, &Theme::monochrome())?;
+        expect_equal(&notices.len(), &1)?;
+        // A broken personal file fails with or without NO_COLOR.
+        theme_file(&home, "not json")?;
+        for no_color in [None, Some("1")] {
+            expect_true(
+                resolve_theme(&theme_env(None, no_color, None, Some(&home)), &()).is_err(),
+                "a broken personal file is an error",
+            )?;
+        }
+        // Empty NO_COLOR is unset.
         let (theme, _) =
             resolve_theme(&theme_env(Some("light"), Some(""), None, Some(&home)), &())?;
         expect_equal(&theme, &Theme::light())?;

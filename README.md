@@ -183,8 +183,8 @@ Environment:
 | `YACH_RIG_OPENAI_MODEL` | — | Model id; required when the provider is `openai`. |
 | `YACH_RIG_OPENAI_COMPAT_BASE_URL` / `_API_KEY` / `_MODEL` | — | Required when `YACH_RIG_PROVIDER=openai-compatible`. |
 | `YACH_RIG_PROVIDER_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
-| `YACH_THEME` | user file, then `auto` | Preset (`dark`, `light`, `system`, `auto`), bundled palette name, or explicit path to a theme JSON file. A non-empty `NO_COLOR` overrides it. |
-| `NO_COLOR` | unset | Non-empty selects the monochrome theme and overrides `YACH_THEME` and `~/.yach/theme.json`. |
+| `YACH_THEME` | user file, then `auto` | Preset (`dark`, `light`, `system`, `auto`), bundled palette name, or explicit path to a theme JSON file. A non-empty `NO_COLOR` replaces its colors and keeps its `spacing` and `composer`. |
+| `NO_COLOR` | unset | Non-empty selects monochrome colors. The selected theme's `spacing` and `composer` still apply, and theme file errors are still reported. |
 | `COLORFGBG` | unset | Read only when the theme is `auto`. Last field below 8 selects `dark`; otherwise `light`. Absent or unparsable selects `dark`. |
 | `YACH_SESSION_DIR` | project-keyed directory under `~/.yach/sessions/` | Absolute override for session storage and lookup. |
 | `YACH_CAPTURE_REQUESTS` | off | Absolute directory. Writes each OpenAI, OpenAI-compatible, ChatGPT-subscription, and native-compaction request body, one private file per attempt. Anthropic requests are not captured. Authentication headers are never written; bodies are the exact request bodies, so they contain whatever the prompt and files contain. Keep capture off unless diagnosing a request. |
@@ -257,14 +257,16 @@ Invalid config fails closed to the defaults.
 
 ### TUI appearance
 
-TUI appearance is chosen once, at startup. `NO_COLOR` set to any non-empty
-value wins over everything else and selects the monochrome theme. Otherwise
-the first match wins:
+TUI appearance is chosen once, at startup. The first match wins:
 
 1. Non-empty `YACH_THEME`: a preset (`dark`, `light`, `system`, `auto`), a
    bundled palette name, or an explicit path to a theme file. Empty is unset.
 2. `~/.yach/theme.json`.
 3. `auto`.
+
+`NO_COLOR` set to any non-empty value then replaces every color with the
+monochrome theme's. The chosen theme's `spacing` and `composer` still apply,
+and a broken theme file is reported exactly as it is without `NO_COLOR`.
 
 A value that is absolute, starts with `.` or `~`, or contains a path
 separator is a path; `~/` uses your home directory. Other values are theme
