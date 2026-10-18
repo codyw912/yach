@@ -2256,6 +2256,11 @@ impl App {
                 }
                 "tool" => {
                     let tool_name = message.tool_name.as_deref().unwrap_or("tool");
+                    let label = message
+                        .tool_preview
+                        .as_deref()
+                        .filter(|preview| !preview.is_empty())
+                        .map(|preview| format!("{tool_name} {preview}"));
                     let is_error = message.is_error.unwrap_or(false);
                     let summary = tool_output_summary(
                         &message.text,
@@ -2265,7 +2270,7 @@ impl App {
                     );
                     self.transcript.append_tool_result_record(
                         message.entry_id.as_deref(),
-                        tool_name,
+                        label.as_deref().unwrap_or(tool_name),
                         &summary,
                         &message.text,
                         is_error,
@@ -5497,6 +5502,7 @@ mod tests {
             text: text.to_string(),
             entry_id: Some(entry_id.to_string()),
             tool_name: None,
+            tool_preview: None,
             is_error: None,
             outcome_kind: None,
             tool_result_metadata: None,
@@ -5515,6 +5521,7 @@ mod tests {
             text: text.to_string(),
             entry_id: Some(entry_id.to_string()),
             tool_name: Some(tool_name.to_string()),
+            tool_preview: None,
             is_error: Some(is_error),
             outcome_kind: None,
             tool_result_metadata: None,
@@ -6014,6 +6021,59 @@ mod tests {
             app.transcript.entries()[3].content,
             "failed; reason=target_exists"
         );
+    }
+
+    #[test]
+    fn resumed_tool_titles_restore_preview_and_accept_legacy_messages() {
+        for (preview, expected_title) in [
+            (Some("src/lib.rs"), "read_text_file src/lib.rs"),
+            (None, "read_text_file"),
+        ] {
+            let mut message = serde_json::json!({
+                "role": "tool",
+                "text": "pub fn greeting() {}",
+                "entry_id": "read-1",
+                "tool_name": "read_text_file",
+                "is_error": false
+            });
+            if let Some(preview) = preview {
+                message["tool_preview"] = serde_json::json!(preview);
+            }
+            let message = match serde_json::from_value(message) {
+                Ok(message) => message,
+                Err(error) => unreachable!("session message should load: {error}"),
+            };
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(tx);
+            app.session_message_hydration = SessionMessageHydration::ExplicitResume;
+            app.handle_server_event(ServerEvent::SessionMessagesUpdated {
+                messages: vec![message],
+            });
+
+            let area = Rect::new(0, 0, 100, 10);
+            let mut buffer = Buffer::empty(area);
+            crate::transcript::render(
+                area,
+                &mut buffer,
+                &app.transcript,
+                &mut crate::transcript::TranscriptRenderCache::new(),
+                0,
+                false,
+                crate::transcript::TranscriptAlignment::Top,
+            );
+            let title = (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .find(|line| line.contains("read_text_file"))
+                .unwrap_or_default();
+            assert!(title.contains(expected_title), "tool title: {title}");
+            if preview.is_none() {
+                assert!(!title.contains("src/lib.rs"), "legacy title: {title}");
+            }
+        }
     }
 
     #[test]
