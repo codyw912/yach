@@ -5,10 +5,32 @@ on:
   push:
     branches:
       - main
+  # Timing samples for choosing the perf runner: `Perf (deterministic)` on one
+  # fixed commit pair, on the chosen runner. Other jobs do not run.
+  workflow_dispatch:
+    inputs:
+      perf_runner:
+        description: Runner for Perf (deterministic)
+        type: choice
+        options:
+          - ubuntu-latest
+          - ubicloud-standard-4
+          - ubicloud-standard-8
+        default: ubuntu-latest
+      head_sha:
+        description: Full commit SHA to measure
+        type: string
+        required: true
+      base_sha:
+        description: Full commit SHA to compare against
+        type: string
+        required: true
 
 jobs:
   rust:
     name: Rust workspace
+    # A dispatch would test the dispatched branch, not `head_sha`.
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     # Normally 3-4 minutes; a hung test should fail fast, not run for hours.
     timeout-minutes: 15
@@ -54,19 +76,59 @@ jobs:
   # dependencies. Pull requests can only restore caches saved on main, so
   # pushes to main also run the comparison (against the previous main commit)
   # and save the cache that pull requests start from.
+  #
+  # `workflow_dispatch` measures `head_sha` against `base_sha` on
+  # `perf_runner`, to compare runners on one fixed pair. Both SHAs must be
+  # ancestors of `main`: checkout accepts any commit the repository can
+  # reach, including fork pull-request heads under `refs/pull/*`, so dispatch
+  # permission alone would not keep a fork's build scripts off a paid runner.
+  # Pull requests and pushes stay on `ubuntu-latest`.
   perf-deterministic:
     name: Perf (deterministic)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.perf_runner || 'ubuntu-latest' }}
     # Normally 5-10 minutes with the build cache, about 20 without it.
     timeout-minutes: 35
     env:
       CARGO_TERM_COLOR: always
-      BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+      DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+      HEAD_SHA: ${{ inputs.head_sha }}
+      BASE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
     steps:
+      # A dispatch with a malformed SHA must fail, not fall back to the
+      # dispatched branch: a run of some other commit is not a sample.
+      - name: Check dispatch inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          for sha in "$HEAD_SHA" "$BASE_SHA"; do
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::head_sha and base_sha must be full 40-character commit SHAs, got '$sha'"
+              exit 1
+            fi
+          done
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || '' }}
+
+      # Provenance before any build step: both sides must already be on
+      # `main`, not merely reachable. Fetched explicitly so the check does not
+      # depend on which refs checkout happened to bring along.
+      - name: Confirm dispatched commits are on main
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
+            echo "::error::checked out $(git rev-parse HEAD), expected head_sha $HEAD_SHA"
+            exit 1
+          fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          for sha in "$HEAD_SHA" "$BASE_SHA"; do
+            if ! git merge-base --is-ancestor "$sha" refs/remotes/origin/main 2>/dev/null; then
+              echo "::error::$sha is not on main; dispatch only measures commits already merged to main"
+              exit 1
+            fi
+          done
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.98.1
@@ -75,6 +137,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
 
       # A new branch or force-push has no usable previous commit to compare.
+      # A dispatch always names its base, so a missing one fails instead.
       - name: Materialize base
         id: base
         run: |
@@ -82,6 +145,9 @@ jobs:
             && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
             git worktree add .perf/base "$BASE_SHA"
             echo "available=true" >> "$GITHUB_OUTPUT"
+          elif [ "$DISPATCH" = true ]; then
+            echo "::error::base_sha $BASE_SHA is not a commit in this repository"
+            exit 1
           else
             echo "No base commit to compare against; skipping."
           fi
@@ -89,6 +155,7 @@ jobs:
       # After the worktree exists: restoring .perf/base/target first would
       # make `git worktree add` refuse a non-empty directory.
       - name: Cache Rust builds
+        id: cache
         if: steps.base.outputs.available == 'true'
         uses: Swatinem/rust-cache@v2.9.2
         with:
@@ -113,6 +180,32 @@ jobs:
       - name: Summarize
         if: always() && steps.base.outputs.available == 'true'
         run: ./target/release-root/release/yach-bench perf report ab.json >> "$GITHUB_STEP_SUMMARY"
+
+      # A dispatch run without a comparison document is not a timing sample.
+      # `Compare` exits non-zero on a regressed verdict and still writes the
+      # document, so this runs after any outcome.
+      - name: Check comparison document
+        if: always() && github.event_name == 'workflow_dispatch' && steps.base.outputs.available == 'true'
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          PERF_RUNNER: ${{ inputs.perf_runner }}
+        run: |
+          if [[ ! -s ab.json ]]; then
+            echo "::error::ab.json is missing or empty"
+            exit 1
+          fi
+          {
+            echo ""
+            echo "Runner: $PERF_RUNNER; head: $HEAD_SHA; base: $BASE_SHA; rust-cache exact hit: ${CACHE_HIT:-false}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload comparison document
+        if: always() && github.event_name == 'workflow_dispatch' && steps.base.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-ab-${{ inputs.perf_runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ab.json
+          if-no-files-found: error
 
   # Opt-in wall-clock gate for the headless TUI rows whose shared-runner A/A
   # spread was tight enough to budget. Size and count stay on
