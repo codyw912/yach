@@ -325,7 +325,7 @@ fn rpc_hashline_extension_recovers_from_malformed_edit_then_applies_reviewed_edi
     let malformed = child.wait_for(|event| match event {
         ServerEvent::ToolCallFinished(result)
             if result.tool_name == "edit_text_file"
-                && result.outcome_kind == Some(HarnessOutcomeKind::Failed) =>
+                && result.outcome_kind == Some(HarnessOutcomeKind::Blocked) =>
         {
             Some(result)
         }

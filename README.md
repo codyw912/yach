@@ -141,6 +141,19 @@ session-only, unsandboxed `full-access` backend posture; `--auto-review
 Use `--full-auto` only in disposable working directories, ideally containers.
 `--full-auto` and `--auto-review` are mutually exclusive.
 
+Tool panels have no vertical padding and one blank line between adjacent calls.
+Successful tool titles use regular weight; pending, error, and harness-outcome
+titles are bold. Harness rows label the outcome once and show the reason before
+any other detail, without line/byte counts. Malformed edit requests (bad patch
+syntax, empty or oversized transactions, duplicate targets) are `blocked`; an
+edit that does not match the current file (stale snapshot, hunk not found, hash
+mismatch) is `failed`, because the model must re-read before retrying. Blocked,
+denied, cancelled, and limit outcomes use neutral panels, while failed outcomes
+use the error surface. `Ctrl+O` expands tool output and
+diffs; omission markers show this shortcut. The status bar labels token totals
+as `tok:`. User and assistant text share a two-column gutter; tool text stays
+inset four columns to preserve the panel's continuous rule and state marker.
+
 Headless: `yach run --prompt "..."` runs a non-interactive session
 (read-only-safe by default; `--full-auto` explicitly selects the same
 session-only, unsandboxed `full-access` backend posture). Use `--full-auto` only
