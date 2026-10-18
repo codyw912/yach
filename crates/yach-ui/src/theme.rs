@@ -39,10 +39,22 @@ pub enum DiffKind {
     Hunk,
 }
 
+/// How the composer and status row are laid out. Layout, not color, so it
+/// survives `NO_COLOR`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ComposerStyle {
+    #[default]
+    Box,
+    Rule,
+    Band,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     colors: ThemeColors,
     pub spacing: ThemeSpacing,
+    pub composer: ComposerStyle,
     mode: ThemeMode,
 }
 
@@ -70,6 +82,7 @@ struct ThemeColors {
     diff_context: Color,
     diff_hunk: Color,
     harness: Color,
+    status_background: Color,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +175,24 @@ impl Theme {
     #[must_use]
     pub fn harness(&self) -> Style {
         Self::foreground(self.colors.harness, Modifier::empty())
+    }
+
+    /// The status band's background, or `None` when this theme cannot paint
+    /// one: `system`, monochrome, or `statusBackground` set to `default`.
+    #[must_use]
+    pub fn status_band(&self) -> Option<Color> {
+        (self.mode == ThemeMode::Painted && self.colors.status_background != Color::Reset)
+            .then_some(self.colors.status_background)
+    }
+
+    /// The composer style this theme can draw. A band with no background is
+    /// just a row of text, so `band` falls back to `rule`.
+    #[must_use]
+    pub fn composer_style(&self) -> ComposerStyle {
+        match self.composer {
+            ComposerStyle::Band if self.status_band().is_none() => ComposerStyle::Rule,
+            style => style,
+        }
     }
 
     /// Selection follows the same mode handling as other surfaces: System
@@ -345,6 +376,7 @@ impl Theme {
             "diffContext" => colors.diff_context = color,
             "diffHunk" => colors.diff_hunk = color,
             "harness" => colors.harness = color,
+            "statusBackground" => colors.status_background = color,
             _ => return Err(ThemeLoadError::UnknownColorToken(token.to_owned())),
         }
         Ok(())
@@ -414,6 +446,7 @@ pub struct ThemeDocument {
     vars: BTreeMap<String, ColorValue>,
     colors: BTreeMap<String, ColorValue>,
     spacing: ThemeSpacingOverrides,
+    composer: ComposerOverrides,
 }
 
 impl ThemeDocument {
@@ -426,6 +459,7 @@ impl ThemeDocument {
             vars: file.vars,
             colors: file.colors,
             spacing: file.spacing,
+            composer: file.composer,
         })
     }
 
@@ -452,6 +486,9 @@ impl ThemeDocument {
             base.set_color(token, color)?;
         }
         base.spacing.apply(&self.spacing);
+        if let Some(style) = self.composer.style {
+            base.composer = style;
+        }
         Ok(base)
     }
 }
@@ -467,6 +504,14 @@ struct ThemeFile {
     colors: BTreeMap<String, ColorValue>,
     #[serde(default)]
     spacing: ThemeSpacingOverrides,
+    #[serde(default)]
+    composer: ComposerOverrides,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+struct ComposerOverrides {
+    style: Option<ComposerStyle>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -538,9 +583,90 @@ fn parse_color(value: &str) -> Option<Color> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffKind, Theme, ThemeDocument, ThemeLoadError, ThemeMode, ToolState};
+    use super::{
+        ComposerStyle, DiffKind, Theme, ThemeDocument, ThemeLoadError, ThemeMode, ToolState,
+    };
     use crate::theme::contrast::{assert_preset_contrast, contrast_ratio};
     use ratatui::style::{Color, Modifier, Style};
+
+    #[test]
+    fn composer_style_parses_names_and_defaults_to_box() {
+        for (json, expected) in [
+            (r"{}", ComposerStyle::Box),
+            (r#"{"composer":{}}"#, ComposerStyle::Box),
+            (r#"{"composer":{"style":"box"}}"#, ComposerStyle::Box),
+            (r#"{"composer":{"style":"rule"}}"#, ComposerStyle::Rule),
+            (r#"{"composer":{"style":"band"}}"#, ComposerStyle::Band),
+        ] {
+            let theme =
+                ThemeDocument::parse(json).and_then(|document| document.apply(Theme::dark()));
+            assert_eq!(
+                theme.ok().map(|theme| theme.composer),
+                Some(expected),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_rejects_unknown_styles_and_keys() {
+        for json in [
+            r#"{"composer":{"style":"boxed"}}"#,
+            r#"{"composer":{"style":"Rule"}}"#,
+            r#"{"composer":{"position":"top"}}"#,
+            r#"{"composer":"rule"}"#,
+        ] {
+            assert!(
+                matches!(ThemeDocument::parse(json), Err(ThemeLoadError::Json(_))),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn band_needs_a_painted_status_background() {
+        assert_eq!(Theme::dark().status_band(), Some(Color::Rgb(40, 40, 50)));
+        assert_eq!(
+            Theme::light().status_band(),
+            Some(Color::Rgb(236, 236, 242))
+        );
+        let mut band = Theme::dark();
+        band.composer = ComposerStyle::Band;
+        assert_eq!(band.composer_style(), ComposerStyle::Band);
+        for base in [Theme::system(), Theme::monochrome()] {
+            let mut theme = base;
+            theme.composer = ComposerStyle::Band;
+            assert_eq!(theme.status_band(), None, "{:?}", base.mode());
+            assert_eq!(
+                theme.composer_style(),
+                ComposerStyle::Rule,
+                "{:?}",
+                base.mode()
+            );
+        }
+        for (json, expected) in [
+            (
+                r#"{"colors":{"statusBackground":"default"},"composer":{"style":"band"}}"#,
+                None,
+            ),
+            (
+                r##"{"colors":{"statusBackground":"#123456"},"composer":{"style":"band"}}"##,
+                Some(Color::Rgb(18, 52, 86)),
+            ),
+        ] {
+            let theme =
+                ThemeDocument::parse(json).and_then(|document| document.apply(Theme::dark()));
+            assert!(theme.is_ok(), "{json}");
+            let Ok(theme) = theme else { return };
+            assert_eq!(theme.status_band(), expected, "{json}");
+            let style = if expected.is_some() {
+                ComposerStyle::Band
+            } else {
+                ComposerStyle::Rule
+            };
+            assert_eq!(theme.composer_style(), style, "{json}");
+        }
+    }
 
     fn fg(style: Style) -> Color {
         style.fg.unwrap_or(Color::Reset)
@@ -735,6 +861,11 @@ mod tests {
         assert_eq!(theme.colors.harness, Color::Rgb(22, 22, 22));
         // Spacing is untouched when the file omits it.
         assert_eq!(theme.spacing, Theme::dark().spacing);
+        assert_eq!(
+            theme.colors.status_background,
+            Theme::dark().colors.status_background
+        );
+        assert_eq!(theme.composer, ComposerStyle::Box);
     }
 
     #[test]
@@ -950,6 +1081,7 @@ mod tests {
             colors.diff_context,
             colors.diff_hunk,
             colors.harness,
+            colors.status_background,
         ] {
             assert_eq!(color, Color::Reset);
         }

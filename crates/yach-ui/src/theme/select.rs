@@ -123,7 +123,7 @@ mod tests {
         Appearance, BaseError, ExtensionThemes, appearance_from_colorfgbg, builtin_theme_names,
         is_builtin_theme_name, resolve_base,
     };
-    use crate::theme::{Theme, ThemeMode};
+    use crate::theme::{ComposerStyle, Theme, ThemeDocument, ThemeMode};
     use ratatui::style::Color;
 
     #[test]
@@ -154,6 +154,28 @@ mod tests {
         fn theme_json(&self, name: &str) -> Option<String> {
             (name == "nightowl:dim").then(|| self.0.to_owned())
         }
+    }
+
+    #[test]
+    fn extension_composer_applies_only_until_the_user_file_sets_one() -> Result<(), String> {
+        let extension = OneTheme(r#"{"base":"dark","composer":{"style":"band"}}"#);
+        let base = resolve_base("nightowl:dim", Appearance::Dark, &extension)
+            .map_err(|error| format!("{error:?}"))?;
+        for (json, expected) in [
+            (r#"{"base":"nightowl:dim"}"#, ComposerStyle::Band),
+            (
+                r#"{"base":"nightowl:dim","composer":{"style":"rule"}}"#,
+                ComposerStyle::Rule,
+            ),
+        ] {
+            let theme = ThemeDocument::parse(json)
+                .and_then(|document| document.apply(base))
+                .map_err(|error| format!("{json}: {error}"))?;
+            if theme.composer != expected {
+                return Err(format!("{json}: {:?} != {expected:?}", theme.composer));
+            }
+        }
+        Ok(())
     }
 
     #[test]

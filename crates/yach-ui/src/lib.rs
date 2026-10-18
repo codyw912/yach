@@ -24,9 +24,9 @@ pub use app::{
 };
 
 pub use theme::{
-    Appearance, BaseError, DiffKind, ExtensionThemes, Theme, ThemeDocument, ThemeLoadError,
-    ThemeMode, ThemeSpacing, ToolState, appearance_from_colorfgbg, builtin_theme_names,
-    resolve_base,
+    Appearance, BaseError, ComposerStyle, DiffKind, ExtensionThemes, Theme, ThemeDocument,
+    ThemeLoadError, ThemeMode, ThemeSpacing, ToolState, appearance_from_colorfgbg,
+    builtin_theme_names, resolve_base,
 };
 pub use transcript::Transcript;
 

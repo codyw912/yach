@@ -47,6 +47,18 @@ pub(crate) fn assert_preset_contrast(theme: &Theme, page: Option<Color>) {
     let text = theme.text().fg.unwrap_or(Color::Reset);
     assert_contrast_at_least("text on panel", text, panel, 4.5);
     assert_contrast_at_least("text on error panel", text, error_panel, 4.5);
+    let band = theme.status_band();
+    assert!(band.is_some(), "painted theme has no status band");
+    let band = band.unwrap_or(Color::Reset);
+    assert_contrast_at_least("text on status band", text, band, 4.5);
+    for (name, style) in [
+        ("muted", theme.muted()),
+        ("warning", theme.warning()),
+        ("error", theme.error()),
+    ] {
+        let foreground = style.fg.unwrap_or(Color::Reset);
+        assert_contrast_at_least(&format!("{name} on status band"), foreground, band, 3.0);
+    }
     let title = theme.tool_title().fg.unwrap_or(Color::Reset);
     assert_contrast_at_least("tool title on panel", title, panel, 4.5);
     assert_contrast_at_least("tool title on error panel", title, error_panel, 4.5);

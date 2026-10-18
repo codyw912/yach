@@ -1,6 +1,6 @@
 use ratatui::style::Color;
 
-use super::{Theme, ThemeColors, ThemeMode, ThemeSpacing};
+use super::{ComposerStyle, Theme, ThemeColors, ThemeMode, ThemeSpacing};
 
 pub(super) const fn dark() -> Theme {
     Theme {
@@ -27,6 +27,7 @@ pub(super) const fn dark() -> Theme {
             diff_context: Color::Rgb(128, 128, 128),
             diff_hunk: Color::Rgb(0, 215, 255),
             harness: Color::Rgb(178, 148, 187),
+            status_background: Color::Rgb(40, 40, 50),
         },
         spacing: ThemeSpacing {
             user_message_horizontal_padding: 0,
@@ -35,6 +36,7 @@ pub(super) const fn dark() -> Theme {
             tool_vertical_padding: 0,
             tool_gap: 1,
         },
+        composer: ComposerStyle::Box,
         mode: ThemeMode::Painted,
     }
 }
@@ -54,6 +56,7 @@ pub(super) const fn light() -> Theme {
             error: Color::Rgb(176, 36, 36),
             warning: Color::Rgb(150, 96, 0),
             harness: Color::Rgb(140, 40, 150),
+            status_background: Color::Rgb(236, 236, 242),
             selected_background: Color::Rgb(208, 216, 236),
             selected_text: Color::Rgb(36, 36, 48),
             user_message_background: Color::Rgb(228, 231, 240),
@@ -75,6 +78,7 @@ pub(super) const fn light() -> Theme {
             tool_vertical_padding: 0,
             tool_gap: 1,
         },
+        composer: ComposerStyle::Box,
         mode: ThemeMode::Painted,
     }
 }
@@ -106,6 +110,7 @@ pub(super) const fn system() -> Theme {
             diff_context: Color::Reset,
             diff_hunk: Color::Cyan,
             harness: Color::Magenta,
+            status_background: Color::Reset,
         },
         spacing: ThemeSpacing {
             user_message_horizontal_padding: 0,
@@ -114,6 +119,7 @@ pub(super) const fn system() -> Theme {
             tool_vertical_padding: 0,
             tool_gap: 1,
         },
+        composer: ComposerStyle::Box,
         mode: ThemeMode::System,
     }
 }
@@ -143,6 +149,7 @@ pub(super) const fn monochrome() -> Theme {
             diff_context: Color::Reset,
             diff_hunk: Color::Reset,
             harness: Color::Reset,
+            status_background: Color::Reset,
         },
         spacing: ThemeSpacing {
             user_message_horizontal_padding: 0,
@@ -151,6 +158,7 @@ pub(super) const fn monochrome() -> Theme {
             tool_vertical_padding: 0,
             tool_gap: 1,
         },
+        composer: ComposerStyle::Box,
         mode: ThemeMode::Mono,
     }
 }

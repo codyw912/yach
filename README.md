@@ -359,7 +359,7 @@ others), 256-color indices, or entries from `vars`. Available color tokens:
 `selectedBackground`, `selectedText`, `userMessageBackground`,
 `userMessageText`, `toolPendingBackground`, `toolSuccessBackground`,
 `toolErrorBackground`, `toolTitle`, `toolOutput`, `diffAdded`, `diffRemoved`,
-`diffContext`, `diffHunk`, and `harness`. Unknown fields, tokens, colors, or
+`diffContext`, `diffHunk`, `harness`, and `statusBackground`. Unknown fields, tokens, colors, or
 variables in the personal file fail before the TUI opens rather than being
 ignored; explicit `YACH_THEME` file failures instead show the fallback notice.
 
