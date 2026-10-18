@@ -34,3 +34,10 @@ test('includes new palettes automatically and splits overflowing families', () =
     assert.equal(pages.filter(page => page.body.includes(`<pre>${name}</pre>`)).length, 1);
   }
 });
+
+test('groups composer captures on their own pages after the palettes', () => {
+  const panels = ['dark', 'composer-box-dark-120', 'composer-rule-dark-80', 'nord'];
+  const pages = gridPages(panels.map(name => ({ name, body: `<pre>${name}</pre>` })));
+  assert.deepEqual(pages.map(page => page.name), ['presets', 'nord-monokai', 'composer']);
+  assert.ok(pages[2].body.includes('<pre>composer-rule-dark-80</pre>'));
+});

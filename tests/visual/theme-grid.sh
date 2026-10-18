@@ -48,12 +48,12 @@ cp "$repo_root/tests/visual/session.jsonl" "$work/sessions/session-visual.jsonl"
 manifest="$out/panels.jsonl"
 
 capture() {
-  local name="$1" fg="$2" bg="$3" launch screen previous='' stable=0 settled=0
-  local -a theme_env=("YACH_THEME=$name")
+  local name="$1" fg="$2" bg="$3" theme="${4:-$1}" cols="${5:-120}" launch screen previous='' stable=0 settled=0
+  local -a theme_env=("YACH_THEME=$theme")
   if [[ "$name" == nocolor ]]; then theme_env=(YACH_THEME=dark NO_COLOR=1); fi
   printf -v launch 'exec env -i HOME=%q PATH=%q TERM=xterm-256color COLORTERM=truecolor COLORFGBG=15\;0 YACH_SESSION_DIR=%q %s %q tui --backend fixture --resume' \
     "$work/home" "$PATH" "$work/sessions" "${theme_env[*]}" "$binary"
-  tmux -L "$socket" -f /dev/null new-session -d -s capture -x 120 -y 40 -c "$work/project" "$launch"
+  tmux -L "$socket" -f /dev/null new-session -d -s capture -x "$cols" -y 40 -c "$work/project" "$launch"
   # Wait for the resumed transcript, then three identical frames. Bound failure
   # rather than silently screenshotting a blank pane or startup error.
   # Preserve trailing cells: their backgrounds are part of the rendered UI.
@@ -71,7 +71,7 @@ capture() {
   printf '%s\n' "$screen" > "$out/$name.ansi"
   ((settled)) || fail "screen did not settle for $name; inspect $out/$name.ansi"
   tmux -L "$socket" kill-session -t capture
-  jq -nc --arg name "$name" --arg fg "$fg" --arg bg "$bg" '{name:$name,fg:$fg,bg:$bg}' >> "$manifest"
+  jq -nc --arg name "$name" --arg fg "$fg" --arg bg "$bg" --argjson cols "$cols" '{name:$name,fg:$fg,bg:$bg,cols:$cols}' >> "$manifest"
   printf 'captured %s\n' "$name"
 }
 
@@ -86,6 +86,18 @@ for palette in "$repo_root"/crates/yach-ui/themes/*.json; do
   fg="$(jq -er '. as $p | .colors.text | $p.vars[.] // .' "$palette")"
   bg="$(jq -er '.vars.base00' "$palette")"
   capture "$name" "$fg" "$bg"
+done
+# Each composer style over the presets, at the full and the narrow width.
+# `system` shows `band` falling back to `rule`.
+for style in box rule band; do
+  for base in dark light system; do
+    file="$work/composer-$style-$base.json"
+    printf '{"base":"%s","composer":{"style":"%s"}}\n' "$base" "$style" > "$file"
+    if [[ "$base" == light ]]; then fg='#303030' bg='#fafafa'; else fg='#d0d0d0' bg='#1c1c1c'; fi
+    for cols in 120 80; do
+      capture "composer-$style-$base-$cols" "$fg" "$bg" "$file" "$cols"
+    done
+  done
 done
 node "$repo_root/tests/visual/ansi2html.mjs" "$out" "$font" "$manifest" > "$out/grids.json"
 while IFS= read -r grid; do

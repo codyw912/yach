@@ -401,6 +401,8 @@ size gate: `just perf --filter 'binary/size_bytes' --deterministic`.
    check), and Chromium on `PATH` (or `CHROMIUM=/path/to/chromium`). It embeds
    the monospace font found by `fc-match`; use `YACH_SHOT_FONT=/path/to/font.ttf`
    to supply one explicitly. Chromium is not part of the default dev shell.
+   The capture also renders a composer section: each composer style over
+   `dark`, `light`, and `system`, at 120 and 80 columns.
 2. Give both sets of labeled grid PNGs and raw `.ansi` captures to two
    reviewers: one for color/contrast (palette fidelity, WCAG ratios computed
    from SGR values, role semantics), one for layout/wording (hierarchy,
