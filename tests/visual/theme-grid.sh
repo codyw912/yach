@@ -48,11 +48,12 @@ cp "$repo_root/tests/visual/session.jsonl" "$work/sessions/session-visual.jsonl"
 manifest="$out/panels.jsonl"
 
 capture() {
-  local name="$1" fg="$2" bg="$3" theme="${4:-$1}" cols="${5:-120}" launch screen previous='' stable=0 settled=0
+  local name="$1" fg="$2" bg="$3" theme="${4:-$1}" cols="${5:-120}" envs launch screen previous='' stable=0 settled=0
   local -a theme_env=("YACH_THEME=$theme")
   if [[ "$name" == nocolor ]]; then theme_env=(YACH_THEME=dark NO_COLOR=1); fi
+  printf -v envs '%q ' "${theme_env[@]}"
   printf -v launch 'exec env -i HOME=%q PATH=%q TERM=xterm-256color COLORTERM=truecolor COLORFGBG=15\;0 YACH_SESSION_DIR=%q %s %q tui --backend fixture --resume' \
-    "$work/home" "$PATH" "$work/sessions" "${theme_env[*]}" "$binary"
+    "$work/home" "$PATH" "$work/sessions" "$envs" "$binary"
   tmux -L "$socket" -f /dev/null new-session -d -s capture -x "$cols" -y 40 -c "$work/project" "$launch"
   # Wait for the resumed transcript, then three identical frames. Bound failure
   # rather than silently screenshotting a blank pane or startup error.
