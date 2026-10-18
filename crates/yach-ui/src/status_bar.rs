@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use unicode_segmentation::UnicodeSegmentation;
@@ -12,7 +12,10 @@ use crate::theme::Theme;
 // more than context health or transient feedback, especially in full-access.
 const PRIORITY_MODEL: u8 = 100;
 const PRIORITY_APPROVAL: u8 = 99;
-const PRIORITY_CONTEXT: u8 = 98;
+// A warning or error needs attention now: it outranks the context meter and
+// is truncated, not dropped, while 12 cells fit. An info status stays below.
+const PRIORITY_ALERT: u8 = 98;
+const PRIORITY_CONTEXT: u8 = 97;
 // A status answers the user's last action. Keep it above ambient details and
 // truncate it before sacrificing approval, rather than losing that feedback.
 const PRIORITY_STATUS: u8 = 95;
@@ -89,6 +92,16 @@ impl Segment {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusFill {
+    /// `box`: segments only.
+    None,
+    /// `rule`: segments, a space, then `─` in this style up to the marker.
+    Rule(Style),
+    /// `band`: the row painted with this background, one leading space.
+    Band(Color),
+}
+
 /// Deliberately compact status bar segments. Segments are selected as whole
 /// units, so a narrow terminal loses low-priority information rather than
 /// cutting a label in half.
@@ -111,18 +124,28 @@ pub struct StatusBar<'a> {
     /// The bool is `true` when the number is the catalog floor, not a listed value.
     pub context_window: Option<(u64, bool)>,
     pub theme: &'a Theme,
+    pub fill: StatusFill,
+    /// `running` / `more ↑`, drawn at the right end. Its width is taken
+    /// from the segment budget before fitting.
+    pub marker: Option<Span<'a>>,
 }
 
 impl StatusBar<'_> {
     fn segments(&self) -> Vec<Segment> {
-        let mut segments = vec![
-            Segment::new(SegmentId::Connection, "●", PRIORITY_CONNECTION),
-            Segment::new(
-                SegmentId::Model,
-                model_segment_text(self.model, self.thinking_level),
-                PRIORITY_MODEL,
-            ),
-        ];
+        let mut segments = Vec::new();
+        // A healthy connection needs no indicator; the dot is a warning sign.
+        if !self.is_connected || self.status_message.severity == StatusSeverity::Error {
+            segments.push(Segment::new(
+                SegmentId::Connection,
+                "●",
+                PRIORITY_CONNECTION,
+            ));
+        }
+        segments.push(Segment::new(
+            SegmentId::Model,
+            model_segment_text(self.model, self.thinking_level),
+            PRIORITY_MODEL,
+        ));
         segments.push(Segment::new(
             SegmentId::Approval,
             format!("approval:{}", self.approval_mode),
@@ -158,10 +181,15 @@ impl StatusBar<'_> {
             ));
         }
         if !self.status_message.text.is_empty() {
+            let priority = if self.status_message.severity == StatusSeverity::Info {
+                PRIORITY_STATUS
+            } else {
+                PRIORITY_ALERT
+            };
             segments.push(Segment::new(
                 SegmentId::Status,
                 self.status_message.text.as_str(),
-                PRIORITY_STATUS,
+                priority,
             ));
         }
 
@@ -171,11 +199,38 @@ impl StatusBar<'_> {
 
 impl Widget for StatusBar<'_> {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        let segments = fit_segments(self.segments(), area.width);
+        if area.is_empty() {
+            return;
+        }
+        let band = matches!(self.fill, StatusFill::Band(_));
+        if let StatusFill::Band(color) = self.fill {
+            buf.set_style(area, Style::new().bg(color));
+        }
+        let lead = u16::from(band);
+        // A rule needs a space and at least one `─` after the segments.
+        let tail = if matches!(self.fill, StatusFill::Rule(_)) {
+            2
+        } else {
+            0
+        };
+        let marker_width = self.marker.as_ref().map_or(0, |marker| {
+            u16::try_from(marker.width()).unwrap_or(u16::MAX)
+        });
+        let budget = area
+            .width
+            .saturating_sub(lead.saturating_add(tail).saturating_add(marker_width));
+        let segments = fit_segments(self.segments(), budget);
+        let used = u16::try_from(segment_width(&segments)).unwrap_or(u16::MAX);
         let mut spans = Vec::with_capacity(segments.len().saturating_mul(2));
+        // The spec's band rule: separators take `muted`, not the default fg.
+        let separator = if band {
+            self.theme.muted()
+        } else {
+            Style::default()
+        };
         for (index, segment) in segments.into_iter().enumerate() {
             if index > 0 {
-                spans.push(Span::raw(SEGMENT_SEPARATOR));
+                spans.push(Span::styled(SEGMENT_SEPARATOR, separator));
             }
             let style = segment_style(
                 segment.id,
@@ -183,13 +238,26 @@ impl Widget for StatusBar<'_> {
                 self.context_used_percent,
                 self.approval_mode,
                 self.status_message.severity,
+                band,
                 self.theme,
             );
             spans.push(Span::styled(segment.text, style));
         }
-
-        let paragraph = Paragraph::new(Line::from(spans));
-        Widget::render(paragraph, area, buf);
+        let row = Rect {
+            x: area.x.saturating_add(lead),
+            width: area.width.saturating_sub(lead),
+            ..area
+        };
+        Widget::render(Paragraph::new(Line::from(spans)), row, buf);
+        let marker_x = area.right().saturating_sub(marker_width);
+        if let StatusFill::Rule(style) = self.fill {
+            for x in row.x.saturating_add(used).saturating_add(1)..marker_x {
+                buf[(x, area.y)].set_symbol("─").set_style(style);
+            }
+        }
+        if let Some(marker) = &self.marker {
+            buf.set_span(marker_x, area.y, marker, marker_width);
+        }
     }
 }
 
@@ -252,39 +320,41 @@ fn segment_width(segments: &[Segment]) -> usize {
         + SEGMENT_SEPARATOR.width() * segments.len().saturating_sub(1)
 }
 
+/// Color only what asks for attention. On a band, `accent` and `dim` do not
+/// reliably reach 3:1 against `statusBackground`, so the model uses bold
+/// `text` and a healthy context meter uses `muted`.
 fn segment_style(
     id: SegmentId,
     is_connected: bool,
     context_used_percent: Option<u8>,
     approval_mode: &str,
     severity: StatusSeverity,
+    band: bool,
     theme: &Theme,
 ) -> Style {
     match id {
+        // Present only when disconnected or showing an error (`segments`).
         SegmentId::Connection => {
-            if is_connected && severity == StatusSeverity::Error {
+            if is_connected {
                 theme.warning()
-            } else if is_connected {
-                theme.success()
             } else {
                 theme.error()
             }
         }
-        SegmentId::Model | SegmentId::Reviewer => theme.accent(),
-        SegmentId::Approval => {
-            if approval_mode == "full-access" {
-                theme.error()
-            } else {
-                theme.warning()
-            }
+        SegmentId::Model if band => theme.text().add_modifier(Modifier::BOLD),
+        SegmentId::Model => theme.accent().add_modifier(Modifier::BOLD),
+        SegmentId::Approval if approval_mode == "full-access" => {
+            theme.error().add_modifier(Modifier::BOLD)
+        }
+        SegmentId::Approval | SegmentId::Reviewer | SegmentId::Compaction | SegmentId::Tokens => {
+            theme.muted()
         }
         SegmentId::Context => match context_used_percent.unwrap_or_default().min(100) {
+            0..=69 if band => theme.muted(),
             0..=69 => theme.dim(),
             70..=89 => theme.warning(),
             _ => theme.error(),
         },
-        SegmentId::Compaction => theme.harness(),
-        SegmentId::Tokens => theme.muted(),
         SegmentId::Status => match severity {
             StatusSeverity::Info => theme.muted(),
             StatusSeverity::Warning => theme.warning(),
@@ -338,15 +408,222 @@ pub(crate) fn format_token_capacity(tokens: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Segment, SegmentId, StatusBar, StatusMessage, StatusSeverity, fit_segments,
+        Segment, SegmentId, StatusBar, StatusFill, StatusMessage, StatusSeverity, fit_segments,
         format_context_meter, format_token_capacity, model_segment_text, segment_style,
         segment_width,
     };
     use crate::theme::Theme;
+    use ratatui::style::{Color, Modifier};
+    use ratatui::text::Span;
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
+    const ACCEPTANCE_ERROR: &str =
+        "invalid_config; set the provider environment and relaunch yach tui";
+
+    fn acceptance_bar<'a>(
+        theme: &'a Theme,
+        status: &'a StatusMessage,
+        fill: StatusFill,
+    ) -> StatusBar<'a> {
+        StatusBar {
+            model: "gpt-5.1-codex-max",
+            thinking_level: "xhigh",
+            approval_mode: "full-access",
+            reviewer_id: None,
+            status_message: status,
+            is_connected: true,
+            compaction_count: 0,
+            total_tokens: None,
+            context_used_percent: Some(78),
+            context_window: Some((200_000, false)),
+            theme,
+            fill,
+            marker: None,
+        }
+    }
+
+    fn render_row(bar: StatusBar<'_>, width: u16) -> (Buffer, String) {
+        let area = Rect::new(0, 0, width, 1);
+        let mut buffer = Buffer::empty(area);
+        Widget::render(bar, area, &mut buffer);
+        let row = (0..width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        (buffer, row)
+    }
+
+    fn cell_index(buffer: &Buffer, needle: &str) -> Option<u16> {
+        let symbols: Vec<String> = needle.chars().map(String::from).collect();
+        let width = buffer.area.width;
+        (0..width).find(|&x| {
+            (x..width)
+                .zip(&symbols)
+                .filter(|(cell, symbol)| buffer[(*cell, 0)].symbol() == symbol.as_str())
+                .count()
+                == symbols.len()
+        })
+    }
+
     #[test]
-    fn status_severity_colors_text_and_warns_on_connected_errors() {
+    fn alerts_outrank_context_at_80_columns_in_every_fill() {
+        let theme = Theme::dark();
+        let error = StatusMessage::error(ACCEPTANCE_ERROR);
+        for fill in [
+            StatusFill::None,
+            StatusFill::Rule(theme.border(false)),
+            StatusFill::Band(Color::Rgb(40, 40, 50)),
+        ] {
+            let (_, row) = render_row(acceptance_bar(&theme, &error, fill), 80);
+            assert!(
+                row.contains("gpt-5.1-codex-max · think:xhigh"),
+                "{fill:?}: {row}"
+            );
+            assert!(row.contains("approval:full-access"), "{fill:?}: {row}");
+            // At least 12 cells: 11 characters and the ellipsis.
+            assert!(row.contains("invalid_con"), "{fill:?}: {row}");
+        }
+    }
+
+    #[test]
+    fn info_status_still_drops_before_context() {
+        let theme = Theme::dark();
+        let info = StatusMessage::info(ACCEPTANCE_ERROR);
+        let (_, row) = render_row(acceptance_bar(&theme, &info, StatusFill::None), 80);
+        assert!(row.contains("ctx:78%/200k"), "{row}");
+        assert!(!row.contains("invalid"), "{row}");
+    }
+
+    #[test]
+    fn segment_colors_stay_quiet_while_healthy() {
+        let theme = Theme::dark();
+        let style = |id, connected, percent, mode, severity| {
+            segment_style(id, connected, percent, mode, severity, false, &theme)
+        };
+        let info = StatusSeverity::Info;
+        assert_eq!(
+            style(SegmentId::Model, true, None, "review", info),
+            theme.accent().add_modifier(Modifier::BOLD)
+        );
+        for mode in ["review", "accept-edits", "auto-review"] {
+            assert_eq!(
+                style(SegmentId::Approval, true, None, mode, info),
+                theme.muted(),
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            style(SegmentId::Approval, true, None, "full-access", info),
+            theme.error().add_modifier(Modifier::BOLD)
+        );
+        for id in [
+            SegmentId::Reviewer,
+            SegmentId::Compaction,
+            SegmentId::Tokens,
+        ] {
+            assert_eq!(
+                style(id, true, None, "review", info),
+                theme.muted(),
+                "{id:?}"
+            );
+        }
+        for (percent, expected) in [
+            (69, theme.dim()),
+            (70, theme.warning()),
+            (89, theme.warning()),
+            (90, theme.error()),
+        ] {
+            assert_eq!(
+                style(SegmentId::Context, true, Some(percent), "review", info),
+                expected,
+                "{percent}"
+            );
+        }
+        for (severity, expected) in [
+            (StatusSeverity::Info, theme.muted()),
+            (StatusSeverity::Warning, theme.warning()),
+            (StatusSeverity::Error, theme.error()),
+        ] {
+            assert_eq!(
+                style(SegmentId::Status, true, None, "review", severity),
+                expected
+            );
+        }
+        assert_eq!(
+            style(
+                SegmentId::Connection,
+                true,
+                None,
+                "review",
+                StatusSeverity::Error
+            ),
+            theme.warning()
+        );
+        assert_eq!(
+            style(SegmentId::Connection, false, None, "review", info),
+            theme.error()
+        );
+    }
+
+    #[test]
+    fn connection_dot_shows_only_when_something_is_wrong() {
+        let theme = Theme::dark();
+        for (connected, status, shown) in [
+            (true, StatusMessage::info("ready"), false),
+            (true, StatusMessage::warning("slow"), false),
+            (true, StatusMessage::error("failed"), true),
+            (false, StatusMessage::info("ready"), true),
+        ] {
+            let mut bar = acceptance_bar(&theme, &status, StatusFill::None);
+            bar.is_connected = connected;
+            let dot = bar
+                .segments()
+                .iter()
+                .any(|segment| segment.id == SegmentId::Connection);
+            assert_eq!(dot, shown, "connected={connected} {:?}", status.severity);
+        }
+    }
+
+    #[test]
+    fn band_paints_the_row_and_uses_band_safe_roles() {
+        let theme = Theme::dark();
+        let status = StatusMessage::info("ready");
+        let mut bar = acceptance_bar(&theme, &status, StatusFill::Band(Color::Rgb(1, 2, 3)));
+        bar.approval_mode = "review";
+        bar.context_used_percent = Some(42);
+        let (buffer, row) = render_row(bar, 120);
+        assert!(row.starts_with(" gpt-5.1-codex-max"), "{row}");
+        for x in 0..120 {
+            assert_eq!(buffer[(x, 0)].bg, Color::Rgb(1, 2, 3), "cell {x}");
+        }
+        assert_eq!(Some(buffer[(1, 0)].fg), theme.text().fg);
+        assert!(buffer[(1, 0)].modifier.contains(Modifier::BOLD));
+        let context = cell_index(&buffer, "ctx:");
+        assert!(context.is_some(), "{row}");
+        let Some(context) = context else { return };
+        assert_eq!(Some(buffer[(context, 0)].fg), theme.muted().fg);
+    }
+
+    #[test]
+    fn rule_fills_between_the_segments_and_the_marker() {
+        let theme = Theme::dark();
+        let status = StatusMessage::info("ready");
+        let mut bar = acceptance_bar(&theme, &status, StatusFill::Rule(theme.border(false)));
+        bar.model = "model";
+        bar.thinking_level = "high";
+        bar.approval_mode = "review";
+        bar.context_used_percent = None;
+        bar.marker = Some(Span::styled(" running ", theme.accent()));
+        let (buffer, row) = render_row(bar, 60);
+        assert!(row.ends_with("─ running "), "{row}");
+        assert!(row.contains("ready ─"), "{row}");
+        let rule = cell_index(&buffer, "─");
+        assert!(rule.is_some(), "{row}");
+        let Some(rule) = rule else { return };
+        assert_eq!(Some(buffer[(rule, 0)].fg), theme.border(false).fg);
+    }
+
+    #[test]
+    fn status_severity_colors_status_text() {
         let theme = Theme::default();
         for (severity, expected) in [
             (StatusSeverity::Info, theme.muted()),
@@ -372,6 +649,8 @@ mod tests {
                     context_used_percent: None,
                     context_window: None,
                     theme: &theme,
+                    fill: StatusFill::None,
+                    marker: None,
                 },
                 area,
                 &mut buffer,
@@ -391,12 +670,6 @@ mod tests {
                     }
                 }
             }
-            let dot_style = if severity == StatusSeverity::Error {
-                theme.warning()
-            } else {
-                theme.success()
-            };
-            assert_eq!(Some(buffer[(0, 0)].fg), dot_style.fg);
         }
     }
 
@@ -417,6 +690,8 @@ mod tests {
             context_used_percent: None,
             context_window: None,
             theme: &theme,
+            fill: StatusFill::None,
+            marker: None,
         };
         for width in [100, 60] {
             let fitted = fit_segments(bar.segments(), width);
@@ -445,6 +720,8 @@ mod tests {
             context_used_percent: Some(92),
             context_window: Some((200_000, false)),
             theme: &theme,
+            fill: StatusFill::None,
+            marker: None,
         };
         for width in 0..=180 {
             let fitted = fit_segments(bar.segments(), width);
@@ -486,6 +763,8 @@ mod tests {
                     context_used_percent: Some(42),
                     context_window: Some((200_000, false)),
                     theme: &theme,
+                    fill: StatusFill::None,
+                    marker: None,
                 };
                 if width == 80 {
                     assert!(bar.segments().iter().any(
@@ -523,6 +802,8 @@ mod tests {
             context_used_percent: Some(42),
             context_window: Some((200_000, false)),
             theme: &theme,
+            fill: StatusFill::None,
+            marker: None,
         };
 
         let squeezed = fit_segments(bar.segments(), 70);
@@ -576,6 +857,8 @@ mod tests {
                 context_used_percent: Some(42),
                 context_window: Some((200_000, false)),
                 theme: &Theme::default(),
+                fill: StatusFill::None,
+                marker: None,
             },
             area,
             &mut buffer,
@@ -587,20 +870,6 @@ mod tests {
         assert!(rendered.contains("gpt-5.6-sol · think:high"));
         assert!(rendered.contains("ctx:42%/200k"));
         assert!(!rendered.contains("sid:"));
-    }
-
-    #[test]
-    fn full_access_approval_segment_uses_danger_color() {
-        let theme = Theme::default();
-        let style = segment_style(
-            SegmentId::Approval,
-            true,
-            None,
-            "full-access",
-            StatusSeverity::Info,
-            &theme,
-        );
-        assert_eq!(style.fg, theme.error().fg);
     }
 
     #[test]

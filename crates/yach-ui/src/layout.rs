@@ -2,8 +2,8 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::input::{InputComposer, input_metrics};
-use crate::status_bar::{StatusBar, StatusMessage};
-use crate::theme::Theme;
+use crate::status_bar::{StatusBar, StatusFill, StatusMessage};
+use crate::theme::{ComposerStyle, Theme};
 use crate::transcript;
 use crate::transcript::{Transcript, TranscriptAlignment, TranscriptRenderCache};
 
@@ -73,6 +73,13 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
     };
     frame.render_widget(input_widget, chunks[2]);
 
+    let fill = match (params.theme.composer_style(), params.theme.status_band()) {
+        (ComposerStyle::Box, _) => StatusFill::None,
+        (ComposerStyle::Band, Some(color)) => StatusFill::Band(color),
+        (ComposerStyle::Rule | ComposerStyle::Band, _) => {
+            StatusFill::Rule(params.theme.border(false))
+        }
+    };
     let status_bar = StatusBar {
         model: params.model,
         thinking_level: params.thinking_level,
@@ -85,6 +92,8 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
         context_used_percent: params.context_used_percent,
         context_window: params.context_window,
         theme: params.theme,
+        fill,
+        marker: None,
     };
     frame.render_widget(status_bar, chunks[3]);
 }
