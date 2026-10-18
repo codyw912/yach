@@ -345,6 +345,7 @@ the file's overrides over `auto`.
     "toolPendingBackground": "surface",
     "diffAdded": 22
   },
+  "composer": { "style": "rule" },
   "spacing": {
     "userMessageHorizontalPadding": 1,
     "userMessageVerticalPadding": 1,
@@ -364,6 +365,16 @@ others), 256-color indices, or entries from `vars`. Available color tokens:
 `diffContext`, `diffHunk`, `harness`, and `statusBackground`. Unknown fields, tokens, colors, or
 variables in the personal file fail before the TUI opens rather than being
 ignored; explicit `YACH_THEME` file failures instead show the fallback notice.
+
+`composer.style` picks the composer layout. `box` (the default) draws a
+bordered input with the status row below it. `rule` draws the status row on
+a `─` rule above the prompt and closes the composer with a second rule.
+`band` draws the status row on a shaded `statusBackground` band above the
+prompt; under `system`, `NO_COLOR`, or a `statusBackground` of `default` it
+draws as `rule`. In every style the key hint shows only while the prompt is
+empty, and the status row colors only what needs attention: a disconnected
+or erroring connection, full-access approval, a filling context window, and
+warning or error messages.
 
 Monochrome (`NO_COLOR`) draws no color and no panel background. Metadata is
 dim, focused titles, tool names, and errors are bold, and the selected row is

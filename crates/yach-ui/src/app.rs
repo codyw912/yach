@@ -4329,7 +4329,7 @@ impl BenchmarkApp {
         let area = inline_viewport_area(terminal)
             .map_err(|error| io::Error::other(format!("terminal size failed: {error:?}")))?;
         let (viewport_width, viewport_height) =
-            layout::transcript_viewport_size(area, &self.app.prompt);
+            layout::transcript_viewport_size(area, &self.app.prompt, &self.app.theme);
         self.app
             .set_transcript_viewport(viewport_width, viewport_height);
 
@@ -4511,7 +4511,7 @@ pub async fn run_tui_with_trace_and_options(
         }
 
         if let Ok(area) = inline_viewport_area(&mut terminal) {
-            let (width, height) = layout::transcript_viewport_size(area, &app.prompt);
+            let (width, height) = layout::transcript_viewport_size(area, &app.prompt, &app.theme);
             app.set_transcript_viewport(width, height);
         }
         let session_idx = app.session_select_index();

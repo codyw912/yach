@@ -249,14 +249,14 @@ impl Widget for StatusBar<'_> {
             ..area
         };
         Widget::render(Paragraph::new(Line::from(spans)), row, buf);
-        let marker_x = area.right().saturating_sub(marker_width);
+        let marker_x = area.right().saturating_sub(marker_width).max(area.x);
         if let StatusFill::Rule(style) = self.fill {
             for x in row.x.saturating_add(used).saturating_add(1)..marker_x {
                 buf[(x, area.y)].set_symbol("─").set_style(style);
             }
         }
         if let Some(marker) = &self.marker {
-            buf.set_span(marker_x, area.y, marker, marker_width);
+            buf.set_span(marker_x, area.y, marker, marker_width.min(area.width));
         }
     }
 }
@@ -620,6 +620,32 @@ mod tests {
         assert!(rule.is_some(), "{row}");
         let Some(rule) = rule else { return };
         assert_eq!(Some(buffer[(rule, 0)].fg), theme.border(false).fg);
+    }
+
+    #[test]
+    fn oversized_marker_stays_inside_an_offset_area() {
+        let theme = Theme::dark();
+        let status = StatusMessage::info("ready");
+        for fill in [
+            StatusFill::None,
+            StatusFill::Rule(theme.border(false)),
+            StatusFill::Band(Color::Rgb(1, 2, 3)),
+        ] {
+            let mut bar = acceptance_bar(&theme, &status, fill);
+            bar.marker = Some(Span::raw(" running · more ↑ "));
+            let area = Rect::new(5, 1, 4, 1);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 15, 3));
+            Widget::render(bar, area, &mut buffer);
+            for x in 0..15 {
+                let expected = match x {
+                    6 => "r",
+                    7 => "u",
+                    8 => "n",
+                    _ => " ",
+                };
+                assert_eq!(buffer[(x, 1)].symbol(), expected, "{fill:?}, x={x}");
+            }
+        }
     }
 
     #[test]
