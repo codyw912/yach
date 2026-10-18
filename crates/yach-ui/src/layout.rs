@@ -31,7 +31,7 @@ pub struct RenderParams<'a> {
     pub theme: &'a Theme,
 }
 
-/// Shared geometry keeps the transcript viewport and drawn composer aligned.
+/// Drawn geometry per style; `composer_chrome_rows` mirrors it for viewport sizing.
 struct ComposerAreas {
     transcript: Rect,
     status: Rect,
@@ -88,14 +88,28 @@ fn composer_areas(area: Rect, style: ComposerStyle, prompt_rows: u16) -> Compose
     }
 }
 
+/// Rows each style draws around the prompt: `box` has the gap, two borders
+/// and the status row; `rule` the status row and closing rule; `band` the
+/// status row. Must match `composer_areas`.
+fn composer_chrome_rows(style: ComposerStyle) -> u16 {
+    match style {
+        ComposerStyle::Box => 4,
+        ComposerStyle::Rule => 2,
+        ComposerStyle::Band => 1,
+    }
+}
+
+/// Called on every frame before drawing. Row arithmetic, not a second
+/// `Layout` solve: the headless `#alloc_bytes` rows gate this path at the
+/// zero default budget in `crates/yach-bench/perf-thresholds.toml`.
 pub fn transcript_viewport_size(
     area: Rect,
     input: &ratatui_textarea::TextArea<'static>,
     theme: &Theme,
 ) -> (u16, u16) {
     let prompt_rows = input_metrics(input, area.width).prompt_rows;
-    let areas = composer_areas(area, theme.composer_style(), prompt_rows);
-    (area.width, areas.transcript.height.max(1))
+    let reserved = prompt_rows.saturating_add(composer_chrome_rows(theme.composer_style()));
+    (area.width, area.height.saturating_sub(reserved).max(1))
 }
 
 pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
