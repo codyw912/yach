@@ -183,8 +183,8 @@ Environment:
 | `YACH_RIG_OPENAI_MODEL` | — | Model id; required when the provider is `openai`. |
 | `YACH_RIG_OPENAI_COMPAT_BASE_URL` / `_API_KEY` / `_MODEL` | — | Required when `YACH_RIG_PROVIDER=openai-compatible`. |
 | `YACH_RIG_PROVIDER_TIMEOUT_SECS` / `..._MAX_TOKENS` | sane bounds | Request tuning. |
-| `YACH_THEME` | user file, then `auto` | Preset (`dark`, `light`, `system`, `auto`), bundled palette name, or explicit path to a theme JSON file. A non-empty `NO_COLOR` overrides it. |
-| `NO_COLOR` | unset | Non-empty selects the monochrome theme and overrides `YACH_THEME` and `~/.yach/theme.json`. |
+| `YACH_THEME` | user file, then `auto` | Preset (`dark`, `light`, `system`, `auto`), bundled palette name, or explicit path to a theme JSON file. A non-empty `NO_COLOR` replaces its colors and keeps its `spacing` and `composer`. |
+| `NO_COLOR` | unset | Non-empty selects monochrome colors. The selected theme's `spacing` and `composer` still apply, and theme file errors are still reported. |
 | `COLORFGBG` | unset | Read only when the theme is `auto`. Last field below 8 selects `dark`; otherwise `light`. Absent or unparsable selects `dark`. |
 | `YACH_SESSION_DIR` | project-keyed directory under `~/.yach/sessions/` | Absolute override for session storage and lookup. |
 | `YACH_CAPTURE_REQUESTS` | off | Absolute directory. Writes each OpenAI, OpenAI-compatible, ChatGPT-subscription, and native-compaction request body, one private file per attempt. Anthropic requests are not captured. Authentication headers are never written; bodies are the exact request bodies, so they contain whatever the prompt and files contain. Keep capture off unless diagnosing a request. |
@@ -257,14 +257,16 @@ Invalid config fails closed to the defaults.
 
 ### TUI appearance
 
-TUI appearance is chosen once, at startup. `NO_COLOR` set to any non-empty
-value wins over everything else and selects the monochrome theme. Otherwise
-the first match wins:
+TUI appearance is chosen once, at startup. The first match wins:
 
 1. Non-empty `YACH_THEME`: a preset (`dark`, `light`, `system`, `auto`), a
    bundled palette name, or an explicit path to a theme file. Empty is unset.
 2. `~/.yach/theme.json`.
 3. `auto`.
+
+`NO_COLOR` set to any non-empty value then replaces every color with the
+monochrome theme's. The chosen theme's `spacing` and `composer` still apply,
+and a broken theme file is reported exactly as it is without `NO_COLOR`.
 
 A value that is absolute, starts with `.` or `~`, or contains a path
 separator is a path; `~/` uses your home directory. Other values are theme
@@ -343,6 +345,7 @@ the file's overrides over `auto`.
     "toolPendingBackground": "surface",
     "diffAdded": 22
   },
+  "composer": { "style": "rule" },
   "spacing": {
     "userMessageHorizontalPadding": 1,
     "userMessageVerticalPadding": 1,
@@ -359,9 +362,20 @@ others), 256-color indices, or entries from `vars`. Available color tokens:
 `selectedBackground`, `selectedText`, `userMessageBackground`,
 `userMessageText`, `toolPendingBackground`, `toolSuccessBackground`,
 `toolErrorBackground`, `toolTitle`, `toolOutput`, `diffAdded`, `diffRemoved`,
-`diffContext`, `diffHunk`, and `harness`. Unknown fields, tokens, colors, or
-variables in the personal file fail before the TUI opens rather than being
-ignored; explicit `YACH_THEME` file failures instead show the fallback notice.
+`diffContext`, `diffHunk`, `harness`, and `statusBackground`. Unknown fields,
+tokens, colors, or variables in the personal file fail before the TUI opens
+rather than being ignored; explicit `YACH_THEME` file failures instead show
+the fallback notice.
+
+`composer.style` picks the composer layout. `box` (the default) draws a
+bordered input with the status row below it. `rule` draws the status row on
+a `─` rule above the prompt and closes the composer with a second rule.
+`band` draws the status row on a shaded `statusBackground` band above the
+prompt; under `system`, `NO_COLOR`, or a `statusBackground` of `default` it
+draws as `rule`. In every style the key hint shows only while the prompt is
+empty, and the status row colors only what needs attention: a disconnected
+or erroring connection, full-access approval, a filling context window, and
+warning or error messages.
 
 Monochrome (`NO_COLOR`) draws no color and no panel background. Metadata is
 dim, focused titles, tool names, and errors are bold, and the selected row is
@@ -388,6 +402,8 @@ size gate: `just perf --filter 'binary/size_bytes' --deterministic`.
    check), and Chromium on `PATH` (or `CHROMIUM=/path/to/chromium`). It embeds
    the monospace font found by `fc-match`; use `YACH_SHOT_FONT=/path/to/font.ttf`
    to supply one explicitly. Chromium is not part of the default dev shell.
+   The capture also renders a composer section: each composer style over
+   `dark`, `light`, and `system`, at 120 and 80 columns.
 2. Give both sets of labeled grid PNGs and raw `.ansi` captures to two
    reviewers: one for color/contrast (palette fidelity, WCAG ratios computed
    from SGR values, role semantics), one for layout/wording (hierarchy,

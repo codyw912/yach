@@ -5,7 +5,7 @@ use ratatui::style::Color;
 use super::contrast::contrast_ratio;
 use super::{Theme, ToolState};
 
-pub(crate) const COLOR_TOKENS: [&str; 22] = [
+pub(crate) const COLOR_TOKENS: [&str; 23] = [
     "accent",
     "border",
     "success",
@@ -28,6 +28,7 @@ pub(crate) const COLOR_TOKENS: [&str; 22] = [
     "diffContext",
     "diffHunk",
     "harness",
+    "statusBackground",
 ];
 
 /// Light variants of the pinned Tinted Theming schemes. Every other bundled

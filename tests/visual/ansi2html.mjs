@@ -81,6 +81,7 @@ const families = [
   ['tokyo-night', /^tokyo-night-/],
   ['gruvbox-solarized', /^(gruvbox|solarized)-/],
   ['nord-monokai', /^(nord|monokai)$/],
+  ['composer', /^composer-/],
   ['other', /./],
 ];
 
@@ -106,12 +107,12 @@ function render(out, font, manifest) {
 .grid{display:grid;grid-template-columns:repeat(2,max-content);gap:16px}
 .panel{background:var(--bg);color:var(--fg)}
 h2{margin:0;padding:8px 12px;font:16px/20px sans-serif}
-pre{box-sizing:content-box;margin:0;padding:12px;width:120ch;height:560px;font:12px/14px Shot,monospace;white-space:pre}`;
+pre{box-sizing:content-box;margin:0;padding:12px;width:calc(var(--cols)*1ch);height:560px;font:12px/14px Shot,monospace;white-space:pre}`;
   const page = (title, body) => `<!doctype html><meta charset="utf-8"><title>${escape(title)}</title><style>${css}</style>${body}`;
   const panels = readFileSync(manifest, 'utf8').trim().split('\n').map(line => {
-    const { name, fg, bg } = JSON.parse(line);
+    const { name, fg, bg, cols = 120 } = JSON.parse(line);
     const ansi = readFileSync(join(out, `${name}.ansi`), 'utf8').replace(/\n$/, '');
-    const body = `<section class="panel" style="--fg:${fg};--bg:${bg}"><h2>${escape(name)}</h2><pre>${convert(ansi, fg, bg)}</pre></section>`;
+    const body = `<section class="panel" style="--fg:${fg};--bg:${bg};--cols:${cols}"><h2>${escape(name)}</h2><pre>${convert(ansi, fg, bg)}</pre></section>`;
     writeFileSync(join(out, `${name}.html`), page(name, body));
     return { name, body };
   });

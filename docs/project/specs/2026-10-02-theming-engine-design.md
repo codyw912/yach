@@ -606,6 +606,12 @@ Yach behavior:
    **overrides every theme source**, including `YACH_THEME` and extension
    themes. (The standard allows user-level config to override `NO_COLOR`; this
    spec takes the simpler rule. See Open questions.)
+
+   Amended 2026-10-18 by `2026-10-17-composer-styles-design.md`: `NO_COLOR`
+   overrides every theme **color**. The selected theme's `spacing` and
+   `composer` still apply, and theme source errors are reported as they are
+   without `NO_COLOR`.
+
 2. Monochrome sets `Theme.mono = true` and every color to `Color::Reset`.
    Helpers then add attribute emphasis in place of hue:
 

@@ -40,6 +40,7 @@
     "diffRemoved": "#c25957",
     "diffContext": "base04",
     "diffHunk": "base0D",
-    "harness": "base0C"
+    "harness": "base0C",
+    "statusBackground": "base01"
   }
 }
