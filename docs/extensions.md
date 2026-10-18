@@ -78,8 +78,9 @@ a letter or digit. `dark`, `light`, `system`, and `auto` are reserved. The path
 must be relative, with no `..` components; symlinks must resolve inside the
 package root. `max_bytes` must be positive and limits how much theme data is
 read. The file uses the user theme JSON schema: `base`, `vars`, `colors`,
-`spacing`, and `composer` (see [TUI appearance in the README](../README.md#tui-appearance)). Its
-`base`, when present, must name a built-in preset or bundled palette, not another
+`spacing`, and `composer` (see
+[TUI appearance in the README](../README.md#tui-appearance)). Its `base`,
+when present, must name a built-in preset or bundled palette, not another
 extension theme.
 
 Installing a theme does not select it. Extension themes are selected **only

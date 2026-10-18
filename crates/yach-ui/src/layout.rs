@@ -156,7 +156,7 @@ pub fn render(frame: &mut Frame, params: &mut RenderParams<'_>) {
         marker,
     };
     frame.render_widget(status_bar, areas.status);
-    if let Some(closing) = areas.closing {
+    if let Some(closing) = areas.closing.filter(|rect| !rect.is_empty()) {
         let rule = "─".repeat(usize::from(closing.width));
         frame
             .buffer_mut()
@@ -322,6 +322,52 @@ mod tests {
                             assert_eq!(Some(marker.fg), theme.text().fg, "{label}: band marker");
                             assert!(marker.modifier.contains(Modifier::BOLD), "{label}");
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn composer_renders_in_tiny_terminals_while_streaming() {
+        for style in [ComposerStyle::Box, ComposerStyle::Rule, ComposerStyle::Band] {
+            let mut theme = Theme::dark();
+            theme.composer = style;
+            for height in 1..=3 {
+                for width in [1, 2, 40] {
+                    for lines in [1, 7] {
+                        let backend = TestBackend::new(width, height);
+                        let Ok(mut terminal) = Terminal::new(backend);
+                        let transcript = Transcript::new();
+                        let mut transcript_cache = TranscriptRenderCache::default();
+                        let mut input = TextArea::new(vec![String::from("line"); lines]);
+                        let status = StatusMessage::info("ready");
+                        let result = terminal.draw(|frame| {
+                            render(
+                                frame,
+                                &mut RenderParams {
+                                    transcript: &transcript,
+                                    transcript_cache: &mut transcript_cache,
+                                    scroll_offset: 0,
+                                    transcript_alignment: TranscriptAlignment::Bottom,
+                                    is_streaming: true,
+                                    input: &mut input,
+                                    model: "model",
+                                    thinking_level: "high",
+                                    approval_mode: "review",
+                                    reviewer_id: None,
+                                    status_message: &status,
+                                    is_connected: true,
+                                    compaction_count: 0,
+                                    total_tokens: None,
+                                    context_used_percent: None,
+                                    context_window: None,
+                                    terminal_focused: true,
+                                    theme: &theme,
+                                },
+                            );
+                        });
+                        assert!(result.is_ok(), "{style:?}, {width}x{height}, {lines} lines");
                     }
                 }
             }

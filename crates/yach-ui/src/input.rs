@@ -108,7 +108,16 @@ impl InputComposer<'_> {
     /// Open styles offset the unblocked textarea two columns, so wrap-aware
     /// cursor movement sees its rendered area and continuation rows stay indented.
     fn render_open(self, styles: &InputStyles, area: Rect, buf: &mut Buffer) {
-        buf.set_string(area.x, area.y, PROMPT_MARKER, styles.marker);
+        if area.is_empty() {
+            return;
+        }
+        buf.set_stringn(
+            area.x,
+            area.y,
+            PROMPT_MARKER,
+            usize::from(area.width),
+            styles.marker,
+        );
         let prompt = Rect {
             x: area.x.saturating_add(2),
             width: area.width.saturating_sub(2),
@@ -368,6 +377,29 @@ mod tests {
                     "{style:?} draft={draft:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn open_prompt_marker_stays_inside_a_one_column_area() {
+        for style in [ComposerStyle::Rule, ComposerStyle::Band] {
+            let mut input = TextArea::from(["hi"]);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+            buffer[(2, 0)].set_symbol("x");
+            Widget::render(
+                InputComposer {
+                    textarea: &mut input,
+                    is_streaming: false,
+                    terminal_focused: true,
+                    overflowed: false,
+                    style,
+                    theme: &Theme::default(),
+                },
+                Rect::new(1, 0, 1, 1),
+                &mut buffer,
+            );
+            assert_eq!(buffer[(1, 0)].symbol(), "›", "{style:?}");
+            assert_eq!(buffer[(2, 0)].symbol(), "x", "{style:?}: outside area");
         }
     }
 
