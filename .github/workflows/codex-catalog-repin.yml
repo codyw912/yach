@@ -1,17 +1,18 @@
 name: Codex catalog re-pin
 
 # Proposes a PR when a newer stable openai/codex release changes the baked
-# Codex catalog. PRs opened with GITHUB_TOKEN do not trigger pull_request
-# workflows; close and reopen the PR to run CI. Requires the repository
-# setting "Allow GitHub Actions to create and approve pull requests".
+# Codex catalog. The branch push and PR use a GitHub App installation token:
+# runs triggered by a GITHUB_TOKEN-created PR wait for manual approval, while
+# the app's PR runs CI unattended. Requires repository variable
+# REPIN_APP_CLIENT_ID and secret REPIN_APP_PRIVATE_KEY for an app installed
+# on this repository with Contents and Pull requests write access.
 on:
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   repin:
@@ -19,8 +20,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Create app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.REPIN_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REPIN_APP_PRIVATE_KEY }}
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Install just
         uses: extractions/setup-just@v3
@@ -33,7 +43,8 @@ jobs:
       # to its branch again would be rejected as non-fast-forward.
       - name: Open PR when the pin changed
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
         run: |
           set -euo pipefail
           if git diff --quiet -- crates/yach-catalog/data; then
@@ -45,12 +56,13 @@ jobs:
           if [ "$existing" != "0" ]; then
             echo "PR for $branch already exists"; exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bot="${APP_SLUG}[bot]"
+          git config user.name "$bot"
+          git config user.email "$(gh api "users/${bot}" --jq .id)+${bot}@users.noreply.github.com"
           git switch -c "$branch"
           git add crates/yach-catalog/data
           git commit -m "Re-pin baked Codex catalog to ${tag}"
           git push --force-with-lease origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "Re-pin baked Codex catalog to ${tag}" \
-            --body "Automated by .github/workflows/codex-catalog-repin.yml. Review the codex-models.json diff. Close and reopen this PR to run CI."
+            --body "Automated by .github/workflows/codex-catalog-repin.yml. Review the codex-models.json diff."

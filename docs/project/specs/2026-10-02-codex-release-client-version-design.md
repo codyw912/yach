@@ -197,12 +197,15 @@ not present in the previously advertised catalog.
 ### 5. Scheduled re-pin
 
 `.github/workflows/codex-catalog-repin.yml`: `schedule` weekly plus
-`workflow_dispatch`, `permissions: contents: write, pull-requests: write`.
-It runs `just catalog-codex-snapshot`; when the pin or snapshot changed, it
+`workflow_dispatch`, `permissions: contents: read`. It runs
+`just catalog-codex-snapshot`; when the pin or snapshot changed, it
 pushes branch `codex-catalog/<tag>` and opens a PR titled
 `Re-pin baked Codex catalog to <tag>`, unless one with that branch already
-exists. The PR is reviewed like any data change. Shipping it raises the
-baked floor; the runtime check already covers users in between.
+exists. The push and PR use a GitHub App installation token
+(`actions/create-github-app-token`), so CI runs without the manual
+approval GitHub requires for runs on PRs created with `GITHUB_TOKEN`. The PR
+is reviewed like any data change. Shipping it raises the baked floor; the
+runtime check already covers users in between.
 
 ## Error handling
 
@@ -271,12 +274,15 @@ Live acceptance (recorded in the PR):
 
 - **models.dev stays out of the forced chain.** Its refresh feeds the next
   launch by design and does not change which models exist.
-- **Re-pin PR CI: accept the `GITHUB_TOKEN` limitation.** GitHub does not
-  run `pull_request` workflows for a PR opened with the default
-  `GITHUB_TOKEN`; the owner closes and reopens the re-pin PR to run CI. The
-  repository setting "Allow GitHub Actions to create and approve pull
-  requests" must be enabled before the workflow can open PRs. No extra
-  token secret.
+- **Re-pin PR CI: open the PR with a GitHub App token** (revised
+  2026-10-19). The original decision accepted the `GITHUB_TOKEN`
+  limitation and ruled out an extra token secret. Since GitHub's 2026-06-11
+  change, `pull_request` runs on a `GITHUB_TOKEN`-created PR are created but
+  wait for maintainer approval, so each re-pin PR still needed a manual step
+  before CI ran. The owner chose an app installation token instead: it needs
+  repository variable `REPIN_APP_CLIENT_ID` and secret
+  `REPIN_APP_PRIVATE_KEY`, is scoped to this repository, and is revoked when
+  the job ends.
 - **No version cap setting.** Advertising the newest Codex release asserts
   yach handles what that release does; a model needing a protocol feature
   yach lacks could appear and fail when used. Add a cap only if that
