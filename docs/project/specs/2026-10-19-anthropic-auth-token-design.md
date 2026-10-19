@@ -2,10 +2,10 @@
 
 **Outcome:** linear:CEW-147 (kata `yach#q6rj`)
 
-Status: draft, 2026-10-19. Owner decisions the same day: patch the vendored
-Rig so each request carries exactly one credential header (no duplicate
-header for a service that is not this gateway), and include stored
-connections in this change.
+Status: approved by the owner, 2026-10-19 ("go ahead through to a PR"). Owner
+decisions the same day: patch the vendored Rig so each request carries
+exactly one credential header (no duplicate header for a service that is not
+this gateway), and include stored connections in this change.
 
 ## Problem
 
@@ -47,7 +47,7 @@ A third gap: a stored Anthropic connection cannot have a base URL at all.
 2. The choice is available from the environment and from stored connections,
    alongside a custom base URL.
 3. Every Anthropic request goes through the same choice: chat turns, model
-   discovery, and `yach rig-smoke`.
+   discovery, and `yach smoke-rig-anthropic`.
 4. Direct Anthropic API use is unchanged for existing environments and
    stored connections.
 
@@ -135,7 +135,7 @@ Compaction is unaffected. Its raw request with Bearer auth only serves
 Setting both is an error because neither choice is clearly what the user
 meant. Every place that reads `YACH_RIG_ANTHROPIC_API_KEY` in
 `crates/yach-cli/src/main.rs` goes through one resolver implementing this
-table: the interactive provider, `rig-smoke`, and the request-config paths.
+table: the interactive provider, `smoke-rig-anthropic`, and the request-config paths.
 The environment connection reports the mode it resolved (see Stored
 connections).
 
@@ -223,8 +223,7 @@ Permanent tests, in the crates that own the behavior:
 Two runs through `omp-subscriptions`, recorded in
 `docs/project/records/`:
 
-1. `yach rig-smoke` with `YACH_RIG_PROVIDER=anthropic`,
-   `YACH_RIG_ANTHROPIC_AUTH_TOKEN`, and
+1. `yach smoke-rig-anthropic` with `YACH_RIG_ANTHROPIC_AUTH_TOKEN` and
    `YACH_RIG_ANTHROPIC_BASE_URL=http://omp-subscriptions.home.lan:4000`.
 2. One completed `yach run` turn that calls a tool, following
    `docs/project/records/2026-09-30-session-diagnostics-gateway-smoke.md`,
