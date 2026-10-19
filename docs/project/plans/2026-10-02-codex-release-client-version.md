@@ -916,6 +916,11 @@ Refs: yach#np83, plane:YACH-17"
 **Interfaces:**
 - Consumes: `just catalog-codex-snapshot` (Task 1).
 
+> **Superseded 2026-10-19:** the workflow below records what this task
+> shipped. The live workflow opens the PR with a GitHub App installation
+> token instead of `GITHUB_TOKEN`; see the spec's revised re-pin decision and
+> `.github/workflows/codex-catalog-repin.yml`.
+
 - [ ] **Step 1: Write the workflow**
 
 ```yaml
