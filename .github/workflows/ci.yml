@@ -199,7 +199,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev valgrind
 
       # A new branch or force-push has no usable previous commit to compare.
       # A dispatch always names its base, so a missing one fails instead.
@@ -245,6 +245,17 @@ jobs:
       - name: Summarize
         if: always() && steps.base.outputs.available == 'true'
         run: ./target/release-root/release/yach-bench perf report ab.json >> "$GITHUB_STEP_SUMMARY"
+
+      # Report only: never fails the job. `perf ab` left both sides' release
+      # yach-bench under each tree's target/release-root. The table goes to
+      # the step summary and the log.
+      - name: Instruction counts
+        if: always() && steps.base.outputs.available == 'true'
+        continue-on-error: true
+        run: |
+          bash .github/scripts/instruction_counts.sh \
+            .perf/base/target/release-root/release/yach-bench \
+            ./target/release-root/release/yach-bench | tee -a "$GITHUB_STEP_SUMMARY"
 
       # A dispatch run without a comparison document is not a timing sample.
       # `Compare` exits non-zero on a regressed verdict and still writes the
