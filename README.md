@@ -176,7 +176,8 @@ Environment:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `YACH_RIG_PROVIDER` | `anthropic` | Provider selection (`anthropic`, `openai`, `openai-compatible`, `chatgpt-subscription`). |
-| `YACH_RIG_ANTHROPIC_API_KEY` | — | Required for the default provider. |
+| `YACH_RIG_ANTHROPIC_API_KEY` | — | Required for the default provider unless `YACH_RIG_ANTHROPIC_AUTH_TOKEN` is set. Sent as `x-api-key`. |
+| `YACH_RIG_ANTHROPIC_AUTH_TOKEN` | — | Use instead of the API key for gateways that expect `Authorization: Bearer` (the same meaning as `ANTHROPIC_AUTH_TOKEN` in other clients). Setting both is an error. `/connect` offers the same choice for stored Anthropic connections, with an optional base URL. |
 | `YACH_RIG_ANTHROPIC_MODEL` | `claude-sonnet-5` | Model id (interactive default). |
 | `YACH_RIG_ANTHROPIC_BASE_URL` | Anthropic API | Override for messages-compatible aggregators. |
 | `YACH_RIG_OPENAI_API_KEY` | — | API key for OpenAI (Responses API). |

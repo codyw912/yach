@@ -11258,7 +11258,8 @@ mod tests {
         }
     }
     use crate::rig_adapter::{
-        ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
+        AnthropicAuth, ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig,
+        run_provider_request,
     };
     use crate::{
         CompactionError, CompactionPreparation, CompactionProviderContext, CompactionReason,
@@ -26075,6 +26076,7 @@ manual anchored summary"
             adapter: Arc::new(RigProviderAdapterConfig {
                 provider: RigProviderConfig::Anthropic {
                     api_key: ProviderSecret::new(String::from("test-key")),
+                    auth: AnthropicAuth::ApiKey,
                     base_url: None,
                 },
                 timeout: std::time::Duration::from_secs(30),

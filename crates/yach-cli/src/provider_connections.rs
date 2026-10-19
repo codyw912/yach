@@ -15,11 +15,11 @@ use yach_backend::{
     logout_chatgpt_subscription, managed_chatgpt_adapter,
     model_discovery::{ModelDiscoveryError, discover_provider_models},
     reauth_chatgpt_subscription, relogin_chatgpt_subscription,
-    rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig},
+    rig_adapter::{AnthropicAuth, MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig},
 };
 use yach_connections::{
     ConnectionAuth, ConnectionId, ConnectionMetadataStore, ConnectionState,
-    CreateConnectionOutcome, CredentialError, CredentialSource, CredentialStore,
+    CreateConnectionOutcome, CredentialError, CredentialKind, CredentialSource, CredentialStore,
     JsonConnectionMetadataStore, NewConnectionDraft, ProviderConnection, ProviderConnectionStore,
     ProviderKind, ProviderSecret,
 };
@@ -87,10 +87,15 @@ impl EnvironmentConnection {
     #[must_use]
     pub(crate) fn new(adapter: Arc<RigProviderAdapterConfig>) -> Self {
         let (provider, authentication) = match &adapter.provider {
-            RigProviderConfig::Anthropic { .. } => (
+            RigProviderConfig::Anthropic { auth, .. } => (
                 ProviderKind::Anthropic,
-                ConnectionAuth::ApiKey {
-                    source: CredentialSource::Environment,
+                match auth {
+                    AnthropicAuth::ApiKey => ConnectionAuth::ApiKey {
+                        source: CredentialSource::Environment,
+                    },
+                    AnthropicAuth::AuthToken => ConnectionAuth::AuthToken {
+                        source: CredentialSource::Environment,
+                    },
                 },
             ),
             RigProviderConfig::OpenAi { .. } => (
@@ -1585,7 +1590,13 @@ fn adapter_for_draft(
     draft: &NewConnectionDraft,
     secret: ProviderSecret,
 ) -> RigProviderAdapterConfig {
-    adapter_for_parts(state, draft.provider(), draft.base_url(), secret)
+    adapter_for_parts(
+        state,
+        draft.provider(),
+        draft.base_url(),
+        draft.credential_kind(),
+        secret,
+    )
 }
 
 fn adapter_for_connection(
@@ -1597,6 +1608,7 @@ fn adapter_for_connection(
         state,
         connection.provider,
         connection.base_url.as_deref(),
+        connection.authentication.credential_kind(),
         secret,
     )
 }
@@ -1605,6 +1617,7 @@ fn adapter_for_parts(
     state: &RuntimeState,
     provider: ProviderKind,
     base_url: Option<&str>,
+    credential: CredentialKind,
     secret: ProviderSecret,
 ) -> RigProviderAdapterConfig {
     let error_dialect = super::adapter_error_dialect(match provider {
@@ -1616,6 +1629,10 @@ fn adapter_for_parts(
     let provider = match provider {
         ProviderKind::Anthropic => RigProviderConfig::Anthropic {
             api_key: secret,
+            auth: match credential {
+                CredentialKind::ApiKey => AnthropicAuth::ApiKey,
+                CredentialKind::AuthToken => AnthropicAuth::AuthToken,
+            },
             base_url: base_url.map(String::from),
         },
         ProviderKind::OpenAi => RigProviderConfig::OpenAi {

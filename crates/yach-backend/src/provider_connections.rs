@@ -3,8 +3,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use yach_connections::{
-    ConnectionId, ConnectionKey, ConnectionState, NewConnectionDraft, ProviderConnection,
-    ProviderKind, ProviderSecret,
+    ConnectionId, ConnectionKey, ConnectionState, CredentialKind, NewConnectionDraft,
+    ProviderConnection, ProviderKind, ProviderSecret,
 };
 use yach_proto::{DialogKind, DialogOption, DialogRequest, DialogResponse};
 
@@ -17,6 +17,7 @@ const ROOT_DIALOG_ID: &str = "provider-connection:root";
 const PROVIDER_DIALOG_ID: &str = "provider-connection:provider";
 const LABEL_DIALOG_ID: &str = "provider-connection:label";
 const BASE_URL_DIALOG_ID: &str = "provider-connection:base-url";
+const ANTHROPIC_AUTH_DIALOG_ID: &str = "provider-connection:anthropic-auth";
 const CREATE_SECRET_DIALOG_ID: &str = "provider-connection:secret:create";
 const ACTIONS_DIALOG_ID: &str = "provider-connection:actions";
 const RENAME_DIALOG_ID: &str = "provider-connection:rename";
@@ -393,6 +394,7 @@ pub enum ConnectionFlowStateTag {
     RootList,
     ChoosingProvider,
     EnteringLabel,
+    ChoosingAnthropicAuth,
     EnteringBaseUrl,
     EnteringCreateSecret,
     EnteringCreateKey,
@@ -414,9 +416,13 @@ enum ConnectionFlowState {
     EnteringLabel {
         provider: ProviderKind,
     },
+    ChoosingAnthropicAuth {
+        label: Option<String>,
+    },
     EnteringBaseUrl {
         provider: ProviderKind,
         label: Option<String>,
+        credential: CredentialKind,
     },
     EnteringCreateSecret {
         draft: NewConnectionDraft,
@@ -450,10 +456,12 @@ enum ConnectionFlowState {
     },
     EnteringRepairSecret {
         id: ConnectionId,
+        credential: CredentialKind,
     },
     EnteringReplaceSecret {
         id: ConnectionId,
         model: Option<String>,
+        credential: CredentialKind,
     },
 }
 
@@ -463,6 +471,7 @@ impl ConnectionFlowState {
             Self::RootList => ConnectionFlowStateTag::RootList,
             Self::ChoosingProvider => ConnectionFlowStateTag::ChoosingProvider,
             Self::EnteringLabel { .. } => ConnectionFlowStateTag::EnteringLabel,
+            Self::ChoosingAnthropicAuth { .. } => ConnectionFlowStateTag::ChoosingAnthropicAuth,
             Self::EnteringBaseUrl { .. } => ConnectionFlowStateTag::EnteringBaseUrl,
             Self::EnteringCreateSecret { .. } => ConnectionFlowStateTag::EnteringCreateSecret,
             Self::EnteringCreateKey { .. } => ConnectionFlowStateTag::EnteringCreateKey,
@@ -482,7 +491,10 @@ impl ConnectionFlowState {
 
 enum CreateRetryState {
     Fresh(NewConnectionDraft),
-    Pending(ConnectionId),
+    Pending {
+        id: ConnectionId,
+        credential: CredentialKind,
+    },
 }
 
 enum RetryState {
@@ -501,10 +513,14 @@ enum RetryState {
     ReauthChatGpt {
         connection: ProviderConnection,
     },
-    Repair(ConnectionId),
+    Repair {
+        id: ConnectionId,
+        credential: CredentialKind,
+    },
     Replace {
         id: ConnectionId,
         model: Option<String>,
+        credential: CredentialKind,
     },
     Rename {
         connection: ProviderConnection,
@@ -525,9 +541,11 @@ impl RetryState {
                     draft: draft.clone(),
                 }
             }
-            Self::Create(CreateRetryState::Pending(id)) | Self::Repair(id) => {
-                ConnectionFlowState::EnteringRepairSecret { id: id.clone() }
-            }
+            Self::Create(CreateRetryState::Pending { id, credential })
+            | Self::Repair { id, credential } => ConnectionFlowState::EnteringRepairSecret {
+                id: id.clone(),
+                credential: *credential,
+            },
             Self::ProbeChatGpt { label } | Self::LoginChatGpt { label } => {
                 let _ = label;
                 ConnectionFlowState::EnteringLabel {
@@ -546,9 +564,14 @@ impl RetryState {
             Self::ReauthChatGpt { connection } => ConnectionFlowState::ConfirmingChatGptReauth {
                 connection: connection.clone(),
             },
-            Self::Replace { id, model } => ConnectionFlowState::EnteringReplaceSecret {
+            Self::Replace {
+                id,
+                model,
+                credential,
+            } => ConnectionFlowState::EnteringReplaceSecret {
                 id: id.clone(),
                 model: model.clone(),
+                credential: *credential,
             },
             Self::Rename { connection, label } => {
                 let mut connection = connection.clone();
@@ -573,8 +596,8 @@ impl RetryState {
             Self::AdoptChatGpt { .. } | Self::LoginChatGpt { .. } | Self::ReauthChatGpt { .. } => {
                 "ChatGPT subscription connected"
             }
-            Self::Repair(_) => "connection repaired",
-            Self::Replace { .. } => "connection API key replaced",
+            Self::Repair { .. } => "connection repaired",
+            Self::Replace { .. } => "connection credential replaced",
             Self::Rename { .. } => "connection renamed",
             Self::AssignKey { .. } => "connection configuration key assigned",
             Self::Remove(_) => "connection removed",
@@ -703,9 +726,17 @@ impl ProviderConnectionFlow {
                 self.submit_label(*provider, value)
             }
             (
-                ConnectionFlowState::EnteringBaseUrl { provider, label },
+                ConnectionFlowState::ChoosingAnthropicAuth { label },
+                DialogResponse::Selection { value },
+            ) => self.select_anthropic_auth(label.clone(), &value),
+            (
+                ConnectionFlowState::EnteringBaseUrl {
+                    provider,
+                    label,
+                    credential,
+                },
                 DialogResponse::Text { value },
-            ) => self.submit_base_url(*provider, label.clone(), value),
+            ) => self.submit_base_url(*provider, label.clone(), *credential, value),
             (
                 ConnectionFlowState::EnteringCreateSecret { draft },
                 DialogResponse::Secret { value },
@@ -728,13 +759,23 @@ impl ProviderConnectionFlow {
                 DialogResponse::Confirmed { accepted },
             ) => self.confirm_remove(connection.clone(), accepted, provider_turn_active),
             (
-                ConnectionFlowState::EnteringRepairSecret { id },
+                ConnectionFlowState::EnteringRepairSecret { id, credential },
                 DialogResponse::Secret { value },
-            ) => self.submit_repair_secret(id.clone(), value, provider_turn_active),
+            ) => self.submit_repair_secret(id.clone(), *credential, value, provider_turn_active),
             (
-                ConnectionFlowState::EnteringReplaceSecret { id, model },
+                ConnectionFlowState::EnteringReplaceSecret {
+                    id,
+                    model,
+                    credential,
+                },
                 DialogResponse::Secret { value },
-            ) => self.submit_replace_secret(id.clone(), model.clone(), value, provider_turn_active),
+            ) => self.submit_replace_secret(
+                id.clone(),
+                model.clone(),
+                *credential,
+                value,
+                provider_turn_active,
+            ),
             (
                 ConnectionFlowState::ConfirmingChatGptLogin {
                     label,
@@ -795,8 +836,11 @@ impl ProviderConnectionFlow {
             }
             ConnectionMutationOutcome::FailedAfterCreatePending { id, failure } => {
                 let retry = match retry {
-                    RetryState::Create(CreateRetryState::Fresh(_)) => {
-                        RetryState::Create(CreateRetryState::Pending(id.clone()))
+                    RetryState::Create(CreateRetryState::Fresh(draft)) => {
+                        RetryState::Create(CreateRetryState::Pending {
+                            id: id.clone(),
+                            credential: draft.credential_kind(),
+                        })
                     }
                     retry => retry,
                 };
@@ -1038,20 +1082,47 @@ impl ProviderConnectionFlow {
                 false,
             );
         }
-        if provider == ProviderKind::OpenAiCompatible {
-            self.state = ConnectionFlowState::EnteringBaseUrl {
-                provider,
-                label: normalized_label,
-            };
-        } else {
-            let Ok(draft) = NewConnectionDraft::new(provider, normalized_label, None) else {
-                return vec![
-                    ConnectionFlowEffect::Status("connection draft is invalid"),
-                    ConnectionFlowEffect::ShowDialog(self.dialog_for_state()),
-                ];
-            };
-            return self.prepare_create_draft(draft);
+        match provider {
+            ProviderKind::OpenAiCompatible => {
+                self.state = ConnectionFlowState::EnteringBaseUrl {
+                    provider,
+                    label: normalized_label,
+                    credential: CredentialKind::ApiKey,
+                };
+            }
+            ProviderKind::Anthropic => {
+                self.state = ConnectionFlowState::ChoosingAnthropicAuth {
+                    label: normalized_label,
+                };
+            }
+            ProviderKind::OpenAi | ProviderKind::ChatGptSubscription => {
+                let Ok(draft) = NewConnectionDraft::new(provider, normalized_label, None) else {
+                    return vec![
+                        ConnectionFlowEffect::Status("connection draft is invalid"),
+                        ConnectionFlowEffect::ShowDialog(self.dialog_for_state()),
+                    ];
+                };
+                return self.prepare_create_draft(draft);
+            }
         }
+        vec![ConnectionFlowEffect::ShowDialog(self.dialog_for_state())]
+    }
+
+    fn select_anthropic_auth(
+        &mut self,
+        label: Option<String>,
+        value: &str,
+    ) -> Vec<ConnectionFlowEffect> {
+        let credential = match value {
+            "api_key" => CredentialKind::ApiKey,
+            "auth_token" => CredentialKind::AuthToken,
+            _ => return Vec::new(),
+        };
+        self.state = ConnectionFlowState::EnteringBaseUrl {
+            provider: ProviderKind::Anthropic,
+            label,
+            credential,
+        };
         vec![ConnectionFlowEffect::ShowDialog(self.dialog_for_state())]
     }
 
@@ -1059,10 +1130,24 @@ impl ProviderConnectionFlow {
         &mut self,
         provider: ProviderKind,
         label: Option<String>,
+        credential: CredentialKind,
         value: String,
     ) -> Vec<ConnectionFlowEffect> {
-        let Ok(draft) = NewConnectionDraft::new(provider, label.clone(), Some(value)) else {
-            self.state = ConnectionFlowState::EnteringBaseUrl { provider, label };
+        // An Anthropic connection may keep the Anthropic API; an
+        // OpenAI-compatible one has no default endpoint.
+        let base_url = if provider == ProviderKind::Anthropic {
+            optional_field(value)
+        } else {
+            Some(value)
+        };
+        let Ok(draft) = NewConnectionDraft::new(provider, label.clone(), base_url)
+            .and_then(|draft| draft.with_credential_kind(credential))
+        else {
+            self.state = ConnectionFlowState::EnteringBaseUrl {
+                provider,
+                label,
+                credential,
+            };
             return vec![
                 ConnectionFlowEffect::Status("connection base URL is invalid"),
                 ConnectionFlowEffect::ShowDialog(self.dialog_for_state()),
@@ -1161,7 +1246,10 @@ impl ProviderConnectionFlow {
                 if connection.provider != ProviderKind::ChatGptSubscription
                     && connection.state == ConnectionState::PendingCredential =>
             {
-                self.state = ConnectionFlowState::EnteringRepairSecret { id: connection.id };
+                self.state = ConnectionFlowState::EnteringRepairSecret {
+                    credential: connection.authentication.credential_kind(),
+                    id: connection.id,
+                };
             }
             "replace"
                 if connection.provider != ProviderKind::ChatGptSubscription
@@ -1173,6 +1261,7 @@ impl ProviderConnectionFlow {
                     .filter(|active| active.connection_id == connection.id)
                     .map(|active| active.model.clone());
                 self.state = ConnectionFlowState::EnteringReplaceSecret {
+                    credential: connection.authentication.credential_kind(),
                     id: connection.id,
                     model,
                 };
@@ -1265,6 +1354,7 @@ impl ProviderConnectionFlow {
     fn submit_repair_secret(
         &mut self,
         id: ConnectionId,
+        credential: CredentialKind,
         value: yach_proto::SubmittedSecret,
         provider_turn_active: bool,
     ) -> Vec<ConnectionFlowEffect> {
@@ -1275,7 +1365,10 @@ impl ProviderConnectionFlow {
             ];
         }
         self.start_mutation(
-            RetryState::Repair(id.clone()),
+            RetryState::Repair {
+                id: id.clone(),
+                credential,
+            },
             ConnectionMutationOperation::Repair {
                 id,
                 secret: ProviderSecret::new(value.into_inner()),
@@ -1288,6 +1381,7 @@ impl ProviderConnectionFlow {
         &mut self,
         id: ConnectionId,
         model: Option<String>,
+        credential: CredentialKind,
         value: yach_proto::SubmittedSecret,
         provider_turn_active: bool,
     ) -> Vec<ConnectionFlowEffect> {
@@ -1301,6 +1395,7 @@ impl ProviderConnectionFlow {
             RetryState::Replace {
                 id: id.clone(),
                 model: model.clone(),
+                credential,
             },
             ConnectionMutationOperation::Replace {
                 id,
@@ -1342,6 +1437,10 @@ impl ProviderConnectionFlow {
             (ConnectionFlowState::RootList, ROOT_DIALOG_ID)
                 | (ConnectionFlowState::ChoosingProvider, PROVIDER_DIALOG_ID)
                 | (ConnectionFlowState::EnteringLabel { .. }, LABEL_DIALOG_ID)
+                | (
+                    ConnectionFlowState::ChoosingAnthropicAuth { .. },
+                    ANTHROPIC_AUTH_DIALOG_ID
+                )
                 | (
                     ConnectionFlowState::EnteringBaseUrl { .. },
                     BASE_URL_DIALOG_ID
@@ -1412,6 +1511,7 @@ impl ProviderConnectionFlow {
             ConnectionFlowState::RootList => Some(ROOT_DIALOG_ID),
             ConnectionFlowState::ChoosingProvider => Some(PROVIDER_DIALOG_ID),
             ConnectionFlowState::EnteringLabel { .. } => Some(LABEL_DIALOG_ID),
+            ConnectionFlowState::ChoosingAnthropicAuth { .. } => Some(ANTHROPIC_AUTH_DIALOG_ID),
             ConnectionFlowState::EnteringBaseUrl { .. } => Some(BASE_URL_DIALOG_ID),
             ConnectionFlowState::EnteringCreateSecret { .. } => Some(CREATE_SECRET_DIALOG_ID),
             ConnectionFlowState::EnteringCreateKey { .. } => Some(CREATE_KEY_DIALOG_ID),
@@ -1448,16 +1548,37 @@ impl ProviderConnectionFlow {
             ConnectionFlowState::EnteringLabel { .. } => {
                 input_dialog(LABEL_DIALOG_ID, "Connection label", "Optional label", None)
             }
+            ConnectionFlowState::ChoosingAnthropicAuth { .. } => select_dialog(
+                ANTHROPIC_AUTH_DIALOG_ID,
+                "Anthropic authentication",
+                "How does this endpoint expect the credential?",
+                &[
+                    ("API key (x-api-key)", "api_key"),
+                    ("Auth token (Authorization: Bearer)", "auth_token"),
+                ],
+            ),
+            ConnectionFlowState::EnteringBaseUrl {
+                provider: ProviderKind::Anthropic,
+                ..
+            } => input_dialog(
+                BASE_URL_DIALOG_ID,
+                "Anthropic base URL",
+                "Optional; leave empty for the Anthropic API",
+                None,
+            ),
             ConnectionFlowState::EnteringBaseUrl { .. } => input_dialog(
                 BASE_URL_DIALOG_ID,
                 "OpenAI-compatible base URL",
                 "Enter the API base URL",
                 None,
             ),
-            ConnectionFlowState::EnteringCreateSecret { .. } => secret_dialog(
+            ConnectionFlowState::EnteringCreateSecret { draft } => secret_dialog(
                 CREATE_SECRET_DIALOG_ID,
                 "Connection credential",
-                "Enter the API key",
+                match draft.credential_kind() {
+                    CredentialKind::ApiKey => "Enter the API key",
+                    CredentialKind::AuthToken => "Enter the auth token",
+                },
             ),
             ConnectionFlowState::ConfirmingChatGptLogin { account_id, .. } => select_dialog(
                 CHATGPT_CONFIRM_DIALOG_ID,
@@ -1534,15 +1655,15 @@ impl ProviderConnectionFlow {
                 prompt: Some(String::from("Remove this connection and its credential?")),
                 kind: DialogKind::Confirm,
             },
-            ConnectionFlowState::EnteringRepairSecret { .. } => secret_dialog(
+            ConnectionFlowState::EnteringRepairSecret { credential, .. } => secret_dialog(
                 REPAIR_SECRET_DIALOG_ID,
                 "Repair connection credential",
-                "Enter the replacement API key",
+                replacement_secret_prompt(*credential),
             ),
-            ConnectionFlowState::EnteringReplaceSecret { .. } => secret_dialog(
+            ConnectionFlowState::EnteringReplaceSecret { credential, .. } => secret_dialog(
                 REPLACE_SECRET_DIALOG_ID,
                 "Replace connection credential",
-                "Enter the replacement API key",
+                replacement_secret_prompt(*credential),
             ),
         }
     }
@@ -1580,6 +1701,13 @@ fn input_dialog(id: &str, title: &str, prompt: &str, default: Option<String>) ->
         title: Some(title.to_owned()),
         prompt: Some(prompt.to_owned()),
         kind: DialogKind::Input { default },
+    }
+}
+
+const fn replacement_secret_prompt(credential: CredentialKind) -> &'static str {
+    match credential {
+        CredentialKind::ApiKey => "Enter the replacement API key",
+        CredentialKind::AuthToken => "Enter the replacement auth token",
     }
 }
 
@@ -2883,6 +3011,136 @@ mod tests {
         );
         only_dialog(effects, "provider-connection:base-url");
         assert_eq!(flow.state_tag(), ConnectionFlowStateTag::EnteringBaseUrl);
+    }
+
+    /// Walks `/connect` for Anthropic to the secret prompt and returns it.
+    fn anthropic_flow_to_secret(auth: &str, base_url: &str) -> Option<yach_proto::DialogRequest> {
+        let mut flow = ProviderConnectionFlow::new(None);
+        let _ = begin_root(&mut flow, Vec::new());
+        for (dialog, response, next) in [
+            (
+                "provider-connection:root",
+                DialogResponse::Selection {
+                    value: String::from("add"),
+                },
+                "provider-connection:provider",
+            ),
+            (
+                "provider-connection:provider",
+                DialogResponse::Selection {
+                    value: String::from("anthropic"),
+                },
+                "provider-connection:label",
+            ),
+            (
+                "provider-connection:label",
+                DialogResponse::Text {
+                    value: String::from("Gateway"),
+                },
+                "provider-connection:anthropic-auth",
+            ),
+            (
+                "provider-connection:anthropic-auth",
+                DialogResponse::Selection {
+                    value: String::from(auth),
+                },
+                "provider-connection:base-url",
+            ),
+        ] {
+            only_dialog(flow.handle_dialog_response(dialog, response, false), next);
+        }
+        let effects = flow.handle_dialog_response(
+            "provider-connection:base-url",
+            DialogResponse::Text {
+                value: String::from(base_url),
+            },
+            false,
+        );
+        assert_eq!(
+            flow.state_tag(),
+            ConnectionFlowStateTag::EnteringCreateSecret
+        );
+        effects.into_iter().find_map(|effect| match effect {
+            ConnectionFlowEffect::ShowDialog(dialog)
+                if dialog.id.as_deref() == Some("provider-connection:secret:create") =>
+            {
+                Some(dialog)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn anthropic_flow_asks_for_auth_mode_and_accepts_a_gateway_url() {
+        let secret = anthropic_flow_to_secret("auth_token", "http://gateway.example:4000");
+        assert_eq!(
+            secret.and_then(|dialog| dialog.prompt).as_deref(),
+            Some("Enter the auth token")
+        );
+    }
+
+    #[test]
+    fn anthropic_flow_blank_base_url_keeps_the_api_key_default() {
+        let secret = anthropic_flow_to_secret("api_key", "");
+        assert_eq!(
+            secret.and_then(|dialog| dialog.prompt).as_deref(),
+            Some("Enter the API key")
+        );
+    }
+
+    /// Opens `action` on `connection` and returns the secret prompt shown.
+    fn secret_prompt_for_action(connection: ProviderConnection, action: &str) -> Option<String> {
+        let mut flow = ProviderConnectionFlow::new(None);
+        let root_value = begin_root(&mut flow, vec![connection]);
+        only_dialog(
+            flow.handle_dialog_response(
+                "provider-connection:root",
+                DialogResponse::Selection { value: root_value },
+                false,
+            ),
+            "provider-connection:actions",
+        );
+        flow.handle_dialog_response(
+            "provider-connection:actions",
+            DialogResponse::Selection {
+                value: action.to_owned(),
+            },
+            false,
+        )
+        .into_iter()
+        .find_map(|effect| match effect {
+            ConnectionFlowEffect::ShowDialog(dialog) => dialog.prompt,
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn repair_and_replace_prompts_name_the_connections_credential_kind() {
+        let gateway = |state| ProviderConnection {
+            provider: ProviderKind::Anthropic,
+            base_url: Some(String::from("http://gateway.example:4000")),
+            authentication: ConnectionAuth::AuthToken {
+                source: CredentialSource::System,
+            },
+            ..stored_connection(state, Some("Gateway"))
+        };
+        assert_eq!(
+            secret_prompt_for_action(gateway(ConnectionState::PendingCredential), "repair")
+                .as_deref(),
+            Some("Enter the replacement auth token")
+        );
+        assert_eq!(
+            secret_prompt_for_action(gateway(ConnectionState::Ready), "replace").as_deref(),
+            Some("Enter the replacement auth token")
+        );
+        assert_eq!(
+            secret_prompt_for_action(
+                stored_connection(ConnectionState::Ready, Some("Direct")),
+                "replace"
+            )
+            .as_deref(),
+            Some("Enter the replacement API key")
+        );
     }
 
     #[test]

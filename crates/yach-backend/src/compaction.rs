@@ -1051,7 +1051,9 @@ mod tests {
 
     use yach_connections::ProviderSecret;
 
-    use crate::rig_adapter::{MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig};
+    use crate::rig_adapter::{
+        AnthropicAuth, MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig,
+    };
     use crate::session::{
         CompactionCheckpointId, MaskReason, Role, SessionId, ToolOutcome, ToolPayloadSummary,
         ToolRequestId, TurnId,
@@ -1497,6 +1499,7 @@ mod tests {
                 adapter: Arc::new(RigProviderAdapterConfig {
                     provider: RigProviderConfig::Anthropic {
                         api_key: ProviderSecret::new(String::from("fixture-secret")),
+                        auth: AnthropicAuth::ApiKey,
                         base_url: None,
                     },
                     timeout: Duration::from_secs(1),
@@ -1539,6 +1542,7 @@ mod tests {
                 adapter: Arc::new(RigProviderAdapterConfig {
                     provider: RigProviderConfig::Anthropic {
                         api_key: ProviderSecret::new(String::from("fixture-secret")),
+                        auth: AnthropicAuth::ApiKey,
                         base_url: None,
                     },
                     timeout: Duration::from_secs(1),
@@ -1895,6 +1899,7 @@ mod tests {
             adapter: Arc::new(RigProviderAdapterConfig {
                 provider: RigProviderConfig::Anthropic {
                     api_key: ProviderSecret::new(String::from("native-compactor-fixture-secret")),
+                    auth: AnthropicAuth::ApiKey,
                     base_url: None,
                 },
                 timeout: Duration::from_secs(1),
