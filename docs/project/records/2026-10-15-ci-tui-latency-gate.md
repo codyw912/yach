@@ -123,3 +123,23 @@ builds the controller into `target/release-root`, and runs `perf ab` with
 cannot name four ids: glob 0.3 does not expand braces, which is what made
 run 38735209195 empty. Exit 1 (`regressed` or `error`) fails the job. Exit 2
 (`inconclusive`) is written to the step summary and does not fail it.
+
+## Superseded 2026-10-19: latency is advisory
+
+Owner decision: wall-clock latency on shared runners no longer gates
+merges. In the 30 days to 2026-10-19 this job failed five times, all false
+alarms: four were shared-runner noise, including +10.5% and +22.2%
+"regressions" on pull requests that changed only AGENTS.md, and one was a
+count-row verdict this job should not have judged. On `bd2e496e` its count
+values were the deterministic job's per-iteration values times 100
+(`keypress/active_stream_on_history_headless/100#alloc_bytes` 6,336,566,400
+→ 6,336,576,000 against a 96-byte budget). That scaling was fixed in #309
+(2026-10-16), which takes latency runs' `#alloc_*` values from a separate
+one-sample measurement; count rows still belong to `Perf (deterministic)`.
+
+The job moved to `.github/workflows/perf-latency.yml`. It runs on pull
+requests labeled `perf:latency` and on `workflow_dispatch`, reads each
+row's verdict from its `ab-*.json` document, warns on a latency
+`regressed` or `inconclusive`, ignores count rows, and fails only on a
+harness failure. The budgets above still decide each advisory verdict.
+Current behaviour is described in `docs/benchmarks/README.md`, "CI gates".
