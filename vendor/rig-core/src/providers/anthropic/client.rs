@@ -41,25 +41,42 @@ pub struct AnthropicBuilder {
     pub(crate) anthropic_betas: Vec<String>,
 }
 
+/// The credential a Messages-format client sends.
+// yach patch: Anthropic-compatible gateways (and `ANTHROPIC_AUTH_TOKEN` in
+// other clients) authenticate with `Authorization: Bearer`. Exactly one
+// header is sent; the default stays `x-api-key`.
 #[derive(Debug, Clone)]
-pub struct AnthropicKey(String);
+pub enum AnthropicKey {
+    /// Sent as `x-api-key`.
+    ApiKey(String),
+    /// Sent as `Authorization: Bearer`.
+    AuthToken(String),
+}
+
+impl AnthropicKey {
+    /// A token sent as `Authorization: Bearer` instead of `x-api-key`.
+    pub fn auth_token(value: impl Into<String>) -> Self {
+        Self::AuthToken(value.into())
+    }
+}
 
 impl<S> From<S> for AnthropicKey
 where
     S: Into<String>,
 {
     fn from(value: S) -> Self {
-        Self(value.into())
+        Self::ApiKey(value.into())
     }
 }
 
 impl ApiKey for AnthropicKey {
     fn into_header(self) -> Option<http_client::Result<(http::HeaderName, HeaderValue)>> {
-        Some(
-            HeaderValue::from_str(&self.0)
+        Some(match self {
+            Self::ApiKey(key) => HeaderValue::from_str(&key)
                 .map(|val| (HeaderName::from_static("x-api-key"), val))
                 .map_err(Into::into),
-        )
+            Self::AuthToken(token) => http_client::make_auth_header(token),
+        })
     }
 }
 
