@@ -26,11 +26,73 @@ on:
         type: string
         required: true
 
+# A new push to a pull request cancels that pull request's previous run.
+# Everything else gets a group of its own (`run_id`): GitHub replaces a
+# pending run in a shared group even without `cancel-in-progress`, and pushes
+# to main save the caches pull requests restore, so none may be dropped.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Docs-only pull requests skip the build and perf jobs. Job-level `if:`,
+  # not `paths-ignore`: a job skipped by `if:` reports "skipped", which
+  # satisfies a required check, while a workflow skipped by a path filter
+  # never reports and would leave a required check pending forever.
+  #
+  # The classifier and the policy it reads come from the merge commit's
+  # first parent (the base branch), so a pull request cannot reclassify
+  # itself. Anything other than a docs-only pull request is `code=true`.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Classify
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" != pull_request ]]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The pull_request checkout is the merge commit: parent 1 is the
+          # base branch, so HEAD^1..HEAD is exactly what would land.
+          if ! git rev-parse --verify --quiet HEAD^2 >/dev/null \
+            || ! git show HEAD^1:.github/scripts/changes.py > "$RUNNER_TEMP/changes.py" 2>/dev/null \
+            || ! git show HEAD^1:.sjujperpowers/risk.toml > "$RUNNER_TEMP/risk.toml" 2>/dev/null; then
+            echo "No merge commit or no classifier on the base branch; running everything."
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only --no-renames HEAD^1 HEAD > "$RUNNER_TEMP/changed.txt"
+          result=$(python3 "$RUNNER_TEMP/changes.py" "$RUNNER_TEMP/risk.toml" < "$RUNNER_TEMP/changed.txt")
+          echo "$result" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Changes"
+            echo ""
+            echo "$result ($(wc -l < "$RUNNER_TEMP/changed.txt") changed paths)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   rust:
     name: Rust workspace
-    # A dispatch would test the dispatched branch, not `head_sha`.
-    if: github.event_name != 'workflow_dispatch'
+    needs: changes
+    # A dispatch would test the dispatched branch, not `head_sha`. Runs
+    # unless the classifier said docs-only: if `changes` fails, its output
+    # is empty and this still runs.
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     # Normally 3-4 minutes; a hung test should fail fast, not run for hours.
     timeout-minutes: 15
@@ -85,6 +147,9 @@ jobs:
   # Pull requests and pushes stay on `ubuntu-latest`.
   perf-deterministic:
     name: Perf (deterministic)
+    needs: changes
+    # Dispatch and pushes always classify as code; see `changes`.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.perf_runner || 'ubuntu-latest' }}
     # Normally 5-10 minutes with the build cache, about 20 without it.
     timeout-minutes: 35
@@ -217,7 +282,8 @@ jobs:
   # cache that job already saves.
   perf-latency:
     name: Perf (latency)
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     # One release build of the controller plus two rounds of four in-process
     # rows. With a warm cache this is minutes; a cold cache rebuilds both
