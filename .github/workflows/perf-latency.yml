@@ -1,0 +1,185 @@
+name: Perf (latency)
+
+# Wall-clock tracking for the headless TUI rows, advisory only. Shared
+# runners are too noisy to gate merges on latency: in the 30 days to
+# 2026-10-19 the old gate failed five times, all false alarms, including
+# +10.5% and +22.2% "regressions" on pull requests that changed only
+# AGENTS.md. A regressed or inconclusive latency verdict is a warning; a
+# broken harness (build failure, errored row, missing document) still fails.
+# Count rows are `Perf (deterministic)`'s, in CI.
+#
+# Its own workflow, not a job in ci.yml: adding a label must not start a
+# second CI run, which would cancel the push run in ci.yml's per-PR
+# concurrency group.
+#
+# Runs on pull requests labeled `perf:latency` (on the push that carries the
+# label, or when it is added) and on `workflow_dispatch`. Evidence for the
+# gated rows and the manual-row policy:
+# docs/project/records/2026-10-15-ci-tui-latency-gate.md.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: Full commit SHA to measure (must be on main)
+        type: string
+        required: true
+      base_sha:
+        description: Full commit SHA to compare against (must be on main)
+        type: string
+        required: true
+
+# One measuring run per pull request: a newer measuring run (push with the
+# label on, or the label added) replaces the older one. Runs the job `if:`
+# below will skip (another label added, a push without the label) get a
+# group of their own, so they cannot cancel a measurement in progress.
+# Dispatches never share a group. Keep this condition in step with the job's.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request'
+        && contains(github.event.pull_request.labels.*.name, 'perf:latency')
+        && (github.event.action != 'labeled' || github.event.label.name == 'perf:latency')
+        && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number)
+        || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  perf-latency:
+    name: Perf (latency)
+    # Adding any other label must not start a measurement.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (contains(github.event.pull_request.labels.*.name, 'perf:latency')
+          && (github.event.action != 'labeled' || github.event.label.name == 'perf:latency'))
+    runs-on: ubuntu-latest
+    # One release build of the controller plus two rounds of four in-process
+    # rows. With a warm cache this is minutes; a cold cache rebuilds both
+    # sides. Bounded so a hung sampler fails the job instead of the workflow.
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+      HEAD_SHA: ${{ inputs.head_sha }}
+      BASE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.pull_request.base.sha }}
+    steps:
+      # Same dispatch rules as Perf (deterministic): full SHAs, both already
+      # on main, checked before anything is built.
+      - name: Check dispatch inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          for sha in "$HEAD_SHA" "$BASE_SHA"; do
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::head_sha and base_sha must be full 40-character commit SHAs, got '$sha'"
+              exit 1
+            fi
+          done
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || '' }}
+
+      - name: Confirm dispatched commits are on main
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
+            echo "::error::checked out $(git rev-parse HEAD), expected head_sha $HEAD_SHA"
+            exit 1
+          fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          for sha in "$HEAD_SHA" "$BASE_SHA"; do
+            if ! git merge-base --is-ancestor "$sha" refs/remotes/origin/main 2>/dev/null; then
+              echo "::error::$sha is not on main; dispatch only measures commits already merged to main"
+              exit 1
+            fi
+          done
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      # Without a base there is nothing to compare; that is a harness
+      # failure here, not a skip: this job only runs when asked for.
+      - name: Materialize base
+        run: |
+          if [ -z "$BASE_SHA" ] || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "::error::base $BASE_SHA is not a commit in this repository"
+            exit 1
+          fi
+          git worktree add .perf/base "$BASE_SHA"
+
+      # After the worktree exists: restoring .perf/base/target first would
+      # make `git worktree add` refuse a non-empty directory. Restores the
+      # `perf` cache Perf (deterministic) saves on main.
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: perf
+          save-if: false
+          workspaces: |
+            . -> target
+            .perf/base -> target
+
+      # Build the controller into the same target directory `perf ab` uses for
+      # the current side (`target/release-root`), so Compare reuses this build
+      # instead of compiling the current revision a second time.
+      - name: Build yach-bench
+        run: cargo build --release --locked -p yach-bench
+        env:
+          CARGO_TARGET_DIR: target/release-root
+
+      # `--rounds` > 1 so the first round is not the only evidence. `perf ab`
+      # takes one `--filter` glob, and glob 0.3 does not expand braces, so
+      # each row is its own exact-id comparison. Exit statuses are recorded,
+      # not acted on: `perf ab` exits 1 for both `regressed` and `error`, so
+      # Judge reads the verdicts from each document instead.
+      - name: Compare
+        id: compare
+        run: |
+          rows=(
+            viewport/huge_transcript_scroll_headless/10000
+            keypress/active_stream_on_history_headless/100
+            replay/heavy_tool_output_tail_headless/102400
+            startup/backend_ready_to_first_interactive_headless
+          )
+          results=()
+          for row in "${rows[@]}"; do
+            slug="${row//\//_}"
+            rc=0
+            ./target/release-root/release/yach-bench perf ab \
+              --base-dir .perf/base \
+              --filter "$row" \
+              --rounds 2 \
+              --build-cmd cargo \
+              --out "ab-${slug}.json" || rc=$?
+            echo "$row exit=$rc"
+            results+=("$row=$rc")
+          done
+          echo "results=${results[*]}" >> "$GITHUB_OUTPUT"
+
+      # Latency regressed/inconclusive -> warning; errored row, missing or
+      # unreadable document, or an unexplained exit status -> failure. Count
+      # rows are ignored. See .github/scripts/latency_verdicts.py.
+      - name: Judge
+        env:
+          RESULTS: ${{ steps.compare.outputs.results }}
+        run: |
+          read -ra results <<< "$RESULTS"
+          python3 .github/scripts/latency_verdicts.py "${results[@]}"
+
+      - name: Upload comparison documents
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-latency-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ab-*.json
+          if-no-files-found: ignore
