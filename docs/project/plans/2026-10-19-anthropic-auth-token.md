@@ -516,9 +516,10 @@ secretspec run --provider omp-subscriptions --scope anthropic-gateway \
 
 then one `yach run` turn in a scratch project with
 `YACH_RIG_PROVIDER=anthropic`, the same base URL and model, and a prompt
-that lists and reads a file. Record commands, outcomes, and session
-summary in the record; state that the `/connect` path was covered by tests,
-not a live run.
+that lists and reads a file, then the `/connect` flow driven over
+`yach rpc` (add an auth-token Anthropic connection with the gateway base URL,
+activate a discovered model, complete one prompt). Record commands and
+outcomes in the record.
 
 - [ ] **Step 4: Commit**
 

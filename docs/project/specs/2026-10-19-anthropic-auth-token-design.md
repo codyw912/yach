@@ -220,7 +220,7 @@ Permanent tests, in the crates that own the behavior:
 
 `secretspec.toml` gains `YACH_RIG_ANTHROPIC_AUTH_TOKEN` in a new scope,
 `anthropic-gateway`, next to the existing OpenAI-compatible `gateway` scope.
-Two runs through `omp-subscriptions`, recorded in
+Three runs through `omp-subscriptions`, recorded in
 `docs/project/records/`:
 
 1. `yach smoke-rig-anthropic` with `YACH_RIG_ANTHROPIC_AUTH_TOKEN` and
@@ -228,10 +228,9 @@ Two runs through `omp-subscriptions`, recorded in
 2. One completed `yach run` turn that calls a tool, following
    `docs/project/records/2026-09-30-session-diagnostics-gateway-smoke.md`,
    with the same Anthropic settings.
-
-Creating a stored gateway Anthropic connection goes through the TUI dialog,
-which the live runs do not drive. The flow test above covers it; the record
-states that no live stored-connection run was made.
+3. The `/connect` dialog driven over `yach rpc`: add an Anthropic connection
+   with an auth token and the gateway base URL, activate one of its
+   discovered models, and complete one prompt.
 
 ## Documentation
 
