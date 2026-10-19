@@ -118,8 +118,11 @@ jobs:
           git worktree add .perf/base "$BASE_SHA"
 
       # After the worktree exists: restoring .perf/base/target first would
-      # make `git worktree add` refuse a non-empty directory. Restores the
-      # `perf` cache Perf (deterministic) saves on main.
+      # make `git worktree add` refuse a non-empty directory. rust-cache puts
+      # the job id in its key (`v0-rust-perf-perf-latency-…`), and nothing
+      # saves that key, so this restores nothing and the job builds cold.
+      # Perf (deterministic)'s `…-perf-deterministic-…` entry is saved by
+      # main's pushes on Ubicloud, which this GitHub-hosted job cannot read.
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2.9.2
         with:

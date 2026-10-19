@@ -139,19 +139,36 @@ jobs:
   # pushes to main also run the comparison (against the previous main commit)
   # and save the cache that pull requests start from.
   #
+  # Pushes and same-repository pull requests run on `ubicloud-standard-8`:
+  # about 3 minutes against 7 on `ubuntu-latest` with Ubicloud premium on,
+  # 4 against 6 without
+  # (docs/project/records/2026-10-19-perf-runner-comparison.md). Fork pull
+  # requests stay on `ubuntu-latest`. That is routing, not a security
+  # boundary: a fork pull request runs its own copy of this file and can ask
+  # for any runner label. The boundary is the repository setting "Require
+  # approval for all external contributors": a maintainer reads a fork's
+  # workflow changes before any of it runs. The
+  # two providers keep separate caches and only main's pushes save one, on
+  # Ubicloud, so once GitHub's last `perf` entry expires (7 days unused) a
+  # fork pull request builds cold (about 20 minutes).
+  #
   # `workflow_dispatch` measures `head_sha` against `base_sha` on
   # `perf_runner`, to compare runners on one fixed pair. Both SHAs must be
   # ancestors of `main`: checkout accepts any commit the repository can
   # reach, including fork pull-request heads under `refs/pull/*`, so dispatch
   # permission alone would not keep a fork's build scripts off a paid runner.
-  # Pull requests and pushes stay on `ubuntu-latest`.
   perf-deterministic:
     name: Perf (deterministic)
     needs: changes
     # Dispatch and pushes always classify as code; see `changes`.
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.perf_runner || 'ubuntu-latest' }}
-    # Normally 5-10 minutes with the build cache, about 20 without it.
+    runs-on: >-
+      ${{ github.event_name == 'workflow_dispatch' && inputs.perf_runner
+          || github.event_name == 'pull_request'
+             && github.event.pull_request.head.repo.full_name != github.repository
+             && 'ubuntu-latest'
+          || 'ubicloud-standard-8' }}
+    # Normally 3-5 minutes with the build cache; about 20 without it.
     timeout-minutes: 35
     env:
       CARGO_TERM_COLOR: always

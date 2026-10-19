@@ -39,8 +39,9 @@ needed.
 - Job time: job `started_at` → `completed_at`.
 - CPU and core count: taken from each `ab.json` (`current[0].host`).
 
-Ubicloud premium runners were off for every run (operator setting), so the
-`ubicloud-*` labels ran on standard runners.
+Ubicloud premium runners were off for the runs above (operator setting), so
+the `ubicloud-*` labels ran on standard runners. A second set with premium on
+follows under "Premium round".
 
 ## Warm-up (not counted)
 
@@ -131,5 +132,92 @@ Prices:
   `main` save the `perf` cache that pull requests read. If they move to a
   Ubicloud label, that cache is the Ubicloud one (`b3412203`). Fork pull
   requests stay on `ubuntu-latest` and read GitHub's cache (`ea977744`),
-  which only a GitHub-hosted run on `main` refreshes. The follow-up change
-  has to keep one of those runs, or forks build cold.
+  which only a GitHub-hosted run on `main` refreshes.
+
+## Premium round
+
+Same pair, same counting rules, with Ubicloud premium runners switched on
+(operator setting, 2026-10-19). Premium is an account setting, not a label:
+the same `ubicloud-standard-4/8` labels go to the premium fleet, AMD Ryzen 9
+7950X3D, and fall back to standard runners when it is busy
+([Use Premium Runners](https://www.ubicloud.com/docs/github-actions-integration/use-premium-runners)).
+A Ubicloud run counted as premium only if its `ab.json` named the Ryzen CPU;
+every standard run above was on an EPYC. All Ubicloud runs here were on the
+Ryzen, so none fell back and no replacement runs were needed.
+
+The rounds were not serialized this time: rounds 1 and 2 were dispatched 30 s
+apart, and round 3 started while round 2's `ubuntu-latest` run was still
+going. Each job had its own VM. The two slowest Ubicloud runs (437 s and
+296 s) came from the overlapping rounds 1 and 2.
+
+Warm-up (not counted):
+[39270982140](https://github.com/codyw912/yach/actions/runs/39270982140),
+ubicloud-standard-4, Ryzen 9 7950X3D, 21 s queue, 297 s job, exact cache hit.
+Premium runners restored the same Ubicloud entry (`b3412203`) the standard
+runs had saved.
+
+| round | run | runner | CPU (cores) | queue | job | artifact |
+|---|---|---|---|---:|---:|---|
+| 1 | [39272426229](https://github.com/codyw912/yach/actions/runs/39272426229) | ubuntu-latest | EPYC 7763 (4) | 3 s | 416 s | `perf-ab-ubuntu-latest-39272426229-1` |
+| 1 | [39272431356](https://github.com/codyw912/yach/actions/runs/39272431356) | ubicloud-standard-4 | Ryzen 9 7950X3D (4) | 24 s | 437 s | `perf-ab-ubicloud-standard-4-39272431356-1` |
+| 1 | [39272437878](https://github.com/codyw912/yach/actions/runs/39272437878) | ubicloud-standard-8 | Ryzen 9 7950X3D (8) | 20 s | 183 s | `perf-ab-ubicloud-standard-8-39272437878-1` |
+| 2 | [39272500036](https://github.com/codyw912/yach/actions/runs/39272500036) | ubuntu-latest | EPYC 7763 (4) | 3 s | 427 s | `perf-ab-ubuntu-latest-39272500036-1` |
+| 2 | [39272507496](https://github.com/codyw912/yach/actions/runs/39272507496) | ubicloud-standard-4 | Ryzen 9 7950X3D (4) | 19 s | 241 s | `perf-ab-ubicloud-standard-4-39272507496-1` |
+| 2 | [39272516014](https://github.com/codyw912/yach/actions/runs/39272516014) | ubicloud-standard-8 | Ryzen 9 7950X3D (8) | 25 s | 296 s | `perf-ab-ubicloud-standard-8-39272516014-1` |
+| 3 | [39273262627](https://github.com/codyw912/yach/actions/runs/39273262627) | ubuntu-latest | EPYC 7763 (4) | 3 s | 439 s | `perf-ab-ubuntu-latest-39273262627-1` |
+| 3 | [39273267033](https://github.com/codyw912/yach/actions/runs/39273267033) | ubicloud-standard-4 | Ryzen 9 7950X3D (4) | 23 s | 349 s | `perf-ab-ubicloud-standard-4-39273267033-1` |
+| 3 | [39273270981](https://github.com/codyw912/yach/actions/runs/39273270981) | ubicloud-standard-8 | Ryzen 9 7950X3D (8) | 17 s | 182 s | `perf-ab-ubicloud-standard-8-39273270981-1` |
+
+Every counted run had an exact cache hit, an `ab.json` for base `3e86b137`
+and head `2f35f5ac`, a successful `Instruction counts` step, and instruction
+counts of +0.00% on all four rows. All ten documents (nine counted, one
+warm-up) have the same 29 `unchanged` verdicts as the standard runs.
+
+| runner | job, median (range) | queue, median (range) | price/min | cost per run at median |
+|---|---|---|---:|---:|
+| ubuntu-latest | 427 s (416–439 s) | 3 s (3 s) | $0 | $0 |
+| ubicloud-standard-4, premium | 349 s (241–437 s) | 23 s (19–24 s) | $0.004 | $0.024 (6 billed min) |
+| ubicloud-standard-8, premium | 183 s (182–296 s) | 20 s (17–25 s) | $0.008 | $0.032 (4 billed min) |
+
+Premium x64 rates are from
+[Ubicloud pricing](https://www.ubicloud.com/docs/about/pricing); billed
+minutes are rounded up as above ([INFERENCE]). Exact-time costs are $0.0233
+and $0.0244.
+
+- `ubicloud-standard-8` premium was fastest in every round, at a median of
+  183 s: 72 s below standard-8 (255 s) and 244 s below this set's
+  `ubuntu-latest` median.
+- `ubicloud-standard-4` premium had the widest spread (196 s) and cost about
+  as much per run as standard-8 premium.
+- `ubuntu-latest` landed on EPYC 7763 all three times here, and its median
+  (427 s) matches the 7763 runs in the first set (420 s and 424 s).
+
+## Decision (owner, 2026-10-19)
+
+`Perf (deterministic)` runs on `ubicloud-standard-8` for pushes to `main` and
+same-repository pull requests, with premium on. Fork pull requests stay on
+`ubuntu-latest`.
+
+Volume: from 2026-09-19 to 2026-10-19, `ci.yml` ran 126 times on
+`pull_request` (81) and `push` (45) events, besides 21 dispatches. At
+$0.032 per run, perf on every one of those runs is about $4 a month before
+Ubicloud's $2.50 credit. This is an upper bound: docs-only pull requests
+skip the job.
+
+Forks (owner, 2026-10-19): no GitHub-hosted run on `main` saves GitHub's
+`perf` cache any more, so once its last entry goes 7 days unused and
+expires, a fork pull request's perf job builds cold (about 20 minutes).
+Keeping it warm would take a second, GitHub-hosted perf run of about 7
+minutes on every push to `main`. Few fork pull requests are expected, so the
+cold build is accepted.
+
+Fork pull requests and the paid runner: the `ubuntu-latest` routing for forks
+is not a security boundary. A `pull_request` run uses the workflow file from
+the pull request's merge commit, so a fork can edit `ci.yml` and name
+`ubicloud-standard-8` itself
+([GitHub: securely using `pull_request_target`](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)).
+What keeps outside code off the paid runner is the repository's fork-run
+approval policy, "Require approval for all external contributors"
+(`all_external_contributors`): a maintainer reviews a fork's workflow changes
+before any run. The owner changed it from `first_time_contributors`, which
+let a contributor's later pull requests run unapproved, on 2026-10-19.
