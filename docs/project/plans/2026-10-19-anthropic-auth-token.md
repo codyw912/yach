@@ -165,6 +165,9 @@ async fn anthropic_auth_token_sends_only_bearer_and_accepts_null_has_more() {
 }
 ```
 
+A third test, `anthropic_discovery_ends_when_has_more_is_omitted`, serves the
+same row with no `has_more` field and asserts discovery returns it. The spec
+requires both gateway shapes, `null` and absent.
 The existing API-key fixture test also asserts no `authorization` line.
 In `rig_adapter.rs`, add a twin of
 `legacy_anthropic_request_without_native_envelope_uses_messages_wire_shape`
@@ -273,13 +276,16 @@ fn anthropic_credential_selects_header_from_exactly_one_variable() {
 }
 ```
 
-`provider_setup_error_copy_is_actionable` and
-`unconfigured_launch_setup_error_requires_both_missing_env_and_no_stored_connections`
-switch to `MissingOneOf` and the new copy.
+`provider_setup_error_copy_is_actionable` switches to `MissingOneOf` and the
+new copy. The launch test becomes
+`unconfigured_launch_setup_error_hides_only_missing_env_behind_stored_connections`:
+with stored connections present, `Missing` and `MissingOneOf` are hidden,
+while `Conflicting`, `Empty`, `InvalidNumber` and `InvalidValue` are still
+reported.
 
 - [ ] **Step 2: Run to see them fail**
 
-Run: `just dev cargo test -p yach-cli anthropic_credential`
+Run: `just dev cargo test -p yach anthropic_credential`
 Expected: compile failure.
 
 - [ ] **Step 3: Implement**
@@ -316,10 +322,15 @@ Messages: `Conflicting(a, b)` → `env vars {a} and {b} are both set; set
 only one`; `MissingOneOf(a, b)` → `missing required env var {a} or {b}`.
 The three Anthropic env sites use `anthropic_credential_from_env()`;
 `run_rig_anthropic_smoke` also reads `YACH_RIG_ANTHROPIC_BASE_URL`.
+`RigSmokeConfigError::is_missing()` (`Missing | MissingOneOf`) is the only
+error that may defer to stored `/connect` connections. Both the interactive
+launch (`unconfigured_launch_setup_error`) and `yach run` without `--model`
+(`run_headless_cli_command`) use it, so conflicting or invalid env config
+is reported instead of being silently replaced by a stored default.
 
 - [ ] **Step 4: Run the tests**
 
-Run: `just dev cargo test -p yach-cli anthropic_credential provider_setup unconfigured_launch`
+Run: `just dev cargo test -p yach -- anthropic_credential provider_setup unconfigured_launch`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -364,10 +375,16 @@ fn anthropic_connections_accept_auth_token_and_base_url() {
         connection.authentication,
         ConnectionAuth::AuthToken { source: CredentialSource::System }
     );
-    let json = serde_json::to_value(&connection.authentication);
-    let Ok(json) = json else { return };
-    assert_eq!(json, serde_json::json!({"kind": "auth_token", "source": "system"}));
     let ready = ProviderConnection { state: ConnectionState::Ready, ..connection };
+    let json = serde_json::to_value(&ready);
+    let Ok(json) = json else { return };
+    assert_eq!(
+        json.get("authentication"),
+        Some(&serde_json::json!({"kind": "auth_token", "source": "system"}))
+    );
+    // Read it back: a kind that writes but cannot load would strand the entry.
+    let reloaded = serde_json::from_value::<ProviderConnection>(json).ok();
+    assert_eq!(reloaded.as_ref(), Some(&ready));
     assert!(ready.validate_persisted().is_ok());
 }
 
@@ -406,7 +423,7 @@ Expected: compile failure.
 
 - [ ] **Step 4: Run the tests**
 
-Run: `just dev cargo test -p yach-connections && just dev cargo test -p yach-cli provider_connections`
+Run: `just dev cargo test -p yach-connections && just dev cargo test -p yach provider_connections`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -445,6 +462,14 @@ fn anthropic_flow_chooses_auth_token_and_optional_base_url() {
 fn anthropic_flow_blank_base_url_keeps_api_key_defaults() {
     // ... select "api_key", submit "" → secret dialog prompt "Enter the API key".
 }
+
+#[test]
+fn repair_and_replace_prompts_name_the_connections_credential_kind() {
+    // A stored Anthropic `AuthToken` connection: "repair" (PendingCredential)
+    // and "replace" (Ready) both prompt "Enter the replacement auth token";
+    // an API-key connection's "replace" still prompts
+    // "Enter the replacement API key".
+}
 ```
 
 Both use the module's `begin_root` and `only_dialog` helpers, as
@@ -452,7 +477,7 @@ Both use the module's `begin_root` and `only_dialog` helpers, as
 
 - [ ] **Step 2: Run to see them fail**
 
-Run: `just dev cargo test -p yach-backend provider_connection_flow anthropic_flow`
+Run: `just dev cargo test -p yach-backend -- provider_connection_flow anthropic_flow`
 Expected: FAIL (label goes straight to the secret dialog).
 
 - [ ] **Step 3: Implement**
@@ -466,6 +491,12 @@ Expected: FAIL (label goes straight to the secret dialog).
   `"Optional; leave empty for the Anthropic API"` for Anthropic, unchanged
   otherwise. Create-secret prompt: `"Enter the auth token"` when the draft
   is `AuthToken`.
+- `EnteringRepairSecret` and `EnteringReplaceSecret` (and their retry
+  states, including a create that failed after the entry was persisted)
+  carry the connection's `CredentialKind`, taken from
+  `connection.authentication.credential_kind()` when the action is chosen.
+  Their prompts read "Enter the replacement auth token" or "Enter the
+  replacement API key" accordingly.
 
 - [ ] **Step 4: Run the tests**
 
@@ -521,7 +552,23 @@ that lists and reads a file, then the `/connect` flow driven over
 activate a discovered model, complete one prompt). Record commands and
 outcomes in the record.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: TUI before/after**
+
+Task 5 changes what `/connect` shows, so the PR needs before/after grids
+(`AGENTS.md`, "Version Control workflow"). `just tui-themes` renders only
+the transcript and the composer, so it cannot show this dialog. Instead,
+build the `yach` binary on `main` and on the change. For each, run
+`yach tui --backend fixture` in tmux with a scratch `HOME` (100 columns,
+`YACH_THEME=dark` and `light`) and walk `/connect` → Add connection →
+Anthropic → label. Capture each new step with `tmux capture-pane -e -p`:
+authentication choice, base URL, and the auth-token secret prompt. On
+`main`, the step after the label is the API key prompt.
+Render the captures with `tests/visual/ansi2html.mjs` and Chromium, using
+the flags and a monospace font as in `tests/visual/theme-grid.sh`. Host the
+PNGs on the `pr-screenshots` branch under `pr-<N>/before|after/`, and embed
+them in the PR description linked by commit ID.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 jj commit README.md secretspec.toml docs/project/records/2026-10-19-anthropic-auth-token-gateway-smoke.md -m "Document the Anthropic auth token and record the gateway smoke"
