@@ -37,54 +37,6 @@ This repo uses Jujutsu (`jj`) for local development.
 - Use `jj op log` and `jj undo` for recovery.
 - Avoid mutating Git commands unless explicitly instructed.
 
-### Codex review
-Codex reviews a PR automatically when it is opened and posts as
-`chatgpt-codex-connector[bot]`. It keeps one summary comment per PR whose
-hidden `codex-review-state:v1` line records the commit it reviewed and whether
-that review has finished. Do not write `@codex` in PR descriptions or titles:
-any mention other than an exact `@codex review` comment starts a Codex cloud
-task, which fails in this repo. Never edit, delete, or resolve Codex's comments.
-
-These helpers print Codex's review state for the PR's current head (nothing if
-it has not reviewed that commit) and its findings on that commit:
-```sh
-codex_state() {
-  gh api --paginate repos/codyw912/yach/issues/<n>/comments \
-    --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]") | .body
-          | capture("codex-review-state:v1 (?<s>\\{.*\\}) -->").s | fromjson | .code_review' \
-    | jq -c --arg h "$(gh pr view <n> --json headRefOid -q .headRefOid)" 'select(.commit_sha == $h)'
-}
-codex_findings() {
-  gh api --paginate repos/codyw912/yach/pulls/<n>/comments \
-    | jq -s --arg h "$(gh pr view <n> --json headRefOid -q .headRefOid)" \
-      '[.[][] | select(.user.login == "chatgpt-codex-connector[bot]" and .original_commit_id == $h)
-        | {url: .html_url, title: (.body | split("\n")[0])}]'
-}
-```
-
-1. After opening a PR, do not request a review. Wait up to 5 minutes for the
-   automatic one to start:
-   `for i in $(seq 5); do codex_state | grep -q . && break; sleep 60; done`
-   If `codex_state` still prints nothing, request a review (step 2) and say
-   in your reply that the automatic review did not start.
-2. After any later push, request a review with the REST API
-   (`gh pr comment` is blocked by the proxy):
-   `gh api repos/codyw912/yach/issues/<n>/comments -f body='@codex review'`
-3. Wait for the review of the current head to finish. Run the wait as a
-   background job if your harness wakes you when one finishes; otherwise run
-   it in the foreground:
-   `for i in $(seq 30); do codex_state | jq -e 'select(.status == "completed")' && break; sleep 60; done`
-   If it prints nothing, it gave up after 30 minutes; say so in your reply
-   instead of reporting the PR ready.
-4. If the state shows `"has_any_findings": false`, the review is clean.
-   Otherwise run `codex_findings`. Each title carries a P0, P1, or P2 badge.
-   Fix each P0/P1 finding or explain why it is wrong; P2 and lower are
-   optional. Replies inside review threads are not available yet: answer in
-   one conversation comment that lists each finding and what you did. If you
-   pushed fixes, go back to step 2.
-5. Report the PR ready only when the latest Codex review of the current head
-   has no P0/P1 findings. Give the review's URL in your reply.
-
 ## Stacked PRs
 
 PRs are squash-merged. Open dependent PRs as a GitHub stack so they land
@@ -94,20 +46,17 @@ without manual retargeting:
   it, push, then run `gh stack link <bottom> ... <top>` with PR numbers or
   branch names, bottom first. To grow a stack, run it again with the full list.
   `gh stack` is a separate extension (`github/gh-stack`), not part of `gh`.
-- The maintainer merges. Merging a PR in a stack also merges every PR below
-  it, as one squash commit each.
 - GitHub deletes merged branches (`delete_branch_on_merge`). After a merge,
   `jj git fetch` drops their bookmarks and abandons the commits nothing else
   points to; a local bookmark still on them keeps them. Rebase any remaining
-  local work onto `main@origin`, and confirm each merged PR's squash commit is
-  an ancestor of `main@origin`.
+  local work onto `main@origin`.
 - If only the lower part of a stack merged, GitHub rebases the remaining PR
   branches itself. Fetch before touching them and build on the fetched
   bookmarks; do not push local copies over GitHub's rebase. This path has not
   been exercised in this repo yet.
 - `jj-stack` is an alternative for stacks of single changes that are revised
-  often: one change per PR, on generated `jj-stack/` branch names. Use
-  `submit` and `sync` only; `jj-stack merge` merges, which agents do not do.
+  often: one change per PR, on generated `jj-stack/` branch names, published
+  with `submit` and `sync`.
 
 ## Code Review Rules
 
