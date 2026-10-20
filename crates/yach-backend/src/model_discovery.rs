@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use rig::client::{ModelLister, ModelListingClient};
 
-use crate::{ProviderError, ProviderErrorKind, rig_adapter::RigProviderConfig};
+use crate::{
+    ProviderError, ProviderErrorKind,
+    rig_adapter::{RigProviderConfig, anthropic_client},
+};
 
 const DISCOVERY_FAILURE_MESSAGE: &str = "provider model discovery failed";
 const MAX_DISCOVERED_MODELS: usize = 2_048;
@@ -30,13 +33,12 @@ pub async fn discover_provider_models(
     catalog_client_version: Option<&str>,
 ) -> Result<Vec<DiscoveredProviderModel>, ModelDiscoveryError> {
     match provider {
-        RigProviderConfig::Anthropic { api_key, base_url } => {
-            let mut builder = api_key
-                .with_exposed(|key| rig::providers::anthropic::Client::builder().api_key(key));
-            if let Some(base_url) = base_url.as_deref() {
-                builder = builder.base_url(base_url);
-            }
-            let client = builder.build().map_err(|_| {
+        RigProviderConfig::Anthropic {
+            api_key,
+            auth,
+            base_url,
+        } => {
+            let client = anthropic_client(api_key, *auth, base_url.as_deref()).map_err(|_| {
                 ModelDiscoveryError::Provider(redacted_discovery_error(
                     ProviderErrorKind::ProviderInternal,
                     "model_client_build",
@@ -224,15 +226,18 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn anthropic_local_models_fixture_sends_required_headers_and_redacts_body() {
-        let fixture = local_anthropic_models_fixture();
+    async fn anthropic_api_key_discovery_sends_only_x_api_key_and_redacts_body() {
+        let fixture = local_anthropic_models_fixture(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 31\r\nConnection: close\r\n\r\nfixture-anthropic-body-sentinel",
+        );
         assert!(fixture.is_some(), "fixture listener should initialize");
-        let Some((base_url, received_expected_request)) = fixture else {
+        let Some((base_url, received_request)) = fixture else {
             return;
         };
         let result = discover_provider_models(
             &RigProviderConfig::Anthropic {
                 api_key: ProviderSecret::new(String::from("fixture-anthropic-sentinel")),
+                auth: AnthropicAuth::ApiKey,
                 base_url: Some(base_url),
             },
             Duration::from_secs(1),
@@ -241,15 +246,102 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        let received = received_expected_request.recv();
-        assert!(received.is_ok(), "fixture received request");
-        let Ok(received) = received else {
+        let request = received_request.recv();
+        assert!(request.is_ok(), "fixture received request");
+        let Ok(request) = request else {
             return;
         };
-        assert!(received);
+        assert_eq!(request.lines().next(), Some("GET /v1/models HTTP/1.1"));
+        assert!(
+            request
+                .lines()
+                .any(|line| line.starts_with("anthropic-version:"))
+        );
+        assert!(
+            request
+                .lines()
+                .any(|line| line == "x-api-key: fixture-anthropic-sentinel")
+        );
+        assert!(
+            !request
+                .lines()
+                .any(|line| line.starts_with("authorization:"))
+        );
         assert!(!format!("{result:?}").contains("fixture-anthropic-body-sentinel"));
     }
-    use crate::{ProviderErrorKind, rig_adapter::RigProviderConfig};
+
+    #[tokio::test]
+    async fn anthropic_auth_token_discovery_sends_only_bearer_and_ends_on_null_has_more() {
+        let fixture = local_anthropic_models_fixture(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 82\r\nConnection: close\r\n\r\n{\"data\":[{\"id\":\"anthropic/m\",\"display_name\":\"M\"}],\"has_more\":null,\"object\":\"list\"}",
+        );
+        assert!(fixture.is_some(), "fixture listener should initialize");
+        let Some((base_url, received_request)) = fixture else {
+            return;
+        };
+        let result = discover_provider_models(
+            &RigProviderConfig::Anthropic {
+                api_key: ProviderSecret::new(String::from("fixture-anthropic-sentinel")),
+                auth: AnthropicAuth::AuthToken,
+                base_url: Some(base_url),
+            },
+            Duration::from_secs(1),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Ok(vec![DiscoveredProviderModel {
+                id: String::from("anthropic/m"),
+                display_name: Some(String::from("M")),
+            }])
+        );
+        let request = received_request.recv();
+        assert!(request.is_ok(), "fixture received request");
+        let Ok(request) = request else {
+            return;
+        };
+        assert!(
+            request
+                .lines()
+                .any(|line| line == "authorization: Bearer fixture-anthropic-sentinel")
+        );
+        assert!(!request.lines().any(|line| line.starts_with("x-api-key:")));
+    }
+
+    #[tokio::test]
+    async fn anthropic_discovery_ends_when_has_more_is_omitted() {
+        let fixture = local_anthropic_models_fixture(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 66\r\nConnection: close\r\n\r\n{\"data\":[{\"id\":\"anthropic/m\",\"display_name\":\"M\"}],\"object\":\"list\"}",
+        );
+        assert!(fixture.is_some(), "fixture listener should initialize");
+        let Some((base_url, _received_request)) = fixture else {
+            return;
+        };
+        let result = discover_provider_models(
+            &RigProviderConfig::Anthropic {
+                api_key: ProviderSecret::new(String::from("fixture-anthropic-sentinel")),
+                auth: AnthropicAuth::AuthToken,
+                base_url: Some(base_url),
+            },
+            Duration::from_secs(1),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Ok(vec![DiscoveredProviderModel {
+                id: String::from("anthropic/m"),
+                display_name: Some(String::from("M")),
+            }])
+        );
+    }
+    use crate::{
+        ProviderErrorKind,
+        rig_adapter::{AnthropicAuth, RigProviderConfig},
+    };
 
     #[test]
     fn normalize_models_deduplicates_sorts_and_keeps_provider_names() {
@@ -435,7 +527,10 @@ mod tests {
         ));
     }
 
-    fn local_anthropic_models_fixture() -> Option<(String, std::sync::mpsc::Receiver<bool>)> {
+    /// Answers one request with `response` and reports the request head.
+    fn local_anthropic_models_fixture(
+        response: &'static [u8],
+    ) -> Option<(String, std::sync::mpsc::Receiver<String>)> {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -450,23 +545,11 @@ mod tests {
             let Ok(count) = stream.read(&mut bytes) else {
                 return;
             };
-            let request = String::from_utf8_lossy(&bytes[..count]);
-            let expected = request
-                .lines()
-                .next()
-                .is_some_and(|line| line == "GET /v1/models HTTP/1.1")
-                && request
-                    .lines()
-                    .any(|line| line == "x-api-key: fixture-anthropic-sentinel")
-                && request
-                    .lines()
-                    .any(|line| line.starts_with("anthropic-version:"));
-            if sender.send(expected).is_err() {
+            let request = String::from_utf8_lossy(&bytes[..count]).into_owned();
+            if sender.send(request).is_err() {
                 return;
             }
-            let _ = stream.write_all(
-                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 29\r\nConnection: close\r\n\r\nfixture-anthropic-body-sentinel",
-            );
+            let _ = stream.write_all(response);
         });
         Some((format!("http://{address}"), receiver))
     }

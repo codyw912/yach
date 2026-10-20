@@ -200,6 +200,13 @@ pub enum ConnectionAuth {
         /// The place where the API key is resolved.
         source: CredentialSource,
     },
+    /// Anthropic token sent as `Authorization: Bearer` instead of
+    /// `x-api-key`, for Messages-format gateways. Held like an API key.
+    #[serde(rename = "auth_token")]
+    AuthToken {
+        /// The place where the token is resolved.
+        source: CredentialSource,
+    },
     /// Transient-only ChatGPT subscription authentication.
     #[serde(rename = "chatgpt_subscription")]
     ChatGptSubscriptionEnvironment {
@@ -214,6 +221,29 @@ pub enum ConnectionAuth {
         /// Nonempty account identity captured at successful login.
         account_id: String,
     },
+}
+
+impl ConnectionAuth {
+    /// The header kind an API-style credential travels in.
+    #[must_use]
+    pub const fn credential_kind(&self) -> CredentialKind {
+        match self {
+            Self::AuthToken { .. } => CredentialKind::AuthToken,
+            Self::ApiKey { .. }
+            | Self::ChatGptSubscriptionEnvironment { .. }
+            | Self::ChatGptSubscriptionManaged { .. } => CredentialKind::ApiKey,
+        }
+    }
+}
+
+/// How a stored secret is presented to the provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CredentialKind {
+    /// The provider's API-key header.
+    #[default]
+    ApiKey,
+    /// `Authorization: Bearer`; Anthropic only.
+    AuthToken,
 }
 
 /// Whether persisted metadata can be used for discovery and activation.
@@ -273,6 +303,9 @@ impl ProviderConnection {
             ConnectionAuth::ApiKey {
                 source: CredentialSource::System,
             } if self.provider.supports_persisted_api_key() => {}
+            ConnectionAuth::AuthToken {
+                source: CredentialSource::System,
+            } if self.provider == ProviderKind::Anthropic => {}
             ConnectionAuth::ChatGptSubscriptionManaged {
                 auth_file,
                 account_id,
@@ -345,6 +378,7 @@ pub struct NewConnectionDraft {
     label: Option<String>,
     key: Option<ConnectionKey>,
     base_url: Option<String>,
+    credential: CredentialKind,
 }
 
 impl NewConnectionDraft {
@@ -362,7 +396,8 @@ impl NewConnectionDraft {
             ProviderKind::OpenAiCompatible => Some(normalize_base_url(
                 &base_url.ok_or(ValidationError::MissingBaseUrl)?,
             )?),
-            ProviderKind::Anthropic | ProviderKind::OpenAi => {
+            ProviderKind::Anthropic => base_url.as_deref().map(normalize_base_url).transpose()?,
+            ProviderKind::OpenAi => {
                 if base_url.is_some() {
                     return Err(ValidationError::BaseUrlNotAllowed);
                 }
@@ -375,7 +410,23 @@ impl NewConnectionDraft {
             label,
             base_url,
             key: None,
+            credential: CredentialKind::ApiKey,
         })
+    }
+
+    /// Selects how the secret is sent. Only Anthropic accepts an auth token.
+    pub fn with_credential_kind(mut self, kind: CredentialKind) -> Result<Self, ValidationError> {
+        if kind == CredentialKind::AuthToken && self.provider != ProviderKind::Anthropic {
+            return Err(ValidationError::UnsupportedProvider);
+        }
+        self.credential = kind;
+        Ok(self)
+    }
+
+    /// Returns how the secret will be sent.
+    #[must_use]
+    pub const fn credential_kind(&self) -> CredentialKind {
+        self.credential
     }
 
     /// Returns the selected provider for candidate validation.
@@ -395,7 +446,7 @@ impl NewConnectionDraft {
         self.key.as_ref()
     }
 
-    /// Returns the normalized optional OpenAI-compatible endpoint.
+    /// Returns the normalized optional endpoint (OpenAI-compatible or Anthropic).
     #[must_use]
     pub fn base_url(&self) -> Option<&str> {
         self.base_url.as_deref()
@@ -415,8 +466,13 @@ impl NewConnectionDraft {
             label: self.label,
             key: self.key,
             base_url: self.base_url,
-            authentication: ConnectionAuth::ApiKey {
-                source: CredentialSource::System,
+            authentication: match self.credential {
+                CredentialKind::ApiKey => ConnectionAuth::ApiKey {
+                    source: CredentialSource::System,
+                },
+                CredentialKind::AuthToken => ConnectionAuth::AuthToken {
+                    source: CredentialSource::System,
+                },
             },
             state: ConnectionState::PendingCredential,
         }
@@ -2287,5 +2343,101 @@ mod tests {
                 ValidationError::ConnectionKeyRequired
             ))
         ));
+    }
+
+    #[test]
+    fn anthropic_connections_store_an_auth_token_with_a_normalized_base_url() {
+        let draft = NewConnectionDraft::new(
+            ProviderKind::Anthropic,
+            None,
+            Some(String::from(" http://gateway.example:4000/ ")),
+        )
+        .and_then(|draft| draft.with_credential_kind(CredentialKind::AuthToken));
+        assert!(draft.is_ok());
+        let Ok(draft) = draft else {
+            return;
+        };
+        assert_eq!(draft.base_url(), Some("http://gateway.example:4000"));
+        let connection = ProviderConnection {
+            state: ConnectionState::Ready,
+            ..draft.into_pending(ConnectionId::new_stored())
+        };
+        assert_eq!(
+            connection.authentication,
+            ConnectionAuth::AuthToken {
+                source: CredentialSource::System
+            }
+        );
+        assert_eq!(
+            connection.authentication.credential_kind(),
+            CredentialKind::AuthToken
+        );
+        let persisted = serde_json::to_value(&connection);
+        assert!(persisted.is_ok());
+        let Ok(persisted) = persisted else {
+            return;
+        };
+        assert_eq!(
+            persisted.get("authentication"),
+            Some(&serde_json::json!({"kind": "auth_token", "source": "system"}))
+        );
+        let reloaded = serde_json::from_value::<ProviderConnection>(persisted).ok();
+        assert_eq!(reloaded.as_ref(), Some(&connection));
+        assert_eq!(
+            reloaded.map(|connection| connection.authentication.credential_kind()),
+            Some(CredentialKind::AuthToken)
+        );
+        assert_eq!(connection.validate_persisted(), Ok(()));
+    }
+
+    #[test]
+    fn auth_tokens_and_base_urls_stay_closed_to_openai() {
+        let openai = NewConnectionDraft::new(ProviderKind::OpenAi, None, None);
+        assert!(openai.is_ok());
+        let Ok(openai) = openai else {
+            return;
+        };
+        assert_eq!(
+            openai
+                .clone()
+                .with_credential_kind(CredentialKind::AuthToken),
+            Err(ValidationError::UnsupportedProvider)
+        );
+        assert_eq!(
+            NewConnectionDraft::new(
+                ProviderKind::OpenAi,
+                None,
+                Some(String::from("http://gateway.example"))
+            ),
+            Err(ValidationError::BaseUrlNotAllowed)
+        );
+        let forged = ProviderConnection {
+            authentication: ConnectionAuth::AuthToken {
+                source: CredentialSource::System,
+            },
+            state: ConnectionState::Ready,
+            ..openai.into_pending(ConnectionId::new_stored())
+        };
+        assert_eq!(
+            forged.validate_persisted(),
+            Err(ValidationError::TransientAuthentication)
+        );
+    }
+
+    #[test]
+    fn existing_api_key_entries_still_read_as_api_keys() {
+        let parsed =
+            serde_json::from_str::<ConnectionAuth>(r#"{"kind":"api_key","source":"system"}"#);
+        assert!(parsed.is_ok());
+        let Ok(parsed) = parsed else {
+            return;
+        };
+        assert_eq!(parsed.credential_kind(), CredentialKind::ApiKey);
+        assert_eq!(
+            parsed,
+            ConnectionAuth::ApiKey {
+                source: CredentialSource::System
+            }
+        );
     }
 }

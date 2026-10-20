@@ -253,6 +253,7 @@ pub(crate) fn scripted_provider_config() -> crate::ProviderConfig {
         adapter: Arc::new(crate::rig_adapter::RigProviderAdapterConfig {
             provider: crate::rig_adapter::RigProviderConfig::Anthropic {
                 api_key: ProviderSecret::new(String::from("scripted")),
+                auth: crate::rig_adapter::AnthropicAuth::ApiKey,
                 base_url: None,
             },
             timeout: Duration::from_secs(30),

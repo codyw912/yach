@@ -174,10 +174,22 @@ pub struct OpenAiCompatibleHttpSmokeReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RigAnthropicSmokeConfig {
-    pub api_key: String,
+    pub api_key: ProviderSecret,
+    pub auth: AnthropicAuth,
+    pub base_url: Option<String>,
     pub model: String,
     pub timeout: Duration,
     pub max_tokens: u64,
+}
+
+/// Which header carries an Anthropic credential.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnthropicAuth {
+    /// `x-api-key`, the Anthropic API's own scheme.
+    ApiKey,
+    /// `Authorization: Bearer`, as `ANTHROPIC_AUTH_TOKEN` does in other
+    /// clients. Messages-format gateways expect it.
+    AuthToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +212,7 @@ pub struct RigChatGptSubscriptionSmokeConfig {
 pub enum RigProviderConfig {
     Anthropic {
         api_key: ProviderSecret,
+        auth: AnthropicAuth,
         /// opencode Zen's `/zen/v1` messages endpoint). `None` uses the
         /// Anthropic API proper. Env-var provider wiring is a stopgap;
         /// the provider/model product surface is a slated design item.
@@ -451,13 +464,12 @@ pub(crate) async fn run_provider_request_attempt_with_approved_tools(
         recorder: recorder.unwrap_or_default(),
     };
     match &config.provider {
-        RigProviderConfig::Anthropic { api_key, base_url } => {
-            let mut builder = api_key.with_exposed(|key| anthropic::Client::builder().api_key(key));
-            if let Some(base_url) = base_url.as_deref() {
-                builder = builder.base_url(base_url);
-            }
-            let client = builder
-                .build()
+        RigProviderConfig::Anthropic {
+            api_key,
+            auth,
+            base_url,
+        } => {
+            let client = anthropic_client(api_key, *auth, base_url.as_deref())
                 .map_err(|error| provider_internal_error(&error))?;
             let model = client.completion_model(attempt.request.model.model.clone());
             let additional_params = attempt
@@ -980,13 +992,30 @@ pub async fn run_chatgpt_subscription_smoke(
 pub async fn run_anthropic_smoke(
     config: RigAnthropicSmokeConfig,
 ) -> Result<RigOpenAiCompatibleSmokeReport, ProviderError> {
-    let client = anthropic::Client::builder()
-        .api_key(&config.api_key)
-        .build()
+    let client = anthropic_client(&config.api_key, config.auth, config.base_url.as_deref())
         .map_err(|error| provider_internal_error(&error))?;
     let model = client.completion_model(config.model.clone());
     let stream = stream_smoke_completion(&model, config.max_tokens).await?;
     collect_rig_smoke_stream(stream, "anthropic", config.model, config.timeout).await
+}
+
+/// Builds every Anthropic client yach uses, so turns, discovery, and the
+/// smoke command send the same credential header.
+pub(crate) fn anthropic_client(
+    secret: &ProviderSecret,
+    auth: AnthropicAuth,
+    base_url: Option<&str>,
+) -> Result<anthropic::Client, rig::http_client::Error> {
+    let mut builder = secret.with_exposed(|value| {
+        anthropic::Client::builder().api_key(match auth {
+            AnthropicAuth::ApiKey => anthropic::client::AnthropicKey::from(value),
+            AnthropicAuth::AuthToken => anthropic::client::AnthropicKey::auth_token(value),
+        })
+    });
+    if let Some(base_url) = base_url {
+        builder = builder.base_url(base_url);
+    }
+    builder.build()
 }
 
 pub async fn run_openai_smoke(
@@ -1775,8 +1804,8 @@ mod tests {
     use yach_connections::ProviderSecret;
 
     use super::{
-        MaxTokensParam, ProviderStreamAttempt, RigProviderAdapterConfig, RigProviderConfig,
-        RigToolCallCollection, RigToolCallPolicy, anthropic_thinking_params,
+        AnthropicAuth, MaxTokensParam, ProviderStreamAttempt, RigProviderAdapterConfig,
+        RigProviderConfig, RigToolCallCollection, RigToolCallPolicy, anthropic_thinking_params,
         apply_rig_tool_definitions, collect_rig_completion_stream, collect_rig_stream_item,
         compatible_reasoning_params, preamble_from_request, provider_thinking_level,
         provider_thinking_level_extension, provider_tool_advertising_error_label,
@@ -2920,6 +2949,7 @@ mod tests {
             RigProviderAdapterConfig {
                 provider: RigProviderConfig::Anthropic {
                     api_key: ProviderSecret::new(String::from("anthropic-debug-sentinel")),
+                    auth: AnthropicAuth::ApiKey,
                     base_url: None,
                 },
                 timeout: Duration::from_secs(1),
@@ -3103,6 +3133,7 @@ mod tests {
         let adapter = RigProviderAdapterConfig {
             provider: RigProviderConfig::Anthropic {
                 api_key: ProviderSecret::new(String::from("fixture-key")),
+                auth: AnthropicAuth::ApiKey,
                 base_url: None,
             },
             timeout: Duration::from_secs(1),
@@ -3259,6 +3290,7 @@ mod tests {
         let adapter = RigProviderAdapterConfig {
             provider: RigProviderConfig::Anthropic {
                 api_key: ProviderSecret::new(String::from("fixture-key")),
+                auth: AnthropicAuth::ApiKey,
                 base_url: Some(base_url),
             },
             timeout: Duration::from_secs(1),
@@ -3288,6 +3320,12 @@ mod tests {
         let header = String::from_utf8_lossy(&request[..header_end]);
         assert!(header.starts_with("POST /v1/messages HTTP/1.1"));
         assert!(header.contains("anthropic-version:"));
+        assert!(header.lines().any(|line| line == "x-api-key: fixture-key"));
+        assert!(
+            !header
+                .lines()
+                .any(|line| line.starts_with("authorization:"))
+        );
         let body = serde_json::from_slice::<serde_json::Value>(&request[header_end + 4..]);
         assert!(body.is_ok());
         let Ok(body) = body else {
@@ -3299,6 +3337,49 @@ mod tests {
         assert!(body.get("input").is_none());
         assert!(body.get("instructions").is_none());
         assert!(body.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_auth_token_turn_sends_only_bearer_header() {
+        let (base_url, captured, server) = local_sse_fixture();
+        let adapter = RigProviderAdapterConfig {
+            provider: RigProviderConfig::Anthropic {
+                api_key: ProviderSecret::new(String::from("fixture-token")),
+                auth: AnthropicAuth::AuthToken,
+                base_url: Some(base_url),
+            },
+            timeout: Duration::from_secs(1),
+            max_tokens: 1,
+            context_window: 1,
+            context_window_assumed: false,
+            max_tokens_param: MaxTokensParam::MaxTokens,
+            error_dialect: DialectSelection::Missing,
+        };
+        let result = run_provider_request(
+            &adapter,
+            provider_request(vec![ProviderMessage::text(Role::User, "gateway")]),
+        )
+        .await;
+        drop(result);
+        assert!(server.join().is_ok());
+        let request = captured.lock().ok().and_then(|mut request| request.take());
+        assert!(request.is_some());
+        let Some(request) = request else {
+            return;
+        };
+        let header_end = request.windows(4).position(|window| window == b"\r\n\r\n");
+        assert!(header_end.is_some());
+        let Some(header_end) = header_end else {
+            return;
+        };
+        let header = String::from_utf8_lossy(&request[..header_end]);
+        assert!(header.starts_with("POST /v1/messages HTTP/1.1"));
+        assert!(
+            header
+                .lines()
+                .any(|line| line == "authorization: Bearer fixture-token")
+        );
+        assert!(!header.lines().any(|line| line.starts_with("x-api-key:")));
     }
 
     #[tokio::test]

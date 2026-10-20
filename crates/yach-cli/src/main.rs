@@ -25,7 +25,8 @@ use yach_backend::{
     model_discovery::DiscoveredProviderModel,
     nothing_to_grant_message, project_session_log_dir, revoke_confirmation_message, revoke_grant,
     rig_adapter::{
-        MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig, run_provider_request,
+        AnthropicAuth, MaxTokensParam, RigProviderAdapterConfig, RigProviderConfig,
+        run_provider_request,
     },
     rig_diagnostics::{
         RigAnthropicSmokeConfig, RigChatGptSubscriptionSmokeConfig, RigOpenAiCompatibleSmokeConfig,
@@ -1134,7 +1135,13 @@ fn run_headless_cli_command(
         &layers,
     ) {
         Ok(resolved) => Some(resolved),
-        Err(_) if options.model.is_none() && provider_connections::has_stored_connections() => None,
+        Err(error)
+            if options.model.is_none()
+                && error.is_missing()
+                && provider_connections::has_stored_connections() =>
+        {
+            None
+        }
         Err(error) => return setup_error(rig_config_error_message(&error)),
     };
     let (provider, environment, runtime_timeout) = resolved.map_or_else(
@@ -1390,6 +1397,10 @@ struct RigSmokeEnvConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RigSmokeConfigError {
     Missing(&'static str),
+    /// Neither of two alternative variables is set.
+    MissingOneOf(&'static str, &'static str),
+    /// Two mutually exclusive variables are both set.
+    Conflicting(&'static str, &'static str),
     Empty(&'static str),
     InvalidNumber(&'static str),
     InvalidValue {
@@ -1397,6 +1408,52 @@ enum RigSmokeConfigError {
         value: String,
         reason: &'static str,
     },
+}
+
+impl RigSmokeConfigError {
+    /// Env config that is absent, as opposed to present but wrong. Only an
+    /// absent config may defer to stored `/connect` connections.
+    const fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing(_) | Self::MissingOneOf(..))
+    }
+}
+
+const ANTHROPIC_API_KEY_ENV: &str = "YACH_RIG_ANTHROPIC_API_KEY";
+const ANTHROPIC_AUTH_TOKEN_ENV: &str = "YACH_RIG_ANTHROPIC_AUTH_TOKEN";
+
+/// Resolves the Anthropic credential and the header it travels in. The auth
+/// token mirrors `ANTHROPIC_AUTH_TOKEN` in other clients: sent as
+/// `Authorization: Bearer` instead of `x-api-key`. Exactly one may be set.
+fn anthropic_credential(
+    lookup: impl Fn(&'static str) -> Option<String>,
+) -> Result<(ProviderSecret, AnthropicAuth), RigSmokeConfigError> {
+    let (name, auth, value) = match (
+        lookup(ANTHROPIC_API_KEY_ENV),
+        lookup(ANTHROPIC_AUTH_TOKEN_ENV),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(RigSmokeConfigError::Conflicting(
+                ANTHROPIC_API_KEY_ENV,
+                ANTHROPIC_AUTH_TOKEN_ENV,
+            ));
+        }
+        (Some(value), None) => (ANTHROPIC_API_KEY_ENV, AnthropicAuth::ApiKey, value),
+        (None, Some(value)) => (ANTHROPIC_AUTH_TOKEN_ENV, AnthropicAuth::AuthToken, value),
+        (None, None) => {
+            return Err(RigSmokeConfigError::MissingOneOf(
+                ANTHROPIC_API_KEY_ENV,
+                ANTHROPIC_AUTH_TOKEN_ENV,
+            ));
+        }
+    };
+    if value.trim().is_empty() {
+        return Err(RigSmokeConfigError::Empty(name));
+    }
+    Ok((ProviderSecret::new(value), auth))
+}
+
+fn anthropic_credential_from_env() -> Result<(ProviderSecret, AnthropicAuth), RigSmokeConfigError> {
+    anthropic_credential(|name| std::env::var(name).ok())
 }
 
 fn print_capabilities() -> CommandResult {
@@ -1460,10 +1517,14 @@ fn rig_provider_adapter_config_from_env_with_model_override(
     let provider_label =
         optional_env("YACH_RIG_PROVIDER").unwrap_or_else(|| String::from("anthropic"));
     let provider = match provider_label.as_str() {
-        "anthropic" => RigProviderConfig::Anthropic {
-            api_key: ProviderSecret::new(required_env("YACH_RIG_ANTHROPIC_API_KEY")?),
-            base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
-        },
+        "anthropic" => {
+            let (api_key, auth) = anthropic_credential_from_env()?;
+            RigProviderConfig::Anthropic {
+                api_key,
+                auth,
+                base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
+            }
+        }
         "openai-codex" => RigProviderConfig::ChatGptSubscription {
             auth_file: PathBuf::from(required_env("YACH_RIG_CHATGPT_TOKEN_DIR")?).join("auth.json"),
         },
@@ -1500,6 +1561,7 @@ fn rig_provider_adapter_config_from_env_with_model_override(
             let _ = required_env("YACH_BENCH_SCRIPT")?;
             RigProviderConfig::Anthropic {
                 api_key: ProviderSecret::new(String::from("scripted")),
+                auth: AnthropicAuth::ApiKey,
                 base_url: None,
             }
         }
@@ -2489,9 +2551,10 @@ fn run_rig_provider_request_smoke() -> CommandResult {
         }
     };
     let provider_config = match provider.as_str() {
-        "anthropic" => match required_env("YACH_RIG_ANTHROPIC_API_KEY") {
-            Ok(api_key) => RigProviderConfig::Anthropic {
-                api_key: ProviderSecret::new(api_key),
+        "anthropic" => match anthropic_credential_from_env() {
+            Ok((api_key, auth)) => RigProviderConfig::Anthropic {
+                api_key,
+                auth,
                 base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
             },
             Err(error) => return missing_rig_provider_request_config(&error),
@@ -3176,8 +3239,8 @@ fn run_rig_chatgpt_subscription_smoke() -> CommandResult {
 }
 
 fn run_rig_anthropic_smoke() -> CommandResult {
-    let api_key = match required_env("YACH_RIG_ANTHROPIC_API_KEY") {
-        Ok(api_key) => api_key,
+    let (api_key, auth) = match anthropic_credential_from_env() {
+        Ok(credential) => credential,
         Err(error) => {
             return CommandResult::RigOpenAiCompatibleSmoke {
                 outcome: RigSmokeOutcome::MissingConfig,
@@ -3238,6 +3301,8 @@ fn run_rig_anthropic_smoke() -> CommandResult {
     };
     match runtime.block_on(run_anthropic_smoke(RigAnthropicSmokeConfig {
         api_key,
+        auth,
+        base_url: optional_env("YACH_RIG_ANTHROPIC_BASE_URL"),
         model,
         timeout: Duration::from_secs(timeout_secs),
         max_tokens,
@@ -3563,6 +3628,12 @@ fn clamped_optional_numeric_value(
 fn rig_config_error_message(error: &RigSmokeConfigError) -> String {
     match error {
         RigSmokeConfigError::Missing(name) => format!("missing required env var {name}"),
+        RigSmokeConfigError::MissingOneOf(first, second) => {
+            format!("missing required env var {first} or {second}")
+        }
+        RigSmokeConfigError::Conflicting(first, second) => {
+            format!("env vars {first} and {second} are both set; set only one")
+        }
         RigSmokeConfigError::Empty(name) => format!("empty required env var {name}"),
         RigSmokeConfigError::InvalidNumber(name) => format!("invalid numeric env var {name}"),
         RigSmokeConfigError::InvalidValue {
@@ -3585,15 +3656,16 @@ fn provider_setup_error_message(error: &RigSmokeConfigError) -> String {
 }
 
 /// Missing legacy env config is a setup error only when no stored `/connect`
-/// registry can supply auth instead. Genuine failures surface as in-session
-/// status from the unconfigured backend; launch never prints them because a
-/// pre-launch stderr line is hidden by the alternate screen and reappears
-/// after exit.
+/// registry can supply auth instead. Env config that is present but wrong
+/// (conflicting, empty, or invalid) is always reported. Genuine failures
+/// surface as in-session status from the unconfigured backend; launch never
+/// prints them because a pre-launch stderr line is hidden by the alternate
+/// screen and reappears after exit.
 fn unconfigured_launch_setup_error(
     error: &RigSmokeConfigError,
     stored_connections_available: bool,
 ) -> Option<String> {
-    if stored_connections_available {
+    if stored_connections_available && error.is_missing() {
         None
     } else {
         Some(provider_setup_error_message(error))
@@ -6042,6 +6114,7 @@ fn loop_provider_cancel_persists_user_entry() {
                     adapter: Arc::new(RigProviderAdapterConfig {
                         provider: RigProviderConfig::Anthropic {
                             api_key: ProviderSecret::new(String::from("fake-test-key")),
+                            auth: AnthropicAuth::ApiKey,
                             base_url: None,
                         },
                         timeout: std::time::Duration::from_millis(1),
@@ -6230,6 +6303,7 @@ fn loop_provider_cancel_after_finish_does_not_duplicate_terminal_turn() {
 mod tests {
     #[cfg(not(feature = "bundled-hashline"))]
     use super::extension_diagnostic_record_from_install;
+    use super::{AnthropicAuth, anthropic_credential};
     use super::{
         CliArgs, Command, CommandResult, ExtensionDiagnosticRecord, ExtensionDiagnosticsCommand,
         ExtensionDiagnosticsOutcome, ExtensionManagementAction, ExtensionManagementOutcome,
@@ -8201,7 +8275,7 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_launch_setup_error_requires_both_missing_env_and_no_stored_connections() {
+    fn unconfigured_launch_setup_error_hides_only_missing_env_behind_stored_connections() {
         let error = RigSmokeConfigError::Missing("YACH_RIG_ANTHROPIC_API_KEY");
 
         assert_eq!(
@@ -8209,6 +8283,77 @@ mod tests {
             Some("provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY")
         );
         assert_eq!(unconfigured_launch_setup_error(&error, true), None);
+        let either = RigSmokeConfigError::MissingOneOf(
+            "YACH_RIG_ANTHROPIC_API_KEY",
+            "YACH_RIG_ANTHROPIC_AUTH_TOKEN",
+        );
+        assert_eq!(unconfigured_launch_setup_error(&either, true), None);
+
+        let conflict = RigSmokeConfigError::Conflicting(
+            "YACH_RIG_ANTHROPIC_API_KEY",
+            "YACH_RIG_ANTHROPIC_AUTH_TOKEN",
+        );
+        assert_eq!(
+            unconfigured_launch_setup_error(&conflict, true).as_deref(),
+            Some(
+                "provider setup failed: env vars YACH_RIG_ANTHROPIC_API_KEY and YACH_RIG_ANTHROPIC_AUTH_TOKEN are both set; set only one"
+            )
+        );
+        assert!(
+            unconfigured_launch_setup_error(
+                &RigSmokeConfigError::Empty("YACH_RIG_ANTHROPIC_AUTH_TOKEN"),
+                true
+            )
+            .is_some()
+        );
+        for present_but_wrong in [
+            RigSmokeConfigError::InvalidNumber("YACH_RIG_ANTHROPIC_MAX_TOKENS"),
+            RigSmokeConfigError::InvalidValue {
+                name: "YACH_RIG_PROVIDER",
+                value: String::from("bogus"),
+                reason: "unknown provider",
+            },
+        ] {
+            assert!(unconfigured_launch_setup_error(&present_but_wrong, true).is_some());
+        }
+    }
+
+    #[test]
+    fn anthropic_credential_selects_the_header_from_exactly_one_variable() {
+        let only = |name: &'static str, value: &'static str| {
+            move |asked: &'static str| (asked == name).then(|| value.to_owned())
+        };
+        assert!(matches!(
+            anthropic_credential(only("YACH_RIG_ANTHROPIC_API_KEY", "key")),
+            Ok((_, AnthropicAuth::ApiKey))
+        ));
+        assert!(matches!(
+            anthropic_credential(only("YACH_RIG_ANTHROPIC_AUTH_TOKEN", "token")),
+            Ok((_, AnthropicAuth::AuthToken))
+        ));
+        assert!(matches!(
+            anthropic_credential(only("YACH_RIG_ANTHROPIC_AUTH_TOKEN", " ")),
+            Err(RigSmokeConfigError::Empty("YACH_RIG_ANTHROPIC_AUTH_TOKEN"))
+        ));
+
+        let both = anthropic_credential(|_| Some(String::from("value")));
+        assert!(both.is_err());
+        let Err(both) = both else {
+            return;
+        };
+        assert_eq!(
+            provider_setup_error_message(&both),
+            "provider setup failed: env vars YACH_RIG_ANTHROPIC_API_KEY and YACH_RIG_ANTHROPIC_AUTH_TOKEN are both set; set only one"
+        );
+        let neither = anthropic_credential(|_| None);
+        assert!(neither.is_err());
+        let Err(neither) = neither else {
+            return;
+        };
+        assert_eq!(
+            provider_setup_error_message(&neither),
+            "provider setup failed: missing required env var YACH_RIG_ANTHROPIC_API_KEY or YACH_RIG_ANTHROPIC_AUTH_TOKEN"
+        );
     }
 
     #[test]

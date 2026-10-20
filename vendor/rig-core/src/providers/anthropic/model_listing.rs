@@ -10,7 +10,10 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 struct ListModelsResponse {
     data: Vec<ListModelEntry>,
-    has_more: bool,
+    // yach patch: gateways that proxy the Messages API return
+    // `"has_more": null` or omit it; treat that as the last page.
+    #[serde(default)]
+    has_more: Option<bool>,
     last_id: Option<String>,
 }
 
@@ -75,7 +78,7 @@ where
 
             all_models.extend(page.data.into_iter().map(Model::from));
 
-            if !page.has_more {
+            if page.has_more != Some(true) {
                 break;
             }
 
