@@ -11,7 +11,7 @@ Run a full pass, keeping the first failure's exit status and always cleaning up:
 
 ```bash
 s=.agents/skills/verify-yach/scripts
-$s/doctor && $s/launch && $s/drive-prompt-reply && $s/drive-tool-review && $s/drive-resume && $s/drive-headless && $s/drive-provider-failure; rc=$?
+$s/doctor && $s/launch && $s/drive-prompt-reply && $s/drive-tool-review && $s/drive-resume && $s/drive-headless && $s/drive-provider-failure && $s/drive-cancellation; rc=$?
 $s/cleanup; crc=$?; [ "$rc" -ne 0 ] || rc=$crc
 echo "exit status: $rc"; [ "$rc" -eq 0 ]
 ```
@@ -35,8 +35,9 @@ Each script prints its evidence directory as its last line and exits non-zero wh
 | `scripts/drive-resume` | [Resume](features/resume.md): `--resume` restores the transcript and continues the same session |
 | `scripts/drive-headless` | [Headless](features/headless.md): `yach run` outcome JSON, `sessions list/show` |
 | `scripts/drive-provider-failure` | [Provider failure](features/provider-failure.md): a scripted `rate_limited` and `authentication` failure each end the turn failed, one attempt, no retry |
+| `scripts/drive-cancellation` | [Cancellation](features/cancellation.md): a scripted provider cancellation leaves the turn and attempt cancelled, not failed |
 
-Reply scripts are built by `scripts/lib/common.sh` (`text_round`, `bash_round`, `failed_round`, `write_script`): a JSON array of provider rounds, each an array of provider stream events. A tool-call round is followed by the round that answers after the tool result. To cover a new behavior, add a drive script and a feature file rather than improvising tmux commands.
+Reply scripts are built by `scripts/lib/common.sh` (`text_round`, `bash_round`, `failed_round`, `cancelled_round`, `write_script`): a JSON array of provider rounds, each an array of provider stream events. A tool-call round is followed by the round that answers after the tool result. To cover a new behavior, add a drive script and a feature file rather than improvising tmux commands.
 
 ## Evidence
 

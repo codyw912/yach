@@ -56,6 +56,12 @@ failed_round() {
            error: {kind: $k, message: ("scripted " + $k), redacted_debug: null}}]'
 }
 
+# One provider round that the provider ends as cancelled.
+cancelled_round() {
+  jq -cn --argjson s "$started" \
+    '[$s, {type: "cancelled", turn_id: "turn-1", reason: "scripted cancellation"}]'
+}
+
 # Write the reply script from rounds given as arguments.
 write_script() {
   jq -cs . <<<"$(printf '%s\n' "$@")" > "$state/run/script.json"
