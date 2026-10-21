@@ -48,6 +48,14 @@ bash_round() {
            tool_call: {call_id: "call-1", name: "bash", arguments_json: {command: $cmd}}}, $c]'
 }
 
+# One provider round that fails with a ProviderErrorKind, given in its
+# serialized snake_case form (rate_limited, authentication, ...).
+failed_round() {
+  jq -cn --arg k "$1" --argjson s "$started" \
+    '[$s, {type: "failed", turn_id: "turn-1",
+           error: {kind: $k, message: ("scripted " + $k), redacted_debug: null}}]'
+}
+
 # Write the reply script from rounds given as arguments.
 write_script() {
   jq -cs . <<<"$(printf '%s\n' "$@")" > "$state/run/script.json"
