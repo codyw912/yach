@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Scripted tool rounds read two seeded files, edit both, then run the
+# workspace verifier. The proof is on disk and in the session log: the
+# verifier fails on the seed, both files differ from the seed afterwards,
+# the verifier exits 0 when the drive runs it again, and the session
+# recorded both edits and the verifier's exit code.
+# The reply text is not the signal.
+#
+# The default (full) preset replaces edit_text_file with hashline: reads
+# return [path#TAG] headers and edits are line-anchored patches whose tag
+# must match a read in the same session. The drive computes the tags from
+# the seed, so the reads must come first.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+ev=$("$tty" evidence-dir yach)
+"$tty" stop "$session"
+reset_run
+ws="$state/run/workspace"
+printf 'alpha\n' > "$ws/a.txt"
+printf 'beta\n' > "$ws/b.txt"
+printf '#!/bin/sh\ngrep -qx ALPHA a.txt && grep -qx BETA b.txt\n' > "$ws/verify.sh"
+chmod +x "$ws/verify.sh"
+cp "$ws/a.txt" "$ev/seed-a.txt"
+cp "$ws/b.txt" "$ev/seed-b.txt"
+if (cd "$ws" && ./verify.sh); then
+  echo "drive-multi-file-edit: ./verify.sh already passes on the seed" >&2; exit 1
+fi
+
+patch_a=$(printf '[a.txt#%s]\nPUT 1.=1:\n+ALPHA\n' "$(file_tag "$ws/a.txt")")
+patch_b=$(printf '[b.txt#%s]\nPUT 1.=1:\n+BETA\n' "$(file_tag "$ws/b.txt")")
+write_script \
+  "$(tool_round '[{"call_id":"call-1","name":"read_text_file","arguments_json":{"path":"a.txt"}},
+                  {"call_id":"call-2","name":"read_text_file","arguments_json":{"path":"b.txt"}}]')" \
+  "$(tool_round "$(jq -cn --arg a "$patch_a" --arg b "$patch_b" \
+      '[{call_id: "call-3", name: "edit_text_file", arguments_json: {input: $a}},
+        {call_id: "call-4", name: "edit_text_file", arguments_json: {input: $b}}]')")" \
+  "$(tool_round '[{"call_id":"call-5","name":"bash","arguments_json":{"command":"./verify.sh"}}]')" \
+  "$(text_round 'Both files edited; the verifier passed.')"
+
+# --full-auto: this drive proves the edit and verifier path. Review gating
+# is drive-tool-review's job.
+rc=0
+yach_cli run --prompt "edit a.txt and b.txt, then run ./verify.sh" --full-auto \
+  > "$ev/01-outcome.json" 2> "$ev/01-stderr.log" || rc=$?
+echo "exit: $rc" > "$ev/01-exit.txt"
+[[ $rc -eq 0 ]] || { echo "drive-multi-file-edit: yach run exited $rc" >&2; cat "$ev/01-stderr.log" >&2; exit 1; }
+
+changed=0
+cmp -s "$ws/a.txt" "$ev/seed-a.txt" || changed=$((changed + 1))
+cmp -s "$ws/b.txt" "$ev/seed-b.txt" || changed=$((changed + 1))
+cp "$ws/a.txt" "$ws/b.txt" "$ev/"
+[[ $changed -eq 2 ]] || { echo "drive-multi-file-edit: $changed of 2 files differ from the seed" >&2; exit 1; }
+
+vrc=0
+(cd "$ws" && ./verify.sh) || vrc=$?
+echo "verify.sh exit: $vrc" > "$ev/02-verifier.txt"
+[[ $vrc -eq 0 ]] || { echo "drive-multi-file-edit: ./verify.sh exited $vrc after the turn" >&2; exit 1; }
+
+yach_cli sessions show latest --json > "$ev/03-session.json"
+jq -e '
+    .turns[0].outcome == "completed"
+    and ([.turns[0].items[] | select(.kind == "tool" and .outcome == "completed")] | length == 5)' \
+  "$ev/03-session.json" > /dev/null \
+  || { echo "drive-multi-file-edit: session does not show a completed turn with 5 completed tools" >&2; jq . "$ev/03-session.json" >&2; exit 1; }
+
+# The inspector redacts tool output; the session log keeps it. The
+# verifier's recorded result must report exit code 0.
+log=$(find "$state/run/sessions" -name '*.jsonl')
+jq -r 'select(.type == "tool_execution_finished") | .result_content' "$log" > "$ev/04-tool-results.txt"
+expect "$ev/04-tool-results.txt" '^\[applied\]$'
+[[ $(grep -c '^\[applied\]$' "$ev/04-tool-results.txt") -eq 2 ]] \
+  || { echo "drive-multi-file-edit: expected 2 applied edits" >&2; cat "$ev/04-tool-results.txt" >&2; exit 1; }
+expect "$ev/04-tool-results.txt" '^\[no output; exit code 0\]$'
+echo "$ev"
