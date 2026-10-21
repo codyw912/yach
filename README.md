@@ -412,6 +412,19 @@ size gate: `just perf --filter 'binary/size_bytes' --deterministic`.
    presenting them as observations.
 3. The maintainer picks which findings to act on before any fix lands.
 
+For a change to an interactive view or modal, include an affected-view checklist
+with the verification handoff. Static grids show appearance; they do not prove
+keyboard focus, approval gating, provider execution, or persisted state.
+
+| View / modal | Entry → action → exit keys | Expected state / durable effect | Capture and session evidence | Agent result | Human result |
+| --- | --- | --- | --- | --- | --- |
+
+Record one row per affected transition, including rejection and Escape/back to
+the composer where applicable. Run the relevant `verify-yach` drive first;
+then a person exercises those transitions and records their result. Leave a
+human check as **unverified** until it has actually been performed. Agent
+observations and passing artifact assertions do not substitute for that check.
+
 ### Session logs and privacy
 
 Sessions are append-only JSONL under

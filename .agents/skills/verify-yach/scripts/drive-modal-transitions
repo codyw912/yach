@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# Real-TUI proof of edit review's one-Down rejection and model-selector
+# dismissal returning input to the composer. Screen transitions are paired
+# with unchanged file bytes and same-turn persisted session evidence.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+. "$(cd "$(dirname "$0")" && pwd)/lib/semantic-provider.sh"
+
+ev=$("$tty" evidence-dir yach)
+trap '"$tty" stop "$session"' EXIT
+ws="$state/run/workspace"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
+fail() { printf 'drive-modal-transitions: %s\n' "$*" >&2; exit 1; }
+expect_absent() {
+  if grep -Eq -- "$2" "$1"; then
+    cat "$1" >&2
+    fail "unexpected /$2/ in $1"
+  fi
+}
+
+# The old command rejection uses Down Down because bash offers a session
+# grant. An edit must instead present Approve/Reject and select Reject with
+# exactly one Down. Read the snapshot before proposing its hashline patch.
+"$tty" stop "$session"
+reset_run
+semantic_seed_catalog_cache "$ev/01-edit-catalog-cache.json"
+printf 'keep me\nunchanged tail\n' > "$ws/notes.txt"
+cp "$ws/notes.txt" "$ev/seed-notes.txt"
+tag=$(file_tag "$ws/notes.txt")
+snapshot="[notes.txt#$tag]"
+patch=$(printf '%s\nPUT 1.=1:\n+replaced by modal proposal\n' "$snapshot")
+edit_prompt="propose the notes edit $run_id"
+edit_reply="Edit rejection finished $run_id."
+write_script \
+  "$(tool_round '[{"call_id":"call-1","name":"read_text_file","arguments_json":{"path":"notes.txt"}}]')" \
+  "$(tool_round "$(jq -cn --arg patch "$patch" \
+      '[{call_id: "call-2", name: "edit_text_file", arguments_json: {input: $patch}}]')")" \
+  "$(text_round "$edit_reply")"
+cp "$state/run/script.json" "$ev/01-edit-script.json"
+start_tui
+ui_send "$edit_prompt" '› Approve' 15
+capture "$ev/02-edit-pending.txt"
+expect "$ev/02-edit-pending.txt" 'Review: pending'
+expect "$ev/02-edit-pending.txt" 'Path: notes\.txt'
+expect "$ev/02-edit-pending.txt" 'Diff:'
+expect "$ev/02-edit-pending.txt" '\-keep me'
+expect "$ev/02-edit-pending.txt" '\+replaced by modal proposal'
+expect "$ev/02-edit-pending.txt" '› Approve'
+expect "$ev/02-edit-pending.txt" 'Reject'
+expect_absent "$ev/02-edit-pending.txt" 'Approve once|Approve for this session|› Reject'
+
+# Capture the selected option before Enter; a later denial cannot establish
+# how many options one Down traversed.
+ui_keys '› Reject' Down
+capture "$ev/03-edit-reject-selected.txt"
+expect "$ev/03-edit-reject-selected.txt" 'Review: pending'
+expect "$ev/03-edit-reject-selected.txt" '› Reject'
+expect_absent "$ev/03-edit-reject-selected.txt" '› Approve|Approve for this session'
+ui_keys "$edit_reply" Enter
+ui_wait 'enter send · ctrl\+j newline' 15
+capture "$ev/04-edit-rejected.txt"
+expect "$ev/04-edit-rejected.txt" 'denied edit_text_file'
+expect "$ev/04-edit-rejected.txt" 'review rejected'
+expect_absent "$ev/04-edit-rejected.txt" 'Review: pending'
+cp "$ws/notes.txt" "$ev/05-result-notes.txt"
+cmp -s "$ev/seed-notes.txt" "$ev/05-result-notes.txt" \
+  || fail 'rejected edit changed notes.txt'
+printf 'notes.txt matches seed byte-for-byte after rejection\n' > "$ev/05-workspace.txt"
+
+# Extension proposal tool names may be absent in inspector output. The
+# durable review names the edit; correlate its decision with the tool by ID.
+yach_cli sessions show latest --json > "$ev/06-edit-session.json"
+jq -e --arg prompt "$edit_prompt" '
+  (.warnings | length) == 0 and (.turns | length) == 1
+  and .turns[0].prompt == $prompt and .turns[0].outcome == "completed"
+  and ([.turns[0].items[] | select(.kind == "review")] | length) == 1
+  and ([.turns[0].items[] | select(.kind == "tool")] | length) == 2
+  and any(.turns[0].items[]; .kind == "tool" and .tool_name == "read_text_file" and .outcome == "completed")
+  and (.turns[0].items as $items
+    | any($items[]; .kind == "review" and .decision == "reject"
+        and (.tool_request_id as $id
+          | any($items[]; .kind == "tool" and .tool_request_id == $id and .outcome == "completed"))))
+' "$ev/06-edit-session.json" > /dev/null || fail 'edit session lacks the completed read and matching rejected edit'
+edit_session=$(jq -er .id "$ev/06-edit-session.json")
+cp "$state/run/sessions/$edit_session.jsonl" "$ev/07-edit-session.jsonl"
+jq -es --arg sid "$edit_session" --arg snapshot "$snapshot" --arg reply "$edit_reply" '
+  . as $events
+  | [.[] | select(.type == "tool_review_requested" and .tool_name == "edit_text_file")] as $reviews
+  | ($reviews | length) == 1 and ($reviews[0] as $review
+    | $review.session_id == $sid and $review.payload.kind == "local_edit"
+    and $review.payload.preview.path == "notes.txt"
+    and any($events[]; .type == "tool_request_recorded" and .tool_name == "read_text_file"
+      and .turn_id == $review.turn_id and (.tool_request_id as $read_id
+        | any($events[]; .type == "tool_execution_finished" and .tool_request_id == $read_id
+            and .outcome == "completed" and (.result_content | contains($snapshot))
+            and (. as $read | ($events | index($read)) < ($events | index($review))))))
+    and any($events[]; .type == "tool_review_decision_recorded" and .turn_id == $review.turn_id
+      and .tool_request_id == $review.tool_request_id and .decision == "reject")
+    and any($events[]; .type == "permission_decision_recorded" and .turn_id == $review.turn_id
+      and .summary.decision_id == $review.payload.preview.permission_decision_id
+      and .summary.outcome == "denied" and .summary.reason == "user_rejected" and .summary.user_override)
+    and any($events[]; .type == "tool_execution_finished" and .turn_id == $review.turn_id
+      and .tool_request_id == $review.tool_request_id and .reason == "user_rejected"
+      and .result_content == "[rejected by review]")
+    and any($events[]; .type == "entry_appended" and .turn_id == $review.turn_id and .role == "assistant"
+      and .text == $reply and .provider.model == "scripted-model"))
+' "$ev/07-edit-session.jsonl" > /dev/null || fail 'edit JSONL lacks snapshot-linked rejection and tool denial'
+"$tty" stop "$session"
+
+# Fresh local-adapter case: /model itself requests discovery, so the scripted
+# Anthropic adapter is not safe here. The shared fixture serves both model
+# listing and two contextual Responses turns without leaving loopback.
+rm -rf "$state/run"
+semantic_setup resume "$ev"
+warmup_prompt="modal warmup $run_id"
+warmup_reply="Modal warmup completed $run_id."
+focus_prompt="composer focus restored $run_id"
+focus_reply="Fresh composer completion $run_id."
+jq -n --arg first_prompt "$warmup_prompt" --arg first_reply "$warmup_reply" \
+  --arg continuation_prompt "$focus_prompt" --arg continuation_reply "$focus_reply" \
+  '{first_prompt:$first_prompt,first_reply:$first_reply,continuation_prompt:$continuation_prompt,continuation_reply:$continuation_reply}' \
+  > "$ev/protocol/config.json"
+cp "$ev/protocol/config.json" "$ev/08-selector-config.json"
+semantic_start_tui
+ui_send "$warmup_prompt" "$warmup_reply" 15
+semantic_wait_turn "$warmup_prompt" "$warmup_reply"
+ui_wait 'enter send · ctrl\+j newline' 15
+capture "$ev/09-selector-warmup.txt"
+log=$(semantic_session)
+cp "$log" "$ev/10-selector-before.jsonl"
+(cd "$state/run/workspace" && env -i HOME="$state/run/home" PATH="$PATH" \
+  YACH_SESSION_DIR="$state/run/sessions" "$(yach_bin)" sessions show latest --json) > "$ev/10-selector-before-session.json"
+jq -e --arg prompt "$warmup_prompt" '
+  (.warnings | length) == 0 and (.turns | length) == 1
+  and .turns[0].prompt == $prompt and .turns[0].outcome == "completed"
+  and any(.turns[0].items[]; .kind == "provider_attempt" and .attempt.purpose == "turn" and .attempt.outcome == "succeeded")
+' "$ev/10-selector-before-session.json" > /dev/null || fail 'selector warmup did not complete a local-provider turn'
+selector_session=$(jq -er .id "$ev/10-selector-before-session.json")
+
+ui_send '/model' 'Select Model' 15
+ui_wait '▸ .*gpt-fixture.*● active' 15
+capture "$ev/11-model-selector.txt"
+expect "$ev/11-model-selector.txt" 'Select Model'
+expect "$ev/11-model-selector.txt" 'Search:'
+expect "$ev/11-model-selector.txt" 'Arrows move; Enter requests a model change; Esc closes\.'
+expect "$ev/11-model-selector.txt" '▸ .*gpt-fixture.*● active'
+expect_absent "$ev/11-model-selector.txt" "$focus_reply"
+
+# Do not press Enter in the selector or force-refresh it. Its normal discovery
+# request is serviced locally; model activation is not part of this proof.
+ui_keys 'enter send · ctrl\+j newline' Escape
+capture "$ev/12-composer-restored.txt"
+expect "$ev/12-composer-restored.txt" 'enter send · ctrl\+j newline'
+expect_absent "$ev/12-composer-restored.txt" 'Select Model|Search:|Activate and save as default'
+expect_absent "$ev/12-composer-restored.txt" "$focus_reply"
+ui_send "$focus_prompt" "$focus_reply" 15
+semantic_wait_turn "$focus_prompt" "$focus_reply"
+ui_wait 'enter send · ctrl\+j newline' 15
+capture "$ev/13-fresh-completion.txt"
+expect "$ev/13-fresh-completion.txt" "› $focus_prompt"
+expect "$ev/13-fresh-completion.txt" "$focus_reply"
+expect_absent "$ev/13-fresh-completion.txt" 'Select Model|Activate and save as default'
+
+ui_send '/quit' 'Pane is dead' 10
+"$tty" stop "$session"
+semantic_finish "$ev/10-selector-before.jsonl"
+cp "$ev/session-inspector.json" "$ev/14-selector-after-session.json"
+jq -e --arg sid "$selector_session" --arg prompt "$focus_prompt" \
+  --slurpfile before "$ev/10-selector-before-session.json" '
+  .id == $sid and (.warnings | length) == 0 and (.turns | length) == 2
+  and .turns[0] == $before[0].turns[0]
+  and .turns[1].prompt == $prompt and .turns[1].outcome == "completed"
+  and .turns[1].turn_id != .turns[0].turn_id
+  and ([.turns[1].items[] | select(.kind == "provider_attempt")] | length) == 1
+  and any(.turns[1].items[]; .kind == "provider_attempt" and .attempt.purpose == "turn"
+      and .attempt.outcome == "succeeded" and .attempt.retry_index == 0 and .attempt.model == "gpt-fixture")
+' "$ev/14-selector-after-session.json" > /dev/null || fail 'Escape did not allow the unique prompt to complete a fresh provider turn'
+focus_turn=$(jq -er '.turns[1].turn_id' "$ev/14-selector-after-session.json")
+cp "$ev/session.jsonl" "$ev/15-selector-session.jsonl"
+jq -es --arg sid "$selector_session" --arg turn "$focus_turn" \
+  --arg prompt "$focus_prompt" --arg reply "$focus_reply" '
+  . as $events
+  | [.[] | select(.type == "entry_appended" and .session_id == $sid
+      and .turn_id == $turn and .role == "user" and .text == $prompt)] as $users
+  | ($users | length) == 1
+  and any($events[]; .type == "entry_appended" and .session_id == $sid and .turn_id == $turn
+      and .role == "assistant" and .text == $reply and .parent_entry_id == $users[0].entry_id
+      and .provider.model == "gpt-fixture")
+  and any($events[]; .type == "provider_attempt_finished" and .session_id == $sid and .turn_id == $turn
+      and .purpose == "turn" and .outcome == "succeeded" and .model == "gpt-fixture")
+  and any($events[]; .type == "turn_finished" and .session_id == $sid and .turn_id == $turn and .outcome == "completed")
+' "$ev/15-selector-session.jsonl" > /dev/null || fail 'fresh reply is not linked to the submitted prompt and successful local-provider attempt'
+
+printf '%s\n' 'Scripted edit rejection plus local Responses/model-list modal proof; no live-family or resume coverage.' > "$ev/scope.txt"
+echo "$ev"

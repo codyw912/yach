@@ -1,38 +1,79 @@
 #!/usr/bin/env bash
-# A finished session survives quitting: `yach tui --resume` shows the prior
-# transcript and the next prompt continues the same session.
+# Transcript/fixture proof: `yach tui --resume` restores prior messages and
+# continues the same session. Provider-backed resume has its own drive.
 set -euo pipefail
 . "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+# Inspect persisted completion rather than waiting on transient footer counts.
+wait_completed_turn() {
+  local count=$1 prompt=$2 output=$3 deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    yach_cli sessions show latest --json > "$output"
+    if jq -e --argjson count "$count" --arg prompt "$prompt" '
+      (.warnings | length) == 0 and (.turns | length) == $count and
+      .turns[-1].prompt == $prompt and .turns[-1].outcome == "completed"
+    ' "$output" >/dev/null; then return 0; fi
+    sleep 0.1
+  done
+  printf 'drive-resume: no durable completed turn for %s\n' "$prompt" >&2
+  cat "$output" >&2
+  return 1
+}
+
+one_session() {
+  local files
+  shopt -s nullglob globstar
+  files=("$state/run/sessions"/**/*.jsonl)
+  [[ ${#files[@]} -eq 1 ]] || { printf 'drive-resume: expected 1 session file, found %s\n' "${#files[@]}" >&2; return 1; }
+  printf '%s\n' "${files[0]}"
+}
 
 ev=$("$tty" evidence-dir yach)
 "$tty" stop "$session"
 reset_run
 write_script "$(text_round 'First answer.')"
 start_tui
-"$tty" send "$session" "first question"
-"$tty" wait "$session" 'First answer\.' 15
+ui_send "first question" 'First answer\.' 15
+ui_wait 'enter send · ctrl\+j newline' 15
+wait_completed_turn 1 'first question' "$ev/04-before-resume.json"
+session_log=$(one_session)
+cp "$session_log" "$ev/04-before-resume.jsonl"
 capture "$ev/01-first-turn.txt"
-"$tty" send "$session" "/quit"
-"$tty" wait "$session" 'Pane is dead' 10
+ui_send "/quit" 'Pane is dead' 10
 "$tty" stop "$session"
 # A resumed process does not reattach the scripted provider: it answers with
 # the built-in fixture runner ("fixture response: ..."). The drive therefore
 # checks what resume promises (prior transcript restored, the same session
 # continued) and not the second reply's text.
 start_tui --resume
-"$tty" wait "$session" 'First answer\.' 10
+ui_wait 'First answer\.' 10
 capture "$ev/02-resumed.txt"
 expect "$ev/02-resumed.txt" '› first question'
 
-"$tty" send "$session" "second question"
-"$tty" wait "$session" 'session messages: 4' 15
-"$tty" send "$session" "/status"
-"$tty" wait "$session" 'Session status' 10
+ui_send "second question" '› second question' 15
+wait_completed_turn 2 'second question' "$ev/05-after-resume.json"
+ui_wait 'enter send · ctrl\+j newline' 15
+ui_send "/status" 'Session status' 10
 capture "$ev/03-continued.txt"
-expect "$ev/03-continued.txt" '› first question'
-expect "$ev/03-continued.txt" '› second question'
+expect "$ev/03-continued.txt" 'Session status'
 expect "$ev/03-continued.txt" 'messages: 4 \(user 2, assistant 2, tool 0\)'
-sessions=$(find "$state/run/sessions" -name '*.jsonl' | wc -l)
-[[ "$sessions" -eq 1 ]] || { echo "drive-resume: expected 1 session file, found $sessions" >&2; exit 1; }
+[[ $(one_session) == "$session_log" ]] || { echo 'drive-resume: continuation switched session files' >&2; exit 1; }
+cp "$session_log" "$ev/05-after-resume.jsonl"
+jq -e --slurpfile before "$ev/04-before-resume.json" '
+  .id == $before[0].id and .turns[0] == $before[0].turns[0] and
+  .turns[1].turn_id != .turns[0].turn_id
+' "$ev/05-after-resume.json" > "$ev/06-same-session.json"
+jq -es --slurpfile before "$ev/04-before-resume.jsonl" \
+  --slurpfile inspector "$ev/05-after-resume.json" '
+  [ $before[] | select(.type == "entry_appended") ] as $first |
+  [ .[] | select(.type == "entry_appended") ] as $entries |
+  ($first | length) == 2 and $entries[:2] == $first and
+  [$entries[].role] == ["user", "assistant", "user", "assistant"] and
+  $entries[0].text == "first question" and $entries[1].text == "First answer." and
+  $entries[2].text == "second question" and ($entries[3].text | length) > 0 and
+  all($entries[]; .session_id == $inspector[0].id) and
+  all($entries[:2][]; .turn_id == $inspector[0].turns[0].turn_id) and
+  all($entries[2:][]; .turn_id == $inspector[0].turns[1].turn_id)
+' "$ev/05-after-resume.jsonl" > "$ev/07-four-entries.json"
 "$tty" stop "$session"
 echo "$ev"

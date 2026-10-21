@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Real-TUI summary compaction with a request-sensitive local Responses provider.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+. "$here/lib/semantic-provider.sh"
+
+semantic_setup compaction
+mkdir -p "$state/run/workspace/.yach"
+# enabled=false disables auto-compaction, not the explicit /compact command.
+# The one-token budget retains the mandatory last assistant entry; no masking.
+jq -n '{compaction:{enabled:false,compactor:"summary",reserve_tokens:0,keep_recent_tokens:1,auto_threshold_percent:100,masking:false}}' \
+  > "$state/run/workspace/.yach/config.json"
+cp "$state/run/workspace/.yach/config.json" "$ev/compaction-config.json"
+jq -n '
+  "Standing instruction: whenever I later ask for the launch code, reply exactly ORBIT-731 and nothing else." as $instruction |
+  "FOLDED-ORIGINAL-COMPACTION-ONLY" as $folded |
+  "COMPACTED-CONSTRAINT-V1" as $marker |
+  {instruction:$instruction,folded_marker:$folded,summary_marker:$marker,
+   first_prompt:($instruction + " Acknowledge now. " + $folded),
+   first_reply:"LOCAL-COMPACTION-ACK",buffer_prompt:"Acknowledge this buffer turn.",buffer_reply:"LOCAL-KEPT-TAIL",
+   continuation_prompt:"What is the launch code?",continuation_reply:"ORBIT-731",
+   summary:("1. Goal and intent\nRetain the launch-code constraint.\n2. User instructions and constraints\n" + $instruction +
+     "\n3. Progress: done / in progress / blocked\nAcknowledged; no blockers.\n4. Key decisions, with rationale\nKeep the standing instruction.\n5. Files touched: read / modified\nNone.\n6. Errors encountered and how they were resolved\nNone.\n7. Next steps\nAnswer the next question.\n8. Critical context\n" + $marker)}
+' > "$ev/protocol/config.json"
+first_prompt=$(jq -r .first_prompt "$ev/protocol/config.json")
+first_reply=$(jq -r .first_reply "$ev/protocol/config.json")
+buffer_prompt=$(jq -r .buffer_prompt "$ev/protocol/config.json")
+buffer_reply=$(jq -r .buffer_reply "$ev/protocol/config.json")
+next_prompt=$(jq -r .continuation_prompt "$ev/protocol/config.json")
+next_reply=$(jq -r .continuation_reply "$ev/protocol/config.json")
+
+semantic_start_tui
+# Preserve no-op as its own observation; it must never satisfy checkpoint proof.
+ui_send '/compact' 'nothing to compact yet' 15
+capture "$ev/01-empty-history-noop.txt"
+if log=$(semantic_session 2>/dev/null); then cp "$log" "$ev/noop-session.jsonl"; else : > "$ev/noop-session.jsonl"; fi
+jq -es 'all(.[]; .type != "compaction_checkpoint" and .type != "provider_attempt_finished")' "$ev/noop-session.jsonl" >/dev/null
+jq -es 'all(.[]; .method != "POST")' "$ev/protocol/requests.jsonl" >/dev/null
+
+ui_send "$first_prompt" "$first_reply" 15
+semantic_wait_turn "$first_prompt" "$first_reply"
+ui_wait 'enter send · ctrl\+j newline' 15
+capture "$ev/02-standing-instruction-turn.txt"
+ui_send "$buffer_prompt" "$buffer_reply" 15
+semantic_wait_turn "$buffer_prompt" "$buffer_reply"
+ui_wait 'enter send · ctrl\+j newline' 15
+capture "$ev/03-foldable-history.txt"
+log=$(semantic_session)
+printf '%s\n' "$log" > "$ev/original-session-path.txt"
+cp "$log" "$ev/before-compact.jsonl"
+jq -es 'all(.[]; .type != "compaction_checkpoint")' "$ev/before-compact.jsonl" >/dev/null
+
+# Wait on a stable changed footer, not the transient compaction status (a
+# following session-count update can replace it before a settled capture).
+ui_send '/compact' '⟲1' 20
+# Manual compaction has no normal turn_finished event. Its durable attempt and
+# NEW checkpoint, not the footer alone, are the completion gate.
+deadline=$((SECONDS + 15))
+until jq -es --slurpfile before "$ev/before-compact.jsonl" --slurpfile f "$ev/protocol/config.json" '
+  .[($before | length):] as $new |
+  [$new[] | select(.type == "compaction_checkpoint")] as $checkpoints |
+  ($checkpoints | length) == 1 and $checkpoints[0].compactor == "summary" and $checkpoints[0].reason == "manual" and
+  ($checkpoints[0].summary | contains($f[0].instruction)) and
+  any($new[]; .type == "provider_attempt_finished" and .purpose == "compaction_summary" and
+    .turn_id == $checkpoints[0].turn_id and .outcome == "succeeded")
+' "$log" >/dev/null; do
+  (( SECONDS < deadline )) || { echo 'drive-compaction: /compact did not persist a NEW summary checkpoint and successful summary attempt' >&2; exit 1; }
+  sleep 0.1
+done
+ui_wait 'enter send · ctrl\+j newline' 15
+capture "$ev/04-new-summary-checkpoint.txt"
+cp "$log" "$ev/after-compact.jsonl"
+
+# The new question contains neither code nor instruction. The server requires
+# the compacted system summary and excludes the original folded input.
+ui_send "$next_prompt" "$next_reply" 15
+semantic_wait_turn "$next_prompt" "$next_reply"
+ui_wait 'enter send · ctrl\+j newline' 15
+capture "$ev/05-compacted-continuation.txt"
+ui_send '/quit' 'Pane is dead' 10
+"$tty" stop "$session"
+[[ $(semantic_session) == "$log" ]] || { echo 'drive-compaction: continuation switched session files' >&2; exit 1; }
+semantic_finish "$ev/before-compact.jsonl"
+printf '%s\n' 'Local Responses summary-compaction protocol proof only; not native compaction, live-family coverage or a human assessment.' > "$ev/scope.txt"
+echo "$ev"
