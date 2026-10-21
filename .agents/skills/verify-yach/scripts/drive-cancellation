@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# A provider round that ends Cancelled leaves the turn cancelled, not failed.
+# `yach run`'s outcome document has no cancelled value (it reports the turn
+# as failed), so the session inspector is the signal.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+ev=$("$tty" evidence-dir yach)
+"$tty" stop "$session"
+reset_run
+write_script "$(cancelled_round)" "$(text_round 'retried into success')"
+
+rc=0
+yach_cli run --prompt "cancelled turn" > "$ev/01-outcome.json" 2> "$ev/01-stderr.log" || rc=$?
+echo "exit: $rc" > "$ev/01-exit.txt"
+[[ $rc -eq 1 ]] || { echo "drive-cancellation: yach run exited $rc, expected 1" >&2; cat "$ev/01-stderr.log" >&2; exit 1; }
+jq -e '.response == ""' "$ev/01-outcome.json" > /dev/null \
+  || { echo "drive-cancellation: the queued success round was used" >&2; cat "$ev/01-outcome.json" >&2; exit 1; }
+
+yach_cli sessions show latest --json > "$ev/02-session.json"
+jq -e '
+    (.turns | length) == 1
+    and .turns[0].outcome == "cancelled"
+    and ([.turns[0].items[] | select(.kind == "provider_attempt") | .attempt]
+         | length == 1
+           and .[0].outcome == "cancelled"
+           and .[0].error_kind == null)' "$ev/02-session.json" > /dev/null \
+  || { echo "drive-cancellation: session does not show one cancelled turn and attempt" >&2; jq . "$ev/02-session.json" >&2; exit 1; }
+echo "$ev"

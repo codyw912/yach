@@ -256,9 +256,9 @@ queue is empty (`crates/yach-backend/src/bench_loop.rs:106-125`).
 `ProviderStreamEvent::Failed` and `::Cancelled` already exist
 (`crates/yach-backend/src/provider.rs:352-359`), and `ProviderError` is
 serializable (`:233-239`), so a drive script can inject a failed or cancelled
-round without new harness code. Current helpers only emit text and bash
-rounds (`.agents/skills/verify-yach/scripts/lib/common.sh:39-54`). A new
-behavior is a new drive script plus a feature file (`SKILL.md:38`).
+round without new harness code. Helpers emit text, bash, failed, cancelled
+and multi-call tool rounds (`.agents/skills/verify-yach/scripts/lib/common.sh`).
+A new behavior is a new drive script plus a feature file (`SKILL.md`).
 
 ### Exists today
 
@@ -268,22 +268,17 @@ behavior is a new drive script plus a feature file (`SKILL.md:38`).
 | `scripts/drive-tool-review` | `features/tool-review.md:9-11` | Approve-once runs `wc -l notes.txt` and the transcript shows the completed command. Reject leaves `notes.txt` on disk. The file check is the proof, not the transcript text alone (`:17`). |
 | `scripts/drive-resume` | `features/resume.md:9-13` | After `/quit` and `yach tui --resume`, the prior transcript is restored before input, `/status` reports four messages, and exactly one session file remains. |
 | `scripts/drive-headless` | `features/headless.md:9-11` | `yach run` exits 0 with outcome JSON `schema: "yach-run-outcome/1"`, `outcome: "completed"`. `sessions list` shows one completed turn. `sessions show latest` shows the prompt. |
+| `scripts/drive-provider-failure` (retryable) | `features/provider-failure.md` | Injects `ProviderStreamEvent::Failed` with `ProviderErrorKind::RateLimited`. Turn ends failed, not retried into success. `yach sessions show latest --json` has one `provider_attempt` item (the inspector's view of the `ProviderAttemptFinished` event) with `error_kind` `rate_limited`. A scripted `Failed` event is not retried by the attempt layer (`docs/project/specs/2026-08-28-provider-attempt-reliability-design.md:77-81`), so this proves the terminal path, not the live retry ladder. |
+| `scripts/drive-provider-failure` (non-retryable) | `features/provider-failure.md` | Injects `ProviderStreamEvent::Failed` with `ProviderErrorKind::Authentication`. Same shape, `error_kind` `authentication`. Outcome is failed, not a retry storm. |
+| `scripts/drive-cancellation` | `features/cancellation.md` | Injects `ProviderStreamEvent::Cancelled`. The session's turn outcome is cancelled, not failed. Session attempt `outcome` is `cancelled`. `yach run`'s outcome JSON has no cancelled value and reports a provider cancellation as `failed` (`crates/yach-cli/src/headless.rs:931-934`), so the session inspector is the signal. |
+| `scripts/drive-multi-file-edit` | `features/multi-file-edit.md` | Scripted tool rounds change two workspace files and run the workspace verifier. Two paths differ from the seed, verifier command exits 0, response text is not the pass signal. The drive's own workspace is the verify-yach scratch workspace, not the ylog dogfood workspace. |
 
-The current pack is `doctor && launch && drive-prompt-reply &&
-drive-tool-review && drive-resume && drive-headless`
-(`SKILL.md:12-16`). Layer S for a portfolio re-run is that pack plus the
-four drives below, once they exist.
-
-### To build before the first live run
-
-These gate the first live run. They do not gate approval of this record.
-
-| Drive | Inject | Pass signal |
-| --- | --- | --- |
-| Provider failure, retryable | `ProviderStreamEvent::Failed` with `ProviderErrorKind::RateLimited` | Turn ends failed, not retried into success. `yach sessions show latest --json` has one `provider_attempt` item (the inspector's view of the `ProviderAttemptFinished` event) with `error_kind` `rate_limited`. A scripted `Failed` event is not retried by the attempt layer (`docs/project/specs/2026-08-28-provider-attempt-reliability-design.md:77-81`), so this proves the terminal path, not the live retry ladder. |
-| Provider failure, non-retryable | `ProviderStreamEvent::Failed` with `ProviderErrorKind::Authentication` | Same shape, `error_kind` `authentication`. Outcome is failed, not a retry storm. |
-| Cancellation | `ProviderStreamEvent::Cancelled` | The session's turn outcome is cancelled, not failed. Session attempt `outcome` is `cancelled`. `yach run`'s outcome JSON has no cancelled value and reports a provider cancellation as `failed` (`crates/yach-cli/src/headless.rs:931-934`), so the session inspector is the signal. |
-| Two-file edit + verifier | Scripted tool rounds that change two workspace files and run the workspace verifier | Two paths differ from the seed, verifier command exits 0, response text is not the pass signal. The drive's own workspace is the verify-yach scratch workspace, not the ylog dogfood workspace. |
+The full pack is `doctor && launch && drive-prompt-reply &&
+drive-tool-review && drive-resume && drive-headless &&
+drive-provider-failure && drive-cancellation && drive-multi-file-edit`
+(`SKILL.md:12-16`). All four previously missing coverage rows now exist,
+implemented by the three new scripts under
+`docs/project/plans/2026-10-20-m1-scripted-drives.md`.
 
 Retry policy, for reading the live session later: at most three attempts,
 delays of 1s then 2s, 30s cumulative cap; timeout, network, rate limit, and
@@ -596,8 +591,8 @@ those scenarios. S3 is recorded and does not block the cohort gate.
 
 A portfolio re-run is:
 
-1. the scripted pack (the four drives that exist today, plus the four drives
-   listed under "To build", once they exist), and
+1. the full scripted pack under "Exists today", including the drives from
+   `docs/project/plans/2026-10-20-m1-scripted-drives.md`, and
 2. every live scenario with S1 or S2, regardless of failure class or whether
    a prerequisite blocked the prior run, and every live scenario whose
    previous result was `reproducible` or `intermittent-valid`.
@@ -682,13 +677,14 @@ Still in force after the owner decisions:
 
 ## Follow-up, not this record
 
-Implementing the four missing drives (retryable failure, non-retryable
-failure, cancellation, two-file edit plus verifier) is a later change. It
-blocks the first live run. It does not block approval of this record.
+The four scripted coverage rows (retryable failure, non-retryable failure,
+cancellation, two-file edit plus verifier) now exist under
+`docs/project/plans/2026-10-20-m1-scripted-drives.md`. They no longer block
+the first live run; run the full pack before the cohort.
 
 Kata `yach#q6rj` (anthropic Bearer auth for the gateway) landed on
 2026-10-20 (#331, `4b95c442`). It no longer blocks the anthropic half of the
-live cohort; both halves now wait on the four drives to start.
+live cohort. Both families can start once the full scripted pack passes.
 
 Classifying the gateway's unknown-model response as `unavailable_model`
 (the known S2 under Provider failure) is cohort-1 work. It does not block the

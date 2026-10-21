@@ -48,6 +48,35 @@ bash_round() {
            tool_call: {call_id: "call-1", name: "bash", arguments_json: {command: $cmd}}}, $c]'
 }
 
+# One provider round that fails with a ProviderErrorKind, given in its
+# serialized snake_case form (rate_limited, authentication, ...).
+failed_round() {
+  jq -cn --arg k "$1" --argjson s "$started" \
+    '[$s, {type: "failed", turn_id: "turn-1",
+           error: {kind: $k, message: ("scripted " + $k), redacted_debug: null}}]'
+}
+
+# One provider round that the provider ends as cancelled.
+cancelled_round() {
+  jq -cn --argjson s "$started" \
+    '[$s, {type: "cancelled", turn_id: "turn-1", reason: "scripted cancellation"}]'
+}
+
+# One provider round that requests every tool call in a JSON array of
+# {call_id, name, arguments_json} objects.
+tool_round() {
+  jq -cn --argjson calls "$1" --argjson s "$started" --argjson c "$completed" \
+    '[$s] + [$calls[] | {type: "tool_call_completed", turn_id: "turn-1", tool_call: .}] + [$c]'
+}
+
+# The snapshot tag hashline_read mints for a file ([path#TAG]): the first 16
+# hex digits, uppercase, of the SHA-256 of its LF-normalized text. Seeds
+# written with LF need no normalization. macOS has shasum, not sha256sum.
+file_tag() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi \
+    | cut -c1-16 | tr a-f A-F
+}
+
 # Write the reply script from rounds given as arguments.
 write_script() {
   jq -cs . <<<"$(printf '%s\n' "$@")" > "$state/run/script.json"

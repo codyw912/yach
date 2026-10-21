@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# A scripted provider failure ends the turn failed, with no retry into the
+# success round queued behind it. Covers one retryable kind (rate_limited)
+# and one non-retryable kind (authentication). A Failed event inside a
+# provider round is terminal by design (the attempt layer retries request
+# errors, not provider-emitted failures), so this proves the terminal path
+# and its session evidence, not the live retry ladder.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+
+ev=$("$tty" evidence-dir yach)
+"$tty" stop "$session"
+
+n=0
+for kind in rate_limited authentication; do
+  n=$((n + 1))
+  reset_run
+  write_script "$(failed_round "$kind")" "$(text_round 'retried into success')"
+
+  rc=0
+  yach_cli run --prompt "provider failure $kind" > "$ev/0$n-$kind-outcome.json" 2> "$ev/0$n-$kind-stderr.log" || rc=$?
+  echo "exit: $rc" > "$ev/0$n-$kind-exit.txt"
+  [[ $rc -eq 1 ]] || { echo "drive-provider-failure: $kind: yach run exited $rc, expected 1 (failed)" >&2; cat "$ev/0$n-$kind-stderr.log" >&2; exit 1; }
+  jq -e '.outcome == "failed" and .response == ""' "$ev/0$n-$kind-outcome.json" > /dev/null \
+    || { echo "drive-provider-failure: $kind: unexpected outcome document" >&2; cat "$ev/0$n-$kind-outcome.json" >&2; exit 1; }
+
+  yach_cli sessions show latest --json > "$ev/0$n-$kind-session.json"
+  jq -e --arg k "$kind" '
+      (.turns | length) == 1
+      and .turns[0].outcome == "failed"
+      and ([.turns[0].items[] | select(.kind == "provider_attempt") | .attempt]
+           | length == 1
+             and .[0].outcome == "failed"
+             and .[0].error_kind == $k
+             and .[0].retry_index == 0)' "$ev/0$n-$kind-session.json" > /dev/null \
+    || { echo "drive-provider-failure: $kind: session does not show one failed $kind attempt" >&2; jq . "$ev/0$n-$kind-session.json" >&2; exit 1; }
+done
+echo "$ev"
