@@ -88,6 +88,57 @@ reset_run() {
   mkdir -p "$state/run/home" "$state/run/sessions" "$state/run/workspace"
 }
 
+# UI checks never consult scrollback. Two equal matching frames, sampled
+# apart, prevent a transient render from satisfying the wait. Actions also
+# require that the settled frame differs from their pre-action frame.
+# Patterns retain grep -E's per-line semantics, including ^ and $ anchors.
+ui_frame() { tmux -L "sjujp-verify-$session" capture-pane -p -t "$session"; }
+
+# Private arguments: pattern, timeout, require-change, pre-action frame,
+# optional second pattern (startup requires model and composer together).
+_ui_wait() {
+  local pattern=$1 seconds=$2 changed=$3 before=${4-} also=${5-}
+  local frame previous='' matched=0 description='settled frame matching'
+  local deadline=$((SECONDS + seconds))
+  if (( changed )); then description="changed $description"; fi
+  while (( SECONDS < deadline )); do
+    frame=$(ui_frame) || return
+    if { (( !changed )) || [[ "$frame" != "$before" ]]; } \
+      && grep -Eq -- "$pattern" <<< "$frame" \
+      && { [[ -z "$also" ]] || grep -Eq -- "$also" <<< "$frame"; }; then
+      if (( matched )) && [[ "$frame" == "$previous" ]]; then return 0; fi
+      matched=1
+    else
+      matched=0
+    fi
+    previous=$frame
+    sleep 0.2
+  done
+  printf 'verify-yach: timed out after %ss waiting for %s /%s/%s; current pane:\n' \
+    "$seconds" "$description" "$pattern" "${also:+ and /$also/}" >&2
+  ui_frame >&2 || true
+  return 1
+}
+
+# Public UI API: ui_wait PATTERN [SECONDS], ui_send TEXT PATTERN [SECONDS],
+# ui_keys PATTERN KEY... . All default to 10 seconds.
+ui_wait() { _ui_wait "$1" "${2:-10}" 0; }
+
+ui_send() {
+  local text=$1 pattern=$2 seconds=${3:-10} before
+  before=$(ui_frame) || return
+  "$tty" send "$session" "$text" || return
+  _ui_wait "$pattern" "$seconds" 1 "$before"
+}
+
+ui_keys() {
+  local pattern=$1 before
+  shift
+  before=$(ui_frame) || return
+  "$tty" keys "$session" "$@" || return
+  _ui_wait "$pattern" 10 1 "$before"
+}
+
 # Start the TUI in the private tmux session against the current run state.
 start_tui() {
   "$tty" start "$session" "$state/run/workspace" env -i \
@@ -95,7 +146,7 @@ start_tui() {
     YACH_SESSION_DIR="$state/run/sessions" \
     YACH_RIG_PROVIDER=scripted YACH_BENCH_SCRIPT="$state/run/script.json" \
     "$(yach_bin)" tui "$@"
-  "$tty" wait "$session" 'scripted-model' 30
+  _ui_wait 'scripted-model' 30 0 '' 'enter send · ctrl\+j newline'
 }
 
 # Run yach as a CLI with the same isolated environment.
@@ -107,7 +158,7 @@ yach_cli() {
     "$(yach_bin)" "$@")
 }
 
-capture() { "$tty" capture "$session" "$1"; }
+capture() { ui_frame > "$1"; }
 
 # Fail unless the file contains the extended regex.
 expect() {

@@ -14,13 +14,11 @@ reset_run
 printf 'one\ntwo\nthree\n' > "$ws/notes.txt"
 write_script "$(bash_round 'wc -l notes.txt')" "$(text_round 'Counted the lines.')"
 start_tui
-"$tty" send "$session" "count the lines"
-"$tty" wait "$session" 'Approve once' 15
+ui_send "count the lines" 'Approve once' 15
 capture "$ev/01-review-pending.txt"
 expect "$ev/01-review-pending.txt" 'Review: pending'
 expect "$ev/01-review-pending.txt" 'Command: wc -l notes\.txt'
-"$tty" keys "$session" Enter
-"$tty" wait "$session" 'Counted the lines\.' 15
+ui_keys 'Counted the lines\.' Enter
 capture "$ev/02-approved.txt"
 expect "$ev/02-approved.txt" 'review approved'
 expect "$ev/02-approved.txt" '3 notes\.txt'
@@ -31,12 +29,9 @@ reset_run
 printf 'keep me\n' > "$ws/notes.txt"
 write_script "$(bash_round 'rm notes.txt')" "$(text_round 'Left the file alone.')"
 start_tui
-"$tty" send "$session" "delete the notes"
-"$tty" wait "$session" 'Approve once' 15
-"$tty" keys "$session" Down Down
-"$tty" wait "$session" '› Reject' 5
-"$tty" keys "$session" Enter
-"$tty" wait "$session" 'Left the file alone\.' 15
+ui_send "delete the notes" 'Approve once' 15
+ui_keys '› Reject' Down Down
+ui_keys 'Left the file alone\.' Enter
 capture "$ev/03-rejected.txt"
 expect "$ev/03-rejected.txt" 'review rejected'
 expect "$ev/03-rejected.txt" 'user_rejected'

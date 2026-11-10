@@ -12,8 +12,19 @@ start_tui
 capture "$ev/01-started.txt"
 expect "$ev/01-started.txt" 'approval:review'
 
-"$tty" send "$session" "say hello"
-"$tty" wait "$session" 'session messages: 2' 15
+ui_send "say hello" '- second item' 15
+deadline=$((SECONDS + 15))
+completed=0
+while (( SECONDS < deadline )); do
+  yach_cli sessions show latest --json > "$ev/04-session.json"
+  if jq -e '
+    (.warnings | length) == 0 and (.turns | length) == 1 and
+    .turns[0].prompt == "say hello" and .turns[0].outcome == "completed"
+  ' "$ev/04-session.json" >/dev/null; then completed=1; break; fi
+  sleep 0.1
+done
+[[ $completed -eq 1 ]] || { echo 'drive-prompt-reply: reply did not complete durably' >&2; cat "$ev/04-session.json" >&2; exit 1; }
+ui_wait 'enter send · ctrl\+j newline' 15
 capture "$ev/02-reply.txt"
 expect "$ev/02-reply.txt" '› say hello'
 expect "$ev/02-reply.txt" '• Verify heading'
@@ -25,8 +36,7 @@ if grep -Eq '\*\*bold\*\*|## Verify' "$ev/02-reply.txt"; then
   exit 1
 fi
 
-"$tty" send "$session" "/status"
-"$tty" wait "$session" 'Session status' 10
+ui_send "/status" 'Session status' 10
 capture "$ev/03-status.txt"
 expect "$ev/03-status.txt" 'messages: 2 \(user 1, assistant 1, tool 0\)'
 expect "$ev/03-status.txt" 'approval: review'

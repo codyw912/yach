@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Real-TUI local Responses protocol proof, not live-provider family coverage.
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
+. "$here/lib/semantic-provider.sh"
+
+semantic_setup resume
+jq -n '{first_prompt:"Remember the violet notebook for this session.",first_reply:"LOCAL-RESUME-FIRST-OK",continuation_prompt:"Which notebook did we discuss before restarting?",continuation_reply:"LOCAL-RESUME-HISTORY-OK"}' > "$ev/protocol/config.json"
+first_prompt=$(jq -r .first_prompt "$ev/protocol/config.json")
+first_reply=$(jq -r .first_reply "$ev/protocol/config.json")
+next_prompt=$(jq -r .continuation_prompt "$ev/protocol/config.json")
+next_reply=$(jq -r .continuation_reply "$ev/protocol/config.json")
+
+semantic_start_tui
+ui_send "$first_prompt" "$first_reply" 15
+semantic_wait_turn "$first_prompt" "$first_reply"
+ui_wait 'enter send · ctrl\+j newline' 15
+capture "$ev/01-first-provider-turn.txt"
+log=$(semantic_session)
+printf '%s\n' "$log" > "$ev/original-session-path.txt"
+cp "$log" "$ev/before-resume.jsonl"
+ui_send '/quit' 'Pane is dead' 10
+"$tty" stop "$session"
+
+# Resume must restore transcript before input. This recovery recipe explicitly
+# reselects the advertised local provider; it does not claim automatic restore.
+semantic_start_tui --resume
+ui_wait "$first_reply" 15
+capture "$ev/02-restored-before-input.txt"
+expect "$ev/02-restored-before-input.txt" '› Remember the violet notebook for this session\.'
+expect "$ev/02-restored-before-input.txt" "$first_reply"
+[[ $(semantic_session) == "$log" ]] || { echo 'drive-provider-resume: resume switched session files' >&2; exit 1; }
+jq -es --arg next "$next_prompt" 'all(.[]; .type != "entry_appended" or .text != $next)' "$log" >/dev/null
+cp "$log" "$ev/restored-before-input.jsonl"
+
+# The observed automatic resume restored transcript/model text but left no
+# provider configured. Re-activate through the real selector, never fixture echo.
+ui_send '/model' 'Select Model' 15
+# A blank query shows curated models only; the unknown local fixture is in the
+# complete discovered list, which the product exposes through nonempty search.
+ui_keys '▸ .*gpt-fixture.*\[Environment\]' g p t - f i x t u r e
+capture "$ev/03-local-model-reselection.txt"
+ui_keys 'Thinking Level' Enter
+ui_wait '▸ ● off' 15
+capture "$ev/04-thinking-off-confirmation.txt"
+ui_keys 'enter send · ctrl\+j newline' Enter
+ui_wait 'enter send · ctrl\+j newline' 15
+deadline=$((SECONDS + 15))
+until jq -es --slurpfile restored "$ev/restored-before-input.jsonl" '
+  .[($restored | length):] |
+  any(.[]; .type == "session_model_changed" and .source == "explicit" and
+    .target.provider == "openai" and .target.model == "gpt-fixture" and .target.connection_id == "environment")
+' "$log" >/dev/null; do
+  (( SECONDS < deadline )) || { echo 'drive-provider-resume: explicit local provider selection did not persist' >&2; exit 1; }
+  sleep 0.1
+done
+capture "$ev/05-provider-reactivated.txt"
+cp "$log" "$ev/after-reselection.jsonl"
+
+ui_send "$next_prompt" "$next_reply" 15
+semantic_wait_turn "$next_prompt" "$next_reply"
+ui_wait 'enter send · ctrl\+j newline' 15
+capture "$ev/06-provider-continuation.txt"
+ui_send '/quit' 'Pane is dead' 10
+"$tty" stop "$session"
+[[ $(semantic_session) == "$log" ]] || { echo 'drive-provider-resume: continuation switched session files' >&2; exit 1; }
+semantic_finish "$ev/before-resume.jsonl"
+printf '%s\n' 'Local Responses protocol proof only; no live-family coverage. Provider continuation after resume REQUIRES explicit /model re-selection of Environment gpt-fixture. This is recovery, not automatic provider restoration.' > "$ev/scope.txt"
+echo "$ev"
