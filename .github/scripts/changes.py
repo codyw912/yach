@@ -2,33 +2,32 @@
 
 Reads changed paths, one per line, on stdin and prints `code=true` or
 `code=false` for `$GITHUB_OUTPUT`. A path is docs when its first matching
-`[[rule]]` in `.sjujperpowers/risk.toml` has tier `low` (today `docs/**`,
-`*.md`, `evals/**/*.md`) and it is not protected: verifying-by-risk's
-built-in protected paths, the policy's `protected` list, or anything under
-`.github/`. The pull request is docs-only when every path is docs. An empty
-list counts as code.
+`[[rule]]` in `.github/risk.toml` has tier `low` (today `docs/**`, `*.md`,
+`evals/**/*.md`) and it is not protected: the built-in protected paths
+below, the policy's `protected` list, or anything under `.github/`. The
+pull request is docs-only when every path is docs. An empty list counts as
+code.
 
 CI runs the base revision's copy of this script against the base revision's
-`risk.toml`, so a pull request cannot reclassify itself. Globs follow the
-risk policy: matched against the full repository-relative path, `*` and `?`
-stay within one path segment, `**/` matches zero or more directories, and
-`dir/**` matches everything under `dir`. So `*.md` is top-level only.
+`risk.toml`, so a pull request cannot reclassify itself. Globs are matched
+against the full repository-relative path, `*` and `?` stay within one path
+segment, `**/` matches zero or more directories, and `dir/**` matches
+everything under `dir`. So `*.md` is top-level only.
 """
 
 import re
 import sys
 import tomllib
 
-# verifying-by-risk's built-ins (hk-conventions.md, "Protected paths"), plus
-# everything under .github/: workflow helpers such as this script decide
-# what CI runs.
+# Files that configure or drive the repository's checks, plus everything
+# under .github/: the risk policy itself and workflow helpers such as this
+# script decide what CI runs.
 BUILTIN_PROTECTED = (
     "hk.pkl",
     ".config/hk.pkl",
     ".hk/**",
     "nix/hk.nix",
     "scripts/update-hk",
-    ".sjujperpowers/risk.toml",
     ".agents/skills/verify-*/SKILL.md",
     ".agents/skills/verify-*/features/**",
     ".agents/skills/verify-*/scripts/**",
@@ -91,7 +90,7 @@ def is_code(paths: list[str], policy: Policy) -> bool:
 
 
 def main() -> None:
-    risk_toml = sys.argv[1] if len(sys.argv) > 1 else ".sjujperpowers/risk.toml"
+    risk_toml = sys.argv[1] if len(sys.argv) > 1 else ".github/risk.toml"
     with open(risk_toml, "rb") as f:
         policy = Policy(tomllib.load(f))
     paths = [line for line in sys.stdin.read().splitlines() if line]

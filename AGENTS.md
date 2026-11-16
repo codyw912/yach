@@ -85,7 +85,7 @@ environment variables are stripped from subprocesses.
   secret to a subprocess, log, or transcript. Safe path: go through the
   existing seams (`edit_access`, `review`, `permission`, `sensitive_paths`,
   `shell`).
-- Changes to the high-tier paths in `.sjujperpowers/risk.toml` (permissions,
+- Changes to the high-tier paths in `.github/risk.toml` (permissions,
   sandboxing, credentials, extensions, vendored or containerised code) need a
   test that the unsafe case is refused, not only that the allowed case works.
   A missing refusal test is P1.

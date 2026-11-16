@@ -13,7 +13,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 root=$(cd "$here/../../../.." && pwd)
 tty="$here/lib/tmux-tty.sh"
 session=yach
-state="${XDG_STATE_HOME:-$HOME/.local/state}/sjujperpowers/verify-yach"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/verify-yach"
 bin_file="$state/binary"
 
 # The scripted provider exists only in `--features bench` builds. devenv

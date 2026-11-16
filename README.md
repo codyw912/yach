@@ -504,14 +504,27 @@ Hook definitions live in `devenv.nix`. Shell entry regenerates
 shared hooks also work in linked worktrees. Change the Nix definitions rather than
 editing the generated file, and commit both when hook behavior changes.
 
-Static checks (`cargo fmt --check`, Clippy with `-D warnings`) are also declared
-for [hk](https://hk.jdx.dev) in `hk.pkl`, which amends the template base
-`.hk/base/rust.pkl`. The dev shell provides the pinned hk binary from
-`nix/hk.nix`. Agents run them through sjujperpowers' `verifying-by-risk`
-`scripts/hk-check`, which ignores local overrides; hk's git hooks are not
+Before handing off a change, run the repository's checks directly:
+`just fmt-check`, `just lint` (toolchain pin check plus Clippy with
+`-D warnings`), and `just test`. Changes to what yach does on screen also get
+an end-to-end drive with the project skill `.agents/skills/verify-yach/`. Agents
+on the maintainer's hosts reach these through cstack's `verify` skill, publish
+through cstack's `ship` and `land` with the host's
+`governed-github-publication` rules, and plan through cairn (`roadmap`,
+`outcome`) against the Linear project; none of that tooling is required to
+contribute.
+
+The same static checks (`cargo fmt --check`, Clippy with `-D warnings`) are
+also declared for [hk](https://hk.jdx.dev) in `hk.pkl`, which amends the
+template base `.hk/base/rust.pkl`. The dev shell provides the pinned hk binary
+from `nix/hk.nix`; `just dev hk check --all` runs them. hk's git hooks are not
 installed, and tests stay in `just test`. Re-pin hk with
 `bash scripts/update-hk [vX.Y.Z]`, which updates the binary hashes and the hk
 Config package version together; do not use `devenv update` for it.
+
+`.github/risk.toml` assigns paths a risk tier. CI's `Changes` job reads it to
+skip the Rust and perf jobs on docs-only pull requests, and the review rules in
+`AGENTS.md` name its high-tier paths.
 
 The runtime image in `containers/yach-runtime/` and evaluation containers remain
 supported. The old
