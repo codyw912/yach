@@ -30,7 +30,7 @@ tmux + Node + Chromium for `just tui-themes`.
 **Spec:** `docs/project/specs/2026-10-17-composer-styles-design.md`
 (approved 2026-10-18).
 
-**Source:** linear:CEW-266
+**Source:** Calm composer styles
 
 ## Global Constraints
 

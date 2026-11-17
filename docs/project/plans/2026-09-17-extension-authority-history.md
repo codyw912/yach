@@ -12,7 +12,7 @@
 
 Implements its 2026-09-17 amendment, especially Evidence onward.
 
-**Source:** plane:YACH-10
+**Source:** Extension capability contract
 
 ## Global Constraints
 
@@ -257,7 +257,7 @@ Run `just perf --filter 'extension/*'`. In a throwaway in-environment probe, mea
 
 - [ ] **Step 4 — Final review and completion.** Commit the actual doc files with `jj commit docs/extensions.md docs/protocol/yach-proto-v0.md -m 'Document extension lifecycle and retained authority evidence'`. Request a whole-branch review covering state/history atomicity, legacy parser discrimination, native callers, real-policy advertising, revoke/read semantics, discovery scope preservation and truthful failures. Address Critical/Important findings with scoped re-review and rerun affected checks. Preserve all proof artifacts in the normal ignored execution workspace; no new status/roadmap files.
 
-Publication requires `agent-github-publication-plan <bookmark> origin` and public-repository operator approval. Do not reuse expired approval or push main. After PR creation, close verified new-plan children, verify blockers, then close the new parent and the original yach#wc3k/yach#528c only when their amended acceptance is actually met. Update YACH-10 with evidence and the exact PR URL; completion does not imply merge. Inspect `jj log -r 'main..@'`, leave a clean described stack, and run standalone foreground `agent-checkpoint push` last. Include its printed reference and PR URL in the handoff.
+Publication requires `agent-github-publication-plan <bookmark> origin` and public-repository operator approval. Do not reuse expired approval or push main. After PR creation, close verified new-plan children, verify blockers, then close the new parent and the original yach#wc3k/yach#528c only when their amended acceptance is actually met. Update the extension capability contract outcome with evidence and the exact PR URL; completion does not imply merge. Inspect `jj log -r 'main..@'`, leave a clean described stack, and run standalone foreground `agent-checkpoint push` last. Include its printed reference and PR URL in the handoff.
 
 ## Coverage Map
 

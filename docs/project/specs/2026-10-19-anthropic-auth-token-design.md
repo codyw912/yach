@@ -1,6 +1,6 @@
 # Anthropic Auth Token
 
-**Outcome:** linear:CEW-147 (kata `yach#q6rj`)
+**Outcome:** M1 dogfood outcome (roadmap milestone 1, Evidence-driven dogfood loop) (kata `yach#q6rj`)
 
 Status: approved by the owner, 2026-10-19 ("go ahead through to a PR"). Owner
 decisions the same day: patch the vendored Rig so each request carries
@@ -23,7 +23,7 @@ subscription gateway (`http://omp-subscriptions.home.lan:4000`) answers
 | both | 200 |
 
 Other clients reach the gateway because they send `ANTHROPIC_AUTH_TOKEN` as a
-Bearer token. The M1 dogfood live cohort (CEW-147) needs Anthropic through
+Bearer token. The M1 dogfood live cohort needs Anthropic through
 this gateway, so yach must be able to do the same.
 
 A second gap blocks stored connections specifically. The gateway's

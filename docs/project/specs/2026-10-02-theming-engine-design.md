@@ -1,12 +1,12 @@
 # Theming Engine
 
-**Outcome:** plane:YACH-20 (kata `yach#vadv`)
+**Outcome:** TUI theming engine (kata `yach#vadv`)
 
 Status: approved by the owner, 2026-10-06. Open questions 1-8 resolved on
 2026-10-02 and 2026-10-06. Bundled named palettes added 2026-10-06 from
 `docs/project/records/2026-10-06-theme-engine-survey.md`.
 
-Triggered by dogfooding (plane:YACH-19): successful tool results render as a
+Triggered by dogfooding (the daily-use TUI fixes): successful tool results render as a
 dark green band with gray text. Owner direction, 2026-10-02: "a cohesive
 theming engine, though simple/minimal for now", "customizable and controllable
 by extensions", light terminals and `NO_COLOR` included, and "some visual
@@ -57,7 +57,7 @@ date. Claims about other projects cite a URL and were read on 2026-10-02.
   preset uses only terminal-relative colors and is the answer for limited
   terminals. See Open questions.
 - No syntax-highlight or markdown token families. Markdown theming belongs to
-  the markdown work (plane:YACH-19) and consumes the roles defined here.
+  the markdown work (the daily-use TUI fixes) and consumes the roles defined here.
 - No runtime theme protocol between extension hosts and the UI in this slice.
   The seam is described under Deferred.
 - No change to approval, trust, capability, or review semantics.
@@ -456,7 +456,7 @@ table, following existing data embedding (`crates/yach-catalog/src/lib.rs:238`).
 Startup parses only the selected file, through the same `from_json` path as a
 user file, into the existing `Copy` `Theme`; rendering stays field reads.
 Embedded JSON is about 1-1.5 KiB per palette, roughly 25 KiB in total
-`[INFERENCE: estimated, measure against the binary size gate, plane:YACH-13]`.
+`[INFERENCE: estimated, measure against the binary size gate]`.
 
 **Attribution.** `crates/yach-ui/themes/NOTICE.md` lists, per palette, the
 scheme author, upstream project and URL, upstream license, and the pinned
@@ -702,7 +702,7 @@ Concrete layout (a panel is one row of rule plus the existing padded surface):
    from the tool defaults.
 3. Tool treatment in `transcript.rs` (`render_tool_surface`, `tool_background`,
    `1073-1075`, `1181-1191`): rename to state-based and add the rule column.
-   `transcript.rs` is also being edited by plane:YACH-19's markdown and layout
+   `transcript.rs` is also being edited by the daily-use TUI fixes' markdown and layout
    work; land this step after those changes merge to avoid conflicts.
 4. CLI: `resolve_theme`, `NO_COLOR`, presets, `COLORFGBG` (`main.rs:425-450`,
    `3762-3772`); extend the existing precedence test (`main.rs:6019-6043`).

@@ -1,6 +1,6 @@
 # Performance Measurement Framework Design
 
-**Outcome:** plane:YACH-8
+**Outcome:** Performance measurement framework
 
 Status: accepted 2026-09-08 (owner decision in session)
 Date: 2026-09-08
@@ -275,7 +275,7 @@ stages: pre-merge, `just perf` against current `main` resolves to
 other row `no_base_worker`; that run is the acceptance smoke for the
 implementation. The full worker-mode self-comparison (`@ == main`, all
 `unchanged`) is only possible once the framework is on `main` and is
-tracked as a post-merge check on the Plane outcome, not as a pre-handoff
+tracked as a post-merge check on the outcome, not as a pre-handoff
 gate. Until it runs, "every change proves its delta" holds only for the
 five rows above.
 
@@ -527,7 +527,7 @@ profile (5 scenarios × phases).
   prints `base-mode: external`, gives verdicts for exactly the five
   shipping-binary rows, and reports the rest `no_base_worker`; recorded in
   the baseline report.
-- Post-merge check (Plane YACH-8, not pre-handoff): `just perf --filter
+- Post-merge check (performance measurement framework work, not pre-handoff): `just perf --filter
   'request/*'` with `@ == main` reports every workload `unchanged`.
 
 ## Non-goals

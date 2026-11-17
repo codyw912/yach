@@ -1,6 +1,6 @@
 # Distribution Presets and Reference Components
 
-**Outcome:** plane:YACH-12
+**Outcome:** Distribution presets
 
 Status: draft for owner review, 2026-09-27.
 
@@ -53,9 +53,9 @@ Deliver:
   component; no new host message, hook, or interceptor is added.
 - Keeps the coordinated-replacement rules of the hashline bundle design
   (`2026-08-21-hashline-extension-bundle-design.md:215-222`) unchanged.
-- Skills are specified separately (plane:YACH-14). This spec reserves a
+- Skills are specified separately in the Agent Skills format. This spec reserves a
   `skill-index` component slot for them.
-- Binary-size targets per preset and release-profile tuning are plane:YACH-13.
+- Binary-size targets per preset and release-profile tuning are part of the binary size gate work.
 
 ## Layers
 
@@ -84,7 +84,7 @@ First-party, versioned with the binary, each toggled as one unit.
 | `baseline-guidance` | The text now in `PROVIDER_BASELINE_GUIDANCE`, as the separate leading system message | In-process, gated per request |
 | `hashline` | Coordinated replacement of `read_text_file` / `edit_text_file` | Existing subprocess extension, unchanged |
 | `jev-reviewer` | Automatic-review reviewer | Existing subprocess extension, unchanged |
-| `skill-index` | Reserved for plane:YACH-14 | Defined by the skills spec |
+| `skill-index` | Reserved for skills in the Agent Skills format | Defined by the skills spec |
 
 `project-tools` stays in-process under the posture spec's measured-performance
 exception. The 2026-09-12 baseline measures a four-tool-call scripted turn at
@@ -111,7 +111,7 @@ records, trust gating, and capability grants.
 A preset is a named set of components. The term is deliberately not
 "profile": yach already uses model profile for catalog resolution
 (`yach_catalog::ModelProfile`), and Cargo profiles are a separate build
-concept (plane:YACH-13). Two presets ship:
+concept (covered by the binary size gate work). Two presets ship:
 
 | Preset | Components |
 |---|---|
@@ -310,7 +310,7 @@ succeeds.
 
 The size effect is small (hashline and Jev are ~100 KB of symbols together);
 the purpose is that a core build contains no first-party extension code at all.
-Size targets are plane:YACH-13.
+Size targets are part of the binary size gate work.
 
 ## Acceptance
 
@@ -345,8 +345,8 @@ Covered by the stdio RPC invariant matrix unless noted:
 
 ## Out of scope
 
-- Skills and the `yach-guide` skill (plane:YACH-14).
-- Per-preset size targets and release-profile tuning (plane:YACH-13).
+- Skills and the `yach-guide` skill.
+- Per-preset size targets and release-profile tuning.
 - A compaction interceptor or any other new interceptor phase.
 - Provider adapters as extensions.
 - Project-scoped component restrictions and in-session component toggling.

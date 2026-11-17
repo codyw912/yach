@@ -1,8 +1,8 @@
 # Approval Cohort Refresh
 
-Date: 2026-10-02. Outcome: plane:YACH-18.
+Date: 2026-10-02. Outcome: Cohesive approval design.
 
-Refreshes `2026-08-24-approval-modes-cohort-research.md` for the YACH-18
+Refreshes `2026-08-24-approval-modes-cohort-research.md` for the cohesive approval
 design: what posture each harness gives a new user, what runs without a
 prompt, and what makes that safe (or doesn't). Adds the two rewrites in
 progress, opencode v2 (beta) and omp² (`omp2` branch). Evidence, not a
@@ -23,7 +23,7 @@ selected design.
 Per-harness notes with `path:line` citations were collected under
 `.sjujperpowers/research/2026-10-02-cohort-{established,opencode-v2,omp2}.md`
 (local, not versioned); the claims below are the ones that matter for
-YACH-18.
+the cohesive approval design.
 
 ## Corrections to the 2026-08-24 record
 
@@ -153,7 +153,7 @@ recorded separately:
   unix sockets, so a full network cutoff still needs a network namespace
   (bubblewrap `--unshare-net`) or seccomp.
 
-## What this means for YACH-18
+## What this means for the cohesive approval design
 
 Evidence, not decisions:
 

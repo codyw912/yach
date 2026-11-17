@@ -216,7 +216,7 @@ internal shapes" (`:69`).
 ## Open questions for the owner
 
 1. Is a user-facing observer worth a spec now (M5 extension platform, with an
-   M1 evidence hook), or only a Plane item to revisit after the TUI fixes land?
+   M1 evidence hook), or only a roadmap item to revisit after the TUI fixes land?
 2. Should observer notices be allowed to reach the main agent, and if so only
    by explicit user action (Claude Code, Pi) or automatically (omp)?
 3. First-party: should yach ship a reference observer (for example on the

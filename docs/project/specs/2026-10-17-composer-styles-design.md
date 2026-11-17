@@ -1,6 +1,6 @@
 # Composer Styles
 
-**Outcome:** linear:CEW-266 (kata `yach#cwte`)
+**Outcome:** Calm composer styles (kata `yach#cwte`)
 
 Status: approved by the owner, 2026-10-18. Open questions resolved the same
 day: `NO_COLOR` keeps the theme file's layout (option b below), and the key

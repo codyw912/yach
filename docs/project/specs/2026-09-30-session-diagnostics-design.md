@@ -1,6 +1,6 @@
 # Session Diagnostics Design
 
-**Outcome:** plane:YACH-15
+**Outcome:** Diagnosable dogfood sessions
 
 Status: accepted in conversation 2026-09-30; written for owner review.
 

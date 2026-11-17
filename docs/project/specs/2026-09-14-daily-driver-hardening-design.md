@@ -2,7 +2,7 @@
 
 Status: proposed 2026-09-14
 
-Outcome: plane:YACH-1 (M1: Evidence-driven dogfood loop)
+Outcome: M1 dogfood outcome (roadmap milestone 1, Evidence-driven dogfood loop)
 
 ## Motivation
 

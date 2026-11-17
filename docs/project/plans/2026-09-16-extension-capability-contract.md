@@ -18,7 +18,7 @@ manifest the user consented to.
 
 **Spec:** `docs/project/specs/2026-09-16-extension-capability-contract-design.md`
 
-**Source:** plane:YACH-10
+**Source:** Extension capability contract
 
 ## Global Constraints
 

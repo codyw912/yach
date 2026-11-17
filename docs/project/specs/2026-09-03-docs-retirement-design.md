@@ -1,6 +1,6 @@
 # Docs Retirement Design
 
-**Outcome:** plane:YACH-7
+**Outcome:** Retire in-repo planning docs
 
 Status: accepted 2026-09-03 (owner decision in session)
 Date: 2026-09-03

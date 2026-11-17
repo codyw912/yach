@@ -34,7 +34,7 @@ tokio.
 
 **Spec:** `docs/project/specs/2026-09-30-session-diagnostics-design.md`
 
-**Source:** plane:YACH-15
+**Source:** Diagnosable dogfood sessions
 
 ## Global Constraints
 

@@ -1,6 +1,6 @@
 # Auto-Review Signals, Routing, and Evaluation
 
-**Outcome:** plane:YACH-11
+**Outcome:** Intent-aware automatic approvals
 
 Status: proposed 2026-09-24; amends
 [Intent-Aware Automatic Review](2026-09-21-intent-aware-auto-review-design.md).

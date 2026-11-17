@@ -1,6 +1,6 @@
 # SDD ledger — plan: docs/project/plans/2026-10-21-verification-hardening.md
 Fix-round budget: 3
-Source: linear:CEW-147. Parent: yach#j03s. Original approved umbrella: yach#j2rz.
+Source: M1 dogfood outcome. Parent: yach#j03s. Original approved umbrella: yach#j2rz.
 Task 1: Kata yach#2bqw; worker FreshStateImplementation.
 Task 2: Kata yach#n862; worker SemanticVerificationImplementation.
 Task 3: Kata yach#h6cz; worker ModalVerificationImplementation; README owned by controller.

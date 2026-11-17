@@ -1,6 +1,6 @@
 # Extension Cost Attribution Measurement (2026-09-13)
 
-**Outcome:** plane:YACH-8
+**Outcome:** Performance measurement framework
 **Spec:** `docs/project/specs/2026-09-13-extension-cost-attribution-design.md`
 
 ## Why

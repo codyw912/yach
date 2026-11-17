@@ -1,6 +1,6 @@
 # Intent-Aware Automatic Review
 
-**Outcome:** plane:YACH-11
+**Outcome:** Intent-aware automatic approvals
 
 Status: accepted 2026-09-21; implementation pending. Reviewer signals, routing,
 request evidence, and evaluation amended by

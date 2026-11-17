@@ -12,7 +12,7 @@ recipes; preserve durable session/disk assertions alongside captures.
 **Tech Stack:** Bash, tmux, jq, existing Rust toolchain and bench-enabled yach.
 
 **Spec:** `docs/project/specs/2026-10-21-verification-hardening-design.md`
-**Source:** linear:CEW-147
+**Source:** M1 dogfood outcome (roadmap milestone 1, Evidence-driven dogfood loop)
 
 ## Global Constraints
 

@@ -1,6 +1,6 @@
 # Perf Measurement Tooling: Takeaways (2026-09-14)
 
-**Outcome:** plane:YACH-8
+**Outcome:** Performance measurement framework
 
 Closes the measurement-tooling work that began when the deterministic gate
 false-failed PR #270. Written to support a decision about the longer-term
