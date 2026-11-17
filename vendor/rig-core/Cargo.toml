@@ -11,18 +11,23 @@
 
 [package]
 edition = "2024"
-name = "rig-core"
-version = "0.41.0"
+name = "yach-rig-core"
+version = "0.1.0"
 build = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "An opinionated library for building LLM powered applications."
+description = "rig-core 0.41.0 with yach's patches, published for yach. Not a general-purpose Rig release; use rig-core."
 readme = "README.md"
 license = "MIT"
-repository = "https://github.com/0xPlaygrounds/rig"
+repository = "https://github.com/codyw912/yach"
+exclude = [
+    "/Cargo.toml.orig",
+    "/.cargo_vcs_info.json",
+    "/.cargo-ok",
+]
 
 [package.metadata.docs.rs]
 all-features = true

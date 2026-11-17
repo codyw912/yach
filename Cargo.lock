@@ -2173,39 +2173,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rig-core"
-version = "0.41.0"
-dependencies = [
- "as-any",
- "async-stream",
- "base64",
- "bytes",
- "eventsource-stream",
- "fastrand",
- "fs2",
- "futures",
- "futures-timer",
- "glob",
- "http",
- "indexmap",
- "libc",
- "mime",
- "mime_guess",
- "ordered-float 5.3.0",
- "pin-project-lite",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-futures",
- "url",
-]
-
-[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3839,7 +3806,6 @@ dependencies = [
  "globset",
  "libc",
  "reqwest",
- "rig-core",
  "serde",
  "serde_json",
  "sha2",
@@ -3852,6 +3818,7 @@ dependencies = [
  "uuid",
  "yach-connections",
  "yach-proto",
+ "yach-rig-core",
  "yach-trace",
 ]
 
@@ -3923,6 +3890,39 @@ dependencies = [
  "serde",
  "serde_json",
  "zeroize",
+]
+
+[[package]]
+name = "yach-rig-core"
+version = "0.1.0"
+dependencies = [
+ "as-any",
+ "async-stream",
+ "base64",
+ "bytes",
+ "eventsource-stream",
+ "fastrand",
+ "fs2",
+ "futures",
+ "futures-timer",
+ "glob",
+ "http",
+ "indexmap",
+ "libc",
+ "mime",
+ "mime_guess",
+ "ordered-float 5.3.0",
+ "pin-project-lite",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-futures",
+ "url",
 ]
 
 [[package]]

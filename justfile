@@ -433,7 +433,7 @@ release-check:
     '.packages[]
       | select(.name == "yach-backend")
       | .dependencies[]
-      | select(.name == "rig-core")
+      | select(.name == "yach-rig-core")
       | .req' <<<"$metadata")"
   while IFS=$'\t' read -r package dependency requirement; do
     if [[ -z "${expected[$dependency]+present}" ]]; then
@@ -464,34 +464,36 @@ release-check:
   probe_root="$(mktemp -d "${TMPDIR:-/tmp}/yach-release-rig-probe.XXXXXX")"
   trap 'rm -rf "$probe_root"' EXIT
   mkdir -p "$probe_root/crates"
-  cp -R crates/yach-backend crates/yach-connections crates/yach-proto \
-    "$probe_root/crates/"
-  cat >"$probe_root/Cargo.toml" <<'EOF'
-  [workspace]
-  members = [
-    "crates/yach-backend",
-    "crates/yach-connections",
-    "crates/yach-proto",
-  ]
-  resolver = "2"
-
-  [workspace.lints.clippy]
-  EOF
+  # Copy yach-backend and every workspace crate it reaches through path
+  # dependencies, so the probe fails only on what the registry lacks.
+  probe_crates=(yach-backend)
+  for ((i = 0; i < ${#probe_crates[@]}; i++)); do
+    while read -r dependency; do
+      if [[ " ${probe_crates[*]} " != *" $dependency "* ]]; then
+        probe_crates+=("$dependency")
+      fi
+    done < <(jq -r --arg crate "${probe_crates[$i]}" \
+      '.packages[] | select(.name == $crate)
+        | .dependencies[] | select(.path != null) | .name' <<<"$metadata")
+  done
+  members=""
+  for crate in "${probe_crates[@]}"; do
+    cp -R "crates/$crate" "$probe_root/crates/"
+    members+="  \"crates/$crate\","$'\n'
+  done
+  printf '[workspace]\nmembers = [\n%s]\nresolver = "2"\n\n[workspace.lints.clippy]\n' \
+    "$members" >"$probe_root/Cargo.toml"
   if ! just --justfile "{{justfile()}}" dev cargo check \
     --manifest-path "$probe_root/Cargo.toml" -p yach-backend; then
-    echo "release blocked: packaged yach-backend does not build against registry rig-core $rig_requirement" >&2
-    echo "upstream/release the vendored Rig changes or use a published owned crate" >&2
+    echo "release blocked: packaged yach-backend does not build against registry yach-rig-core $rig_requirement" >&2
+    echo "publish vendor/rig-core as that version first (see vendor/README.md)" >&2
     exit 2
   fi
-  resolved_metadata="$(
-    just --justfile "{{justfile()}}" dev cargo metadata --locked --format-version 1
-  )"
-  rig_manifest="$(jq -r \
-    '.packages[] | select(.name == "rig-core") | .manifest_path' \
-    <<<"$resolved_metadata")"
-  if [[ "$rig_manifest" == "$(pwd)/vendor/rig-core/Cargo.toml" ]]; then
-    echo "release blocked: [patch.crates-io] still resolves rig-core from vendor/rig-core" >&2
-    echo "remove the patch only after its load-bearing changes are registry-resolvable" >&2
+  # Local builds resolve yach-rig-core from vendor/rig-core through
+  # [patch.crates-io]; published packages resolve the registry release. Refuse
+  # to publish unless the two are the same source.
+  if ! just --justfile "{{justfile()}}" dev bash scripts/vendor-rig-check.sh; then
+    echo "release blocked: vendor/rig-core is not the published yach-rig-core $rig_requirement" >&2
     exit 2
   fi
   rm -rf "$probe_root"
