@@ -1,19 +1,18 @@
 ## Where to start
 
-- Direction: `docs/project/roadmap.md` (read-only; it mirrors decisions made elsewhere).
+- Direction: `docs/project/roadmap.md` (read-only; it mirrors decisions made elsewhere). Work queue: the Linear project that `docs/roadmap.md` points to.
 - Design: `docs/project/specs/`. Nontrivial features get a spec before implementation.
 - Execution: `docs/project/plans/`. Each spec gets a numbered implementation plan.
 - Evidence: `docs/project/records/` — dated research, measurements, decisions.
 - Product docs index: `docs/README.md`.
 
-Roadmap outcomes, milestone status, and work queues live in an external
-planning system that is configured locally on the maintainer's machines, not
-in this repository. If that configuration is present in your session, plan
-through it. If it is absent, lifecycle mutation is unavailable: do not edit
-`roadmap.md`, do not write new specs or plans, and do not create in-repo
-substitutes (status snapshots, next-work queues, boards). Ask the maintainer
-to run provider setup instead. Ordinary read/build/test/contribution work
-is unaffected.
+Roadmap outcomes, milestone status, and work queues live in Linear, not in
+this repository. `.cairn.toml` selects it for cairn's `roadmap` and `outcome`
+skills; plan through them when your session can reach Linear. If it cannot,
+lifecycle mutation is unavailable: do not edit `roadmap.md`, do not write new
+specs or plans, and do not create in-repo substitutes (status snapshots,
+next-work queues, boards). Ask the maintainer instead. Ordinary
+read/build/test/contribution work is unaffected.
 
 ## Version Control workflow
 
