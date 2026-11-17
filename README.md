@@ -554,6 +554,10 @@ synchronized package set and dependency requirements, runs formatting, Clippy,
 the full test suite, and deterministic `just eval-validate`, then validates
 every package's distributable file list without uploading.
 
+Cargo does not copy workspace-root profiles into published member manifests, so
+`[profile.release]` must match in the root and `crates/yach-cli/Cargo.toml` for
+`cargo install yach` to use the measured settings; `just release-check` rejects drift.
+
 Publication is currently blocked at the vendored Rig boundary. Workspace tests
 resolve `rig-core` through `[patch.crates-io]`, but published packages resolve
 the registry release. `release-check` therefore builds `yach-backend` in an
