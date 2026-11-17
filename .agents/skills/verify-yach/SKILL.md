@@ -1,11 +1,13 @@
 ---
 name: verify-yach
-description: Use when verifying yach behavior end to end (TUI prompts and replies, tool review, resume, headless runs) for verifying-by-risk recipe evidence or before handing off a user-facing change
+description: Use when verifying yach behavior end to end (TUI prompts and replies, tool review, resume, headless runs), as the project verify skill cstack's `verify` drives, or before handing off a user-facing change
 ---
 
 # Verify yach
 
-Drives a real bench-enabled `yach` binary in private tmux servers. Most recipes use the scripted provider; semantic recipes use a request-validating loopback Responses server. Each run isolates HOME, sessions and workspace under `$XDG_STATE_HOME/sjujperpowers/verify-yach/`; operator state and real credentials are not used. Local protocol proofs are not live-provider-family or human-assessment evidence.
+Drives a real bench-enabled `yach` binary in private tmux servers. Most recipes use the scripted provider; semantic recipes use a request-validating loopback Responses server. Each run isolates HOME, sessions and workspace under `$XDG_STATE_HOME/verify-yach/`; operator state and real credentials are not used. Local protocol proofs are not live-provider-family or human-assessment evidence.
+
+This is the project verify skill for cstack's `verify`: run the repository's checks first (`just fmt-check`, `just lint`, `just test`), then drive the journeys the change touches with the recipes below. A verifier that did not write the change should run them.
 
 Run a full pass, keeping the first failure's exit status and always cleaning up:
 
@@ -45,7 +47,7 @@ Reply scripts are built by `scripts/lib/common.sh` (`text_round`, `bash_round`, 
 
 ## Evidence
 
-Under `$XDG_STATE_HOME/sjujperpowers/evidence/yach/<UTC time>-<pid>/` (default `~/.local/state/...`), outside the repository. Numbered text captures show the current visible pane, not scrollback. Session JSONL/inspector, file bytes and protocol request assertions prove durable effects; a settled screen or composer hint alone does not prove turn completion. Semantic recipes retain actual loopback request bodies and validation results; never copy live bodies or credentials into the repository.
+Under `$XDG_STATE_HOME/verify-yach/evidence/<UTC time>-<pid>/` (default `~/.local/state/...`), outside the repository. Evidence from runs before 2026-11-16 is under `$XDG_STATE_HOME/sjujperpowers/evidence/yach/`. Numbered text captures show the current visible pane, not scrollback. Session JSONL/inspector, file bytes and protocol request assertions prove durable effects; a settled screen or composer hint alone does not prove turn completion. Semantic recipes retain actual loopback request bodies and validation results; never copy live bodies or credentials into the repository.
 
 ## Cleanup
 
@@ -55,7 +57,7 @@ Semantic recipes trap exit/signals to stop their own server/tmux and remove priv
 
 ## Helpers
 
-`scripts/lib/tmux-tty.sh` is sjujperpowers' driver, copied unchanged. Put yach quirks in `lib/common.sh` or the drive scripts, not in the driver.
+`scripts/lib/tmux-tty.sh` is the generic tmux driver, copied from a verification-skill template. Keep it generic: put yach quirks in `lib/common.sh` or the drive scripts, not in the driver.
 
 Use yach-specific `common.sh` UI helpers for interactions. `ui_wait PATTERN [SECONDS]` requires two equal matching current-pane frames; `ui_send TEXT PATTERN [SECONDS]` and `ui_keys PATTERN KEY...` additionally require a changed post-action frame. Patterns are per-line extended regexes. They fail with current-pane diagnostics. Pair screen readiness with correlated durable completion before the next action; do not use transient footer counts or archived text as readiness.
 

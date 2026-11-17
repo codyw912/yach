@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Drive a CLI or TUI through a private tmux server, for project verify skills.
-# Copied into .agents/skills/verify-<project>/scripts/lib/ by
-# sjujperpowers:creating-a-verification-skill.
+# Copied into .agents/skills/verify-<project>/scripts/lib/ from a
+# verification-skill template; yach now owns this copy.
 #
 #   tmux-tty.sh start <name> <dir> <command...>   start command in a detached 200x50 pane
 #   tmux-tty.sh send <name> <text>                 type text, then Enter
@@ -68,7 +68,7 @@ case "$cmd" in
     ;;
   evidence-dir)
     [[ $# -eq 1 ]] || die "usage: evidence-dir <project>"
-    dir="${XDG_STATE_HOME:-$HOME/.local/state}/sjujperpowers/evidence/$1/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    dir="${XDG_STATE_HOME:-$HOME/.local/state}/verify-$1/evidence/$(date -u +%Y%m%dT%H%M%SZ)-$$"
     mkdir -p "$dir"
     printf '%s\n' "$dir"
     ;;

@@ -1,14 +1,16 @@
-# Verification risk policy read by sjujperpowers' verifying-by-risk.
-# Classification always uses the copy on trunk, so a stack that edits this
-# file is graded by the old rules. Grammar is restricted: see
-# verifying-by-risk/hk-conventions.md. The first matching rule wins.
+# Path risk policy. CI's `Changes` job reads it through
+# .github/scripts/changes.py to decide whether a pull request is docs-only,
+# and AGENTS.md's review rules name its high-tier paths. CI always uses the
+# base branch's copy, so a pull request that edits this file is classified
+# by the old rules. The first matching `[[rule]]` wins; glob syntax is
+# documented in changes.py.
 version = 1
 default = "medium"
-test = "just test"
 
-# Added to the built-in protected paths (hk config, this file, verify
-# skills, .github/workflows, devenv.*). These are what the declared checks
-# read: changing one can weaken a check without touching the check itself.
+# Added to changes.py's built-in protected paths (hk config, verify skills,
+# everything under .github/ including this file, devenv.*). These are what
+# the checks read: changing one can weaken a check without touching the
+# check itself.
 protected = [
   "justfile",
   "Cargo.toml",

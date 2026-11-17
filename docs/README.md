@@ -10,6 +10,7 @@
 | `project/specs/` | Accepted design documents, one per nontrivial feature. |
 | `project/plans/` | Numbered implementation plans that execute those specs. |
 | `project/records/` | Dated research, measurements, and decision records. |
+| `project/history/` | Execution ledgers and the Plane-to-Linear map kept from the retired sjujperpowers planning state. |
 
 The original product thesis is [`PRD-v0.1.md`](../PRD-v0.1.md) at the
 repository root. Contributor conventions are in [`AGENTS.md`](../AGENTS.md).

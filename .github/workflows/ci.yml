@@ -72,7 +72,7 @@ jobs:
           # base branch, so HEAD^1..HEAD is exactly what would land.
           if ! git rev-parse --verify --quiet HEAD^2 >/dev/null \
             || ! git show HEAD^1:.github/scripts/changes.py > "$RUNNER_TEMP/changes.py" 2>/dev/null \
-            || ! git show HEAD^1:.sjujperpowers/risk.toml > "$RUNNER_TEMP/risk.toml" 2>/dev/null; then
+            || ! git show HEAD^1:.github/risk.toml > "$RUNNER_TEMP/risk.toml" 2>/dev/null; then
             echo "No merge commit or no classifier on the base branch; running everything."
             echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
