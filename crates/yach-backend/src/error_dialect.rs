@@ -2,8 +2,9 @@
 //!
 //! Catalog data supplies an optional dialect ID only. Parser behavior lives
 //! here as reviewed typed envelopes; unknown and missing IDs use the
-//! conservative generic parser.
+//! conservative generic parser, including response-only unknown-model detection.
 
+use std::borrow::Cow;
 use std::time::{Duration, SystemTime};
 
 use rig::completion::CompletionError;
@@ -68,6 +69,20 @@ struct AnthropicErrorBody {
     #[serde(rename = "type")]
     error_type: Option<String>,
     message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UnknownModelEnvelope<'a> {
+    #[serde(borrow)]
+    error: UnknownModelBody<'a>,
+}
+
+#[derive(Deserialize)]
+struct UnknownModelBody<'a> {
+    #[serde(rename = "type", borrow)]
+    error_type: Cow<'a, str>,
+    #[serde(borrow)]
+    message: Cow<'a, str>,
 }
 
 /// Maps a baked catalog dialect ID onto compiled-in parser selection.
@@ -142,6 +157,9 @@ pub fn classify_completion_error(
     if let Some(status_kind) = retryable_status_kind(status) {
         kind = status_kind;
         source = ClassificationSource::Status;
+    } else if is_unknown_model_response(status, body) {
+        kind = ProviderErrorKind::UnavailableModel;
+        source = ClassificationSource::Keyword;
     } else if let Some(classified) = typed {
         kind = classified.kind;
         source = ClassificationSource::TypedDialect;
@@ -188,6 +206,22 @@ fn completion_variant(error: &CompletionError) -> (&'static str, ProviderErrorKi
         CompletionError::Auth(_) => ("auth", ProviderErrorKind::Authentication),
         _ => ("unknown", ProviderErrorKind::Unknown),
     }
+}
+
+// A response-only keyword rule must precede both typed invalid-request errors
+// and generic 404s, without selecting a dialect from provider identity.
+fn is_unknown_model_response(status: Option<u16>, body: Option<&str>) -> bool {
+    if status != Some(404) {
+        return false;
+    }
+    let Some(body) = body else {
+        return false;
+    };
+    let Ok(envelope) = serde_json::from_str::<UnknownModelEnvelope<'_>>(body) else {
+        return false;
+    };
+    envelope.error.error_type == "invalid_request_error"
+        && envelope.error.message.starts_with("Unknown model:")
 }
 
 fn classify_typed(dialect: KnownErrorDialect, body: Option<&str>) -> Option<TypedClassification> {
@@ -522,6 +556,113 @@ mod tests {
             error.metadata.classification_source,
             ClassificationSource::Status
         );
+    }
+
+    #[test]
+    fn gateway_unknown_model_404_without_dialect_is_unavailable_model() {
+        let body = r#"{"error":{"type":"invalid_request_error","message":"Unknown model: gateway-test-model"}}"#;
+        for dialect in [DialectSelection::Missing, DialectSelection::Unknown] {
+            let mut identity = identity(dialect);
+            identity.provider = String::from("openai-compatible");
+            let error = classify_completion_error(
+                &identity,
+                &http_error(404, body, None),
+                SystemTime::UNIX_EPOCH,
+            );
+            assert_eq!(
+                error.kind,
+                ProviderErrorKind::UnavailableModel,
+                "{dialect:?}"
+            );
+            assert_eq!(
+                error.metadata.classification_source,
+                ClassificationSource::Keyword
+            );
+            assert_eq!(error.metadata.status_code, Some(404));
+            assert!(error.metadata.provider_code.is_none());
+            assert!(error.metadata.hard_non_retryable_status());
+            let debug = format!("{error:?}");
+            assert!(!debug.contains("gateway-test-model"));
+            assert!(!debug.contains(body));
+        }
+    }
+
+    #[test]
+    fn gateway_unknown_model_404_with_anthropic_dialect_is_unavailable_model() {
+        for body in [
+            r#"{"error":{"type":"invalid_request_error","message":"Unknown model: gateway-test-model"}}"#,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Unknown model: gateway-test-model"}}"#,
+        ] {
+            let error = classify(
+                DialectSelection::Known(KnownErrorDialect::Anthropic),
+                &http_error(404, body, None),
+            );
+            assert_eq!(error.kind, ProviderErrorKind::UnavailableModel);
+            assert_eq!(
+                error.metadata.classification_source,
+                ClassificationSource::Keyword
+            );
+            assert_eq!(
+                error.metadata.provider_code.as_deref(),
+                Some("invalid_request_error")
+            );
+            assert!(error.metadata.hard_non_retryable_status());
+            let debug = format!("{error:?}");
+            assert!(!debug.contains("gateway-test-model"));
+            assert!(!debug.contains(body));
+        }
+    }
+
+    #[test]
+    fn gateway_unknown_model_requires_404_and_matching_envelope() {
+        for dialect in [
+            DialectSelection::Missing,
+            DialectSelection::Unknown,
+            DialectSelection::Known(KnownErrorDialect::Anthropic),
+        ] {
+            let source = if matches!(dialect, DialectSelection::Known(_)) {
+                ClassificationSource::TypedDialect
+            } else {
+                ClassificationSource::Status
+            };
+            for body in [
+                r#"{"error":{"type":"invalid_request_error","message":"Another invalid request"}}"#,
+                r#"{"error":{"type":"invalid_request_error","message":"The Unknown model: text is not a prefix"}}"#,
+            ] {
+                let error = classify(dialect, &http_error(404, body, None));
+                assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+                assert_eq!(error.metadata.classification_source, source);
+            }
+            let body = r#"{"error":{"type":"invalid_request_error","message":"Unknown model: gateway-test-model"}}"#;
+            let error = classify(dialect, &http_error(400, body, None));
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+            assert_eq!(error.metadata.classification_source, source);
+            for (status, expected) in [
+                (408, ProviderErrorKind::Timeout),
+                (429, ProviderErrorKind::RateLimited),
+                (504, ProviderErrorKind::Timeout),
+            ] {
+                let error = classify(dialect, &http_error(status, body, None));
+                assert_eq!(error.kind, expected);
+                assert_eq!(
+                    error.metadata.classification_source,
+                    ClassificationSource::Status
+                );
+            }
+        }
+        for body in [
+            "",
+            "Unknown model: gateway-test-model",
+            r#"{"message":"Unknown model: gateway-test-model"}"#,
+            r#"{"error":{"type":"mystery_error","message":"Unknown model: gateway-test-model"}}"#,
+        ] {
+            let error = classify(DialectSelection::Unknown, &http_error(404, body, None));
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+            assert_eq!(
+                error.metadata.classification_source,
+                ClassificationSource::Status
+            );
+        }
     }
 
     #[test]
