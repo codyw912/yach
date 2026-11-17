@@ -549,6 +549,9 @@ While Yach is pre-1.0, use a patch bump for backward-compatible fixes and a
 minor bump for features or incompatible public CLI, protocol, persistence, or
 library changes.
 
+Every release updates [CHANGELOG.md](CHANGELOG.md), and its section for the
+version is reconciled with `main` in the release change.
+
 Run `just release-check` on the release change before merging. It verifies the
 synchronized package set and dependency requirements, runs formatting, Clippy,
 the full test suite, and deterministic `just eval-validate`, then validates
