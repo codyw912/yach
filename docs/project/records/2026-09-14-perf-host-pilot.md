@@ -1,6 +1,6 @@
 # Perf Measurement Host Pilot (2026-09-14)
 
-**Outcome:** plane:YACH-8
+**Outcome:** Performance measurement framework
 **Follows:** `2026-09-14-perf-harness-noise-floor.md`,
 `2026-09-14-execute-row-spread-diagnosis.md`
 

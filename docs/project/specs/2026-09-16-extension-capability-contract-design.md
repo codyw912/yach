@@ -1,6 +1,6 @@
 # Extension Capability Contract Design
 
-**Outcome:** plane:YACH-10
+**Outcome:** Extension capability contract
 
 Status: original contract landed in PR #276; follow-up design approved in
 conversation 2026-09-17; written amendment awaiting review.
@@ -9,7 +9,7 @@ The 2026-09-17 amendment replaces session-bound grant evidence with an
 atomic user-scoped authority/history record and specifies discovery,
 CLI failure reporting, and protocol-documentation corrections. The original
 implementation plan remains historical; its Task 7 evidence prescription is
-superseded by this amendment. YACH-10 and `yach#wc3k` remain open until the
+superseded by this amendment. The extension capability contract outcome and `yach#wc3k` remain open until the
 amended behavior is implemented, verified, and published.
 
 ## Motivation

@@ -1,7 +1,7 @@
 # Theme Engine and Named Palette Survey
 
 Date: 2026-10-06. Evidence for the theming spec
-(`docs/project/specs/2026-10-02-theming-engine-design.md`, plane:YACH-20), not a
+(`docs/project/specs/2026-10-02-theming-engine-design.md`, the TUI theming engine), not a
 design or plan.
 
 Owner direction, 2026-10-06: ship the usual named palettes (Monokai,

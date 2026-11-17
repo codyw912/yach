@@ -1,6 +1,6 @@
 # Verification hardening
 
-**Outcome:** linear:CEW-147
+**Outcome:** M1 dogfood outcome (roadmap milestone 1, Evidence-driven dogfood loop)
 **Status:** approved direction in conversation, 2026-10-21
 
 ## Problem and approved scope

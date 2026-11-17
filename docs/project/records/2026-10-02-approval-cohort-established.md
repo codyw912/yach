@@ -26,7 +26,7 @@ Sources read: shallow clones at 2026-10-02 of openai/codex `44dd77b` (latest tag
 - **Prompt UI**: Yes / "Yes, and don't ask again for: `npm test *`" / "Yes, and switch to auto mode" (when available) / No; Tab adds a comment. The "don't ask again" rule is saved to `.claude/settings.local.json` at the repo root. File-edit approvals last until session end. Per-command saved rules are therefore still a live, central feature, though auto is the new default.
 - **Status bar**: `⏸ manual mode on`, `⏵⏵ accept edits on`, `⏸ plan mode on`, `⏵⏵ auto mode on`, `⏵⏵ don't ask on`, `⏵⏵ bypass permissions on`. A first-run notice explains the auto default.
 - **Headless**: `-p` with `--permission-mode dontAsk --allowedTools ...` for CI. Unanswerable prompts are denied, never silently allowed.
-- **Since 2.1.268 (≈2026-09-10)**: auto as built-in default; server-side classifier default; per-command `allowed_domains` for sandboxed commands in auto (2.1.271); `blockReadsOutsideWorkingDirectories` (2.1.257); the "switch to auto mode" prompt option (2.1.247). 2.1.285 made project settings unable to widen or disable an admin-required sandbox. `auto` and `bypassPermissions` are ignored as `defaultMode` from project `.claude/settings*.json` (repo-provided config can't grant autonomy; relevant to the YACH-18 provenance point).
+- **Since 2.1.268 (≈2026-09-10)**: auto as built-in default; server-side classifier default; per-command `allowed_domains` for sandboxed commands in auto (2.1.271); `blockReadsOutsideWorkingDirectories` (2.1.257); the "switch to auto mode" prompt option (2.1.247). 2.1.285 made project settings unable to widen or disable an admin-required sandbox. `auto` and `bypassPermissions` are ignored as `defaultMode` from project `.claude/settings*.json` (repo-provided config can't grant autonomy; relevant to the cohesive approval design provenance point).
 
 ## Codex CLI
 
@@ -60,7 +60,7 @@ Sources read: shallow clones at 2026-10-02 of openai/codex `44dd77b` (latest tag
 - **Isolation**: documented as a deployment choice (Docker, Docker Sandboxes, OpenShell, Gondolin micro-VM extension; `docs/containerization.md`). The new built-in `codemode` runs model JS in QuickJS with no fs/network, reaching the world only through tools (0.99.0, 2026-09-29). It is an interpreter sandbox for scripts, not for `bash`.
 - **Since 08-24**: 0.99.0 (codemode, MCP, tool_search), 1.0.0 (fullscreen TUI default). No approval changes.
 
-## Cross-harness observations for YACH-18
+## Cross-harness observations for the cohesive approval design
 
 - Every harness that restricts at all pairs auto-execution with **either** an OS sandbox (Codex: allow-by-default inside workspace-write; Claude sandbox auto-allow; Gemini opt-in) **or** a model classifier (Claude auto, Codex auto_review). Only Gemini's known-safe list and Claude's read-only set are pure command-text allowlists, and both are short, read-only, and path-checked.
 - Codex deleted its read-only command allowlist (08-20) in favour of "sandbox is the gate + explicit exec-policy rules + dangerous-command prompt". Claude and Gemini retained theirs.

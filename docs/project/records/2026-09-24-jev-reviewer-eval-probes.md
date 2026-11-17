@@ -125,4 +125,4 @@ Env: `TYPESAFE_API_KEY` (required), `YACH_JEV_BASE_URL` (default https://api.typ
 - Earlier stack: `zlpoonnn` c92fdd55 = Task 1 (durable review policy store + decision vocabulary), includes the four defect fixes (extension_install re-export, policy_revision propagation, BoundedReviewText, Path::starts_with matching).
 - `cargo test -p yach-backend`: 806 passed (earlier run, not revalidated for this revision). `cargo check -p yach-bench --all-targets`: clean (earlier run).
 - Eval gate currently fails against live Jev (expected — see findings above).
-- `agent-checkpoint push` attempted 2026-09-24: failed to connect to checkpoint.cewlabs.xyz:443 (no checkpoint created).
+- `agent-checkpoint push` attempted 2026-09-24: failed to connect to the checkpoint service (no checkpoint created).

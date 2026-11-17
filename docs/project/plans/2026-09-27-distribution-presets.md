@@ -32,7 +32,7 @@ drive `yach rpc` and `yach extension` as child processes.
 
 **Spec:** `docs/project/specs/2026-09-27-distribution-presets-design.md`
 
-**Source:** plane:YACH-12
+**Source:** Distribution presets
 
 ## Global Constraints
 
@@ -46,7 +46,7 @@ drive `yach rpc` and `yach extension` as child processes.
   `baseline-guidance`, `hashline`, `jev-reviewer`, `skill-index`.
 - `skill-index` is a reserved slot with no behavior in this plan; it is
   accepted in config and presets and reported by `yach component list` as
-  "reserved (plane:YACH-14)".
+  "reserved (skills support)".
 - Bundled extension ids (exact): `yach.hashline`, `yach.jev-reviewer`.
   Component-to-id map: `hashline` → `yach.hashline`, `jev-reviewer` →
   `yach.jev-reviewer`.

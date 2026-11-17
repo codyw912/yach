@@ -1,13 +1,13 @@
 # Extension Reach and Runtimes
 
-Date: 2026-10-06. Evidence for roadmap discussion (plane:M5), not a design or
+Date: 2026-10-06. Evidence for roadmap discussion (roadmap milestone 5, "Usage-ready extension platform"), not a design or
 plan.
 
 Owner direction, 2026-10-06: the original goal is for extensions to modify
 almost anything except an essential, safety-relevant core, as Pi does with a
 single TypeScript file. Yach may not reach Pi's breadth, but the goal should
 shape what gets built so later extension ideas do not each need core changes.
-The advisor and observer work (plane:YACH-21, kata `ceax`) should be designed
+The advisor and observer work (the user-facing observer extension seam, kata `ceax`) should be designed
 as the first users of general primitives.
 
 This record asks two questions: what can Pi extensions do that yach extensions

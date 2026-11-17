@@ -1,6 +1,6 @@
 # Verification hardening and M1 gate reassessment
 
-**Outcome:** linear:CEW-147
+**Outcome:** M1 dogfood outcome (roadmap milestone 1, Evidence-driven dogfood loop)
 **Spec:** `../specs/2026-10-21-verification-hardening-design.md`
 **Plan:** `../plans/2026-10-21-verification-hardening.md`
 **Result:** verification improvements exercised; cohort gate remains open.

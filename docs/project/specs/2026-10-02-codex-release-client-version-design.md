@@ -1,6 +1,6 @@
 # Codex Model Listing Follows Codex Releases
 
-**Outcome:** plane:YACH-17
+**Outcome:** Codex model listing follows Codex releases
 
 Status: approved by owner, 2026-10-02. Origin: Kata `yach#np83`.
 

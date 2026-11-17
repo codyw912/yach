@@ -11,7 +11,7 @@
 
 **Spec:** `docs/project/specs/2026-09-21-intent-aware-auto-review-design.md`
 
-**Source:** plane:YACH-11
+**Source:** Intent-aware automatic approvals
 
 ## Global Constraints
 

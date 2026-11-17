@@ -1,6 +1,6 @@
 # `extension/execute/*` Spread: Investigation (2026-09-14)
 
-**Outcome:** plane:YACH-8
+**Outcome:** Performance measurement framework
 **Follows:** `2026-09-14-perf-harness-noise-floor.md`
 
 **Status: cause unresolved.** This record documents what was ruled out and

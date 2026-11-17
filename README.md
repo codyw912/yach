@@ -511,8 +511,8 @@ an end-to-end drive with the project skill `.agents/skills/verify-yach/`. Agents
 on the maintainer's hosts reach these through cstack's `verify` skill, publish
 through cstack's `ship` and `land` with the host's
 `governed-github-publication` rules, and plan through cairn (`roadmap`,
-`outcome`) against the Linear project; none of that tooling is required to
-contribute.
+`outcome`) in a planning store outside the repository; none of that tooling is
+required to contribute.
 
 The same static checks (`cargo fmt --check`, Clippy with `-D warnings`) are
 also declared for [hk](https://hk.jdx.dev) in `hk.pkl`, which amends the

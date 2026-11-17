@@ -32,7 +32,7 @@ latency_pct = 10.0
 [[workload]]
 id = "extension/activation/*"
 latency_pct = 32.0
-comment = "ceil(spread)+3 on p95, the statistic the latency gate judges (ab.rs:892), from six 30-sample runs on 2026-09-13: spawn 28.92%, handshake 21.60%, total 16.83%. Widest ceil(28.92)+3 = 32. A budget this wide gates almost nothing: treat these rows as trend evidence and read the absolutes, not the verdict. Tightening needs a less noisy sampler, tracked on plane:YACH-8. Deriving from p50 instead would have produced 13.0 and false-failed honest changes."
+comment = "ceil(spread)+3 on p95, the statistic the latency gate judges (ab.rs:892), from six 30-sample runs on 2026-09-13: spawn 28.92%, handshake 21.60%, total 16.83%. Widest ceil(28.92)+3 = 32. A budget this wide gates almost nothing: treat these rows as trend evidence and read the absolutes, not the verdict. Tightening needs a less noisy sampler, tracked with the performance measurement framework work. Deriving from p50 instead would have produced 13.0 and false-failed honest changes."
 
 [[workload]]
 id = "extension/execute/*"

@@ -22,7 +22,7 @@ with a base URL, so yach can reach the host subscription gateway.
 **Spec:** `docs/project/specs/2026-10-19-anthropic-auth-token-design.md`
 (approved 2026-10-19).
 
-**Source:** linear:CEW-147
+**Source:** M1 dogfood outcome (roadmap milestone 1, Evidence-driven dogfood loop)
 
 ## Global Constraints
 

@@ -28,7 +28,7 @@ the production seams.
 (amends `docs/project/specs/2026-09-21-intent-aware-auto-review-design.md`).
 Evidence: `docs/project/records/2026-09-24-jev-category-rubric-probe.md`.
 
-**Source:** plane:YACH-11
+**Source:** Intent-aware automatic approvals
 
 ## Global Constraints
 

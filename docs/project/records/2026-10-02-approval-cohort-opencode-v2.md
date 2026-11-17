@@ -153,7 +153,7 @@ This answers the `git status *` question.
 - The v1 `migrate.ts` maps rules to the new array. (`packages/core/src/v1/config/migrate.ts:96-122`)
 - v1 `opencode --auto` and `opencode run --auto` were documented in August. v2 keeps both flags.
 
-## 10. Takeaways for Yach (YACH-18)
+## 10. Takeaways for Yach (the cohesive approval design)
 
 1. **OpenCode proves the "rarely interrupts" default is shippable, but with no sandbox.** It rests on a simple rule: allow everything, except deny and ask for a short list of exceptions. It prompts for external directories and `.env` reads, not for commands. The cost is that shell is unconstrained: redirects and wrapper commands bypass the rule list.
 2. **Compound-command decomposition is the design to copy for Yach's allowlist.** An allowed prefix never covers a chained second command, and unanalyzable input fails closed. The scanner has a large corpus of adversarial tests.

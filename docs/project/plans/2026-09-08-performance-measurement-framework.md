@@ -10,7 +10,7 @@
 
 **Spec:** `docs/project/specs/2026-09-08-performance-measurement-framework-design.md`
 
-**Source:** plane:YACH-8
+**Source:** Performance measurement framework
 
 ## Global Constraints
 
@@ -2053,7 +2053,7 @@ Expected: `base-mode: external`; verdicts for exactly `binary/size_bytes`, `yach
 
 - [ ] **Step 3: Record and render the baseline**
 
-Run: `just perf-record` and `just perf-report <path> > docs/benchmarks/baseline-$(date +%F).md`. Then edit the report: fill "Claim supported" (narrow: current Linux numbers on this machine; no comparison), "Confidence/limitations" (external-mode gate partial once; live-terminal rows skipped in a non-TTY shell — run those rows via `script -q /dev/null just perf-record` if a TTY is available and note which run produced which rows), "Follow-up" (post-merge worker-mode self-comparison, tracked on plane:YACH-8).
+Run: `just perf-record` and `just perf-report <path> > docs/benchmarks/baseline-$(date +%F).md`. Then edit the report: fill "Claim supported" (narrow: current Linux numbers on this machine; no comparison), "Confidence/limitations" (external-mode gate partial once; live-terminal rows skipped in a non-TTY shell — run those rows via `script -q /dev/null just perf-record` if a TTY is available and note which run produced which rows), "Follow-up" (post-merge worker-mode self-comparison, tracked with the performance measurement framework work).
 
 Update the PRD target table statuses in `docs/benchmarks/README.md` from the numbers (`met`/`not met`/`unknown` with the workload id that answers each row).
 

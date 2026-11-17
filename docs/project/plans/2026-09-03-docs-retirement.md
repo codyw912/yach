@@ -1,7 +1,7 @@
 # Docs Retirement Implementation Plan
 
 **Spec:** `docs/project/specs/2026-09-03-docs-retirement-design.md`
-**Source:** plane:YACH-7
+**Source:** Retire in-repo planning docs
 
 One commit stacked on the roadmap commit; both publish as one PR against
 `main`. No code behavior changes; a fresh-target `cargo check -p yach` is the

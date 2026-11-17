@@ -1,12 +1,12 @@
 # M1 Dogfood Portfolio
 
-**Outcome:** linear:CEW-147
+**Outcome:** M1 dogfood outcome (roadmap milestone 1, Evidence-driven dogfood loop)
 **Status:** draft for owner review, design approved 2026-10-15; refreshed 2026-10-20 for the landed anthropic auth prerequisite
 **Portfolio version:** 2
 
 Date: 2026-10-15
 
-This is the portfolio gate for linear:CEW-147, not a cohort run. It versions
+This is the portfolio gate for the M1 dogfood outcome, not a cohort run. It versions
 the repositories, task classes, provider families, failure injections,
 automation/manual split, evidence format, failure classes, blocker severity,
 and re-run gate. It does not record a live session, and it does not add
@@ -23,7 +23,7 @@ protocol matrices, deterministic evals, and scripted provider scenarios prove
 what they can observe; manual evidence is reserved for claims that require a
 person.
 
-linear:CEW-147 splits done-when into two gates:
+The M1 dogfood outcome splits done-when into two gates:
 
 1. **Portfolio gate (this record).** An approved, versioned record of the
    items above. Coverage must include fresh start, multi-tool work that
@@ -615,7 +615,7 @@ The cohort gate is met when that re-run has no open S1 or S2.
 
 The eval portfolio's `just eval-gate`
 (`docs/project/specs/2026-07-28-eval-portfolio-design.md:51-53`) is adjacent
-evidence. A green eval gate does not close CEW-147.
+evidence. A green eval gate does not close the M1 dogfood outcome.
 
 ## Where evidence lives
 
@@ -666,7 +666,7 @@ Still in force after the owner decisions:
   The prerequisite, Kata `yach#q6rj`, landed on 2026-10-20. Do not
   substitute a second Codex model id and call it the second family.
 - **Eval gate substituting for the cohort.** A green `just eval-gate`
-  satisfies the eval-portfolio spec, not CEW-147.
+  satisfies the eval-portfolio spec, not the M1 dogfood outcome.
 - **Anthropic capture is absent by design.** Do not fail an anthropic run
   for a missing request-body file. Do not copy a body into git to fill the
   gap.

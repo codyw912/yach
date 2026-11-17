@@ -1,6 +1,6 @@
 # Extension Cost Attribution Design
 
-**Outcome:** plane:YACH-8
+**Outcome:** Performance measurement framework
 
 Status: proposed
 Date: 2026-09-13

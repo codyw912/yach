@@ -24,7 +24,7 @@ a verifier.
 
 **Spec:** `docs/project/records/2026-10-15-dogfood-portfolio.md`
 
-**Source:** linear:CEW-147
+**Source:** M1 dogfood outcome (roadmap milestone 1, Evidence-driven dogfood loop)
 
 ## Global Constraints
 

@@ -1,6 +1,6 @@
 # Perf Harness Noise Floor: A/A Self-Comparison (2026-09-14)
 
-**Outcome:** plane:YACH-8
+**Outcome:** Performance measurement framework
 
 ## Why
 

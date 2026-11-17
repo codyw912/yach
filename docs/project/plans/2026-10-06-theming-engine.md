@@ -30,7 +30,7 @@ VHS tapes under `tests/visual`.
 **Spec:** `docs/project/specs/2026-10-02-theming-engine-design.md`
 (approved 2026-10-06). Evidence: `docs/project/records/2026-10-06-theme-engine-survey.md`.
 
-**Source:** plane:YACH-20
+**Source:** TUI theming engine
 
 ## Global Constraints
 
@@ -2741,7 +2741,7 @@ Expected: PASS. `palettes.rs` is a data table plus two tests; if clippy flags `t
 
 - [ ] **Step 25: Record the binary-size delta**
 
-`cargo bloat` is not installed and is not a project tool. There is no YACH-13 size gate to satisfy: that issue is an unbuilt follow-up (`docs/project/specs/2026-09-27-distribution-presets-design.md:58`), and `crates/yach-bench/perf-thresholds.toml:43-45` only budgets a PR against its own base at 5%. Record the raw delta instead.
+`cargo bloat` is not installed and is not a project tool. There is no per-preset binary size gate to satisfy: that work is an unbuilt follow-up (`docs/project/specs/2026-09-27-distribution-presets-design.md:58`), and `crates/yach-bench/perf-thresholds.toml:43-45` only budgets a PR against its own base at 5%. Record the raw delta instead.
 
 Before this task's files exist, the parent revision's release binary is the baseline. From the repo root:
 
@@ -2765,7 +2765,7 @@ The spec estimates roughly 25 KiB of embedded JSON (`docs/project/specs/2026-10-
 ```bash
 jj commit crates/yach-ui/themes crates/yach-ui/src/theme.rs crates/yach-ui/src/theme/palettes.rs -m "Bundle eighteen named palettes
 
-Embedded JSON is N bytes in target/release/yach (baseline M, delta D). No YACH-13 size gate exists; the relative binary/size_bytes budget is 5%."
+Embedded JSON is N bytes in target/release/yach (baseline M, delta D). No per-preset binary size gate exists; the relative binary/size_bytes budget is 5%."
 ```
 
 Replace `N`, `M`, and `D` with the `ls -l` byte counts from Step 25. Name only these paths so a sibling task's uncommitted edits stay out of the commit.
@@ -5735,7 +5735,7 @@ Expected: `just lint` exits 0. The workspace tests exit 0. All four tapes write 
 
 Re-open the four screenshots and repeat the legibility checks from Steps 2 and 4. The last `just tui-visual` is the run whose pixels count; earlier runs were deleted by `render.sh:12`.
 
-Then measure the release binary against the size gate. Embedded palettes are about 25 KiB (`docs/project/specs/2026-10-02-theming-engine-design.md:449-450`); the gate is `binary/size_bytes` at 5% (`crates/yach-bench/perf-thresholds.toml:42-45`, plane:YACH-13).
+Then measure the release binary against the size gate. Embedded palettes are about 25 KiB (`docs/project/specs/2026-10-02-theming-engine-design.md:449-450`); the gate is `binary/size_bytes` at 5% (`crates/yach-bench/perf-thresholds.toml:42-45`, the binary size gate work).
 
 ```bash
 just perf --filter 'binary/size_bytes' --deterministic

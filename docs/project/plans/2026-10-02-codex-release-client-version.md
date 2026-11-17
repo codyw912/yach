@@ -10,7 +10,7 @@
 
 **Spec:** `docs/project/specs/2026-10-02-codex-release-client-version-design.md`
 
-**Source:** plane:YACH-17
+**Source:** Codex model listing follows Codex releases
 
 ## Global Constraints
 
@@ -208,7 +208,7 @@ client_version is that release's version instead of the highest
 minimal_client_version (which under-reports: gpt-6.1-sol declares 0.153.0
 but is listed only from 0.160.0). Re-pin to rust-v0.160.0.
 
-Refs: yach#np83, plane:YACH-17"
+Refs: yach#np83"
 ```
 
 ### Task 2: Track the latest stable Codex release at runtime
@@ -542,7 +542,7 @@ Cache GitHub's latest openai/codex release (4h, ETag, 5s timeout) in
 latest) as the Codex client_version. Check at launch in the background and
 before a due model refresh.
 
-Refs: yach#np83, plane:YACH-17"
+Refs: yach#np83"
 ```
 
 ### Task 3: Forced refresh in the connection runtime
@@ -734,7 +734,7 @@ the Codex catalog refresh and discovery for every connection regardless of
 their intervals, waits for an in-flight Codex catalog refresh instead of
 being dropped, and returns a report for one status line.
 
-Refs: yach#np83, plane:YACH-17"
+Refs: yach#np83"
 ```
 
 ### Task 4: Forced refresh from the protocol and the TUI
@@ -847,7 +847,7 @@ A new AvailableModelsRefreshRequested event runs the forced connection
 refresh and reports one status line. /model accepts only the refresh
 argument; Ctrl+R in the picker leaves the filter query untouched.
 
-Refs: yach#np83, plane:YACH-17"
+Refs: yach#np83"
 ```
 
 ### Task 5: `yach models refresh`
@@ -905,7 +905,7 @@ jj commit -m "Add yach models refresh
 Runs the forced model refresh without a TUI and prints the same status
 line.
 
-Refs: yach#np83, plane:YACH-17"
+Refs: yach#np83"
 ```
 
 ### Task 6: Weekly re-pin workflow
@@ -984,9 +984,7 @@ Expected: a diff only if a release newer than `rust-v0.160.0` exists; restore wi
 - [ ] **Step 3: Commit**
 
 ```bash
-jj commit -m "Propose a weekly re-pin of the baked Codex catalog
-
-Refs: plane:YACH-17"
+jj commit -m "Propose a weekly re-pin of the baked Codex catalog"
 ```
 
 ### Task 7: Full verification and live acceptance
