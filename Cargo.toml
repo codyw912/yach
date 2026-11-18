@@ -54,3 +54,10 @@ debug = "line-tables-only"
 [profile.debug-full]
 inherits = "dev"
 debug = 2
+
+# Fat LTO + stripping saves 41% within CI's build budget; keep the CLI profile in sync.
+# Install reference: 17,645,144 bytes, 451c65dc9cb5, 2026-11-17, Rust 1.98.1 (see release-profile record).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

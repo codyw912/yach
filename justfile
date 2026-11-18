@@ -199,7 +199,7 @@ perf-profile id samples="1000":
   set -euo pipefail
   justfile="{{justfile()}}"
   mkdir -p .perf
-  CARGO_PROFILE_RELEASE_DEBUG=1 just --justfile "$justfile" dev cargo build --release --locked -p yach-bench -p yach
+  CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none just --justfile "$justfile" dev cargo build --release --locked -p yach-bench -p yach
   target_dir="$(just --justfile "$justfile" dev-shell 'set -o pipefail; cargo metadata --locked --offline --no-deps --format-version 1 | jq -er .target_directory')"
   bin="$target_dir/release/yach-bench"
   yach_bin="$target_dir/release/yach"
@@ -390,6 +390,11 @@ release-check:
   set -euo pipefail
   crates=({{publish_crates}})
   metadata="$(just --justfile "{{justfile()}}" dev cargo metadata --locked --no-deps --format-version 1)"
+  if [[ "$(just --justfile "{{justfile()}}" dev nix-instantiate --eval --strict --json --expr \
+    '(builtins.fromTOML (builtins.readFile ./Cargo.toml)).profile.release == (builtins.fromTOML (builtins.readFile ./crates/yach-cli/Cargo.toml)).profile.release')" != true ]]; then
+    echo "release blocked: [profile.release] differs between Cargo.toml and crates/yach-cli/Cargo.toml; keep the installed and workspace profiles in sync" >&2
+    exit 2
+  fi
   declare -A expected=()
   for crate in "${crates[@]}"; do
     expected["$crate"]=1

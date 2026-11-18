@@ -37,3 +37,9 @@ workspace = true
 [[bin]]
 name = "yach"
 path = "src/main.rs"
+
+# Cargo preserves this for `cargo install`; release-check enforces parity with the root.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
