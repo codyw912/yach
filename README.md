@@ -561,13 +561,15 @@ Cargo does not copy workspace-root profiles into published member manifests, so
 `[profile.release]` must match in the root and `crates/yach-cli/Cargo.toml` for
 `cargo install yach` to use the measured settings; `just release-check` rejects drift.
 
-Publication is currently blocked at the vendored Rig boundary. Workspace tests
-resolve `rig-core` through `[patch.crates-io]`, but published packages resolve
-the registry release. `release-check` therefore builds `yach-backend` in an
-isolated workspace without the root patch and also refuses an active
-`vendor/rig-core` resolution even if that build happens to compile. The release
-can proceed only after the load-bearing Rig changes are available from a
-registry release or from a published Yach-owned crate strategy.
+Yach's Rig patches ship as `yach-rig-core`, a published copy of
+`vendor/rig-core` that `yach-backend` uses under the name `rig`. Workspace
+builds resolve it from `vendor/rig-core` through `[patch.crates-io]`, but
+published packages resolve the registry release. `release-check` therefore
+builds `yach-backend` in an isolated workspace without the root patch, and
+`scripts/vendor-rig-check.sh` refuses the release unless `vendor/rig-core` is
+byte-for-byte the published `yach-rig-core` version that `yach-backend`
+requires. A vendor change ships by bumping `yach-rig-core` and publishing it
+first; see [vendor/README.md](vendor/README.md).
 
 After the release change is merged, update the local Jujutsu checkout so the
 empty working change is directly above synchronized `main`. Run one

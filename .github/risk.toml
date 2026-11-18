@@ -19,6 +19,7 @@ protected = [
   "rust-toolchain.toml",
   ".cargo/config.toml",
   "crates/yach-bench/perf-thresholds.toml",
+  "scripts/vendor-rig-check.sh",
 ]
 
 # Agent execution, permission and sandbox boundaries, credentials, and

@@ -1,8 +1,9 @@
 # Carrying the Rig vendor
 
-`rig-core/` contains published `rig-core 0.41.0` plus yach's local patches.
-The root `[patch.crates-io]` selects it (`Cargo.toml:46-47`), and
-`crates/yach-backend/Cargo.toml:20` consumes it as `rig`. Published 0.46 supplies
+`rig-core/` contains published `rig-core 0.41.0` plus yach's local patches,
+packaged as `yach-rig-core`. The root `[patch.crates-io]` selects it for
+workspace builds (`Cargo.toml:46-47`), and `crates/yach-backend/Cargo.toml:20`
+consumes the published crate as `rig`. Published 0.46 supplies
 Responses replay replacements but still lacks required auth fencing, catalog,
 transport safety and gateway behavior. See the
 [0.46 reconciliation and release decision](../docs/project/records/2026-11-17-rig-0-46-reconciliation.md).
@@ -66,17 +67,31 @@ the patches with the published sources, then update this table and the record.
 Separate renamed APIs from absent behavior; a name-resolution failure count is
 only a lower bound. Do not equate unreleased merged PRs with a published crate.
 
-For 0.2.0 the current vendor is published as `yach-rig-core` 0.1.0, a
-yach-owned MIT crate that keeps the upstream copyright, license and
-attribution (`vendor/rig-core/LICENSE:1-7`). `yach-backend` consumes it
-through Cargo's package rename, keeping the dependency name `rig`, its
-features and current Rust callers unchanged. This guide does not itself
-implement the publication or the dependency switch.
+The vendor is published as `yach-rig-core`, a yach-owned MIT crate that keeps
+the upstream copyright, license and attribution
+(`vendor/rig-core/LICENSE:1-7`). `yach-backend` consumes it through Cargo's
+package rename, keeping the dependency name `rig`, its features and current
+Rust callers unchanged. The checked-in upstream provenance files
+(`Cargo.toml.orig`, `.cargo_vcs_info.json`, `.cargo-ok`) are listed in
+`exclude` so Cargo does not reject them as reserved names; the published crate
+carries Cargo's own regenerated `Cargo.toml.orig` and `.cargo_vcs_info.json`
+instead. That is why the release check compares sources through
+`Cargo.toml.orig` and skips `.cargo_vcs_info.json`.
 
-Keep `just release-check` intact. It refuses an active vendor resolution
-(`justfile:485-490`); a root path patch does not accompany downstream registry
-consumers (`README.md:557-563`). After 0.2.0, upstream the small general fixes,
-move auth fencing to yach's `TokenStore` and capture/error policy to its
-`HttpClientExt`, then migrate to registry Rig with the remaining decoder and
-TRACE safety gaps resolved. The reconciliation record gives the order and
-verification requirements.
+Any change under `vendor/rig-core/` ships in this order:
+
+1. Bump `version` in `vendor/rig-core/Cargo.toml` and the `yach-rig-core`
+   requirement in `crates/yach-backend/Cargo.toml`, then update `Cargo.lock`.
+2. Merge the change, then publish from merged `main`:
+   `just dev cargo publish --manifest-path vendor/rig-core/Cargo.toml`.
+3. Release yach. `just release-check` runs `scripts/vendor-rig-check.sh`,
+   which packages `vendor/rig-core` and compares it with the published crate
+   for the required version. A vendor edit that was not published, or a
+   version that is not on crates.io, blocks the release.
+
+A path patch does not reach downstream registry consumers
+(`README.md:557-565`), which is why the published crate must equal the vendor.
+After 0.2.0, upstream the small general fixes, move auth fencing to yach's
+`TokenStore` and capture/error policy to its `HttpClientExt`, then migrate to
+registry Rig with the remaining decoder and TRACE safety gaps resolved. The
+reconciliation record gives the order and verification requirements.

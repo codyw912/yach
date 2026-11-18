@@ -44,7 +44,7 @@ too_many_lines = "allow"
 
 
 [patch.crates-io]
-rig-core = { path = "vendor/rig-core" }
+yach-rig-core = { path = "vendor/rig-core" }
 
 # Keep backtrace locations without full debugger data in routine builds and tests.
 [profile.dev]

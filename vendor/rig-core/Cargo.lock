@@ -2170,56 +2170,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rig-core"
-version = "0.41.0"
-dependencies = [
- "anyhow",
- "as-any",
- "assert_fs",
- "async-stream",
- "base64",
- "bytes",
- "epub",
- "eventsource-stream",
- "fastrand",
- "fs2",
- "futures",
- "futures-timer",
- "glob",
- "http",
- "indexmap",
- "libc",
- "lopdf",
- "mime",
- "mime_guess",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "ordered-float",
- "pin-project-lite",
- "quick-xml",
- "rayon",
- "redis",
- "reqwest",
- "reqwest-middleware",
- "reqwest-retry",
- "rig-derive",
- "schemars",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "thiserror",
- "tokio",
- "tokio-test",
- "tokio-tungstenite",
- "tracing",
- "tracing-futures",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "rig-derive"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3580,6 +3530,56 @@ name = "xxhash-rust"
 version = "0.8.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
+
+[[package]]
+name = "yach-rig-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "as-any",
+ "assert_fs",
+ "async-stream",
+ "base64",
+ "bytes",
+ "epub",
+ "eventsource-stream",
+ "fastrand",
+ "fs2",
+ "futures",
+ "futures-timer",
+ "glob",
+ "http",
+ "indexmap",
+ "libc",
+ "lopdf",
+ "mime",
+ "mime_guess",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "ordered-float",
+ "pin-project-lite",
+ "quick-xml",
+ "rayon",
+ "redis",
+ "reqwest",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "rig-derive",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "thiserror",
+ "tokio",
+ "tokio-test",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-futures",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+]
 
 [[package]]
 name = "yoke"
