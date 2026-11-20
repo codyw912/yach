@@ -86,18 +86,8 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("__extension-host")
         && args.get(1).map(String::as_str) == Some("jev")
     {
-        #[cfg(feature = "bundled-jev")]
-        {
-            return match yach_jev_reviewer::run_stdio() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(_) => ExitCode::from(1),
-            };
-        }
-        #[cfg(not(feature = "bundled-jev"))]
-        {
-            let _ = writeln!(io::stderr(), "error=bundled extension not compiled in");
-            return ExitCode::from(1);
-        }
+        let _ = writeln!(io::stderr(), "error=bundled extension not compiled in");
+        return ExitCode::from(1);
     }
     let cli = CliArgs::from_args(args.into_iter());
     if let Some(trace) = trace.as_ref() {

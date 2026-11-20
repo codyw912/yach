@@ -47,16 +47,6 @@ fn hashline_manifest_json() -> Option<&'static str> {
     None
 }
 
-#[cfg(feature = "bundled-jev")]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the not-compiled-in sibling returns None"
-)]
-fn jev_manifest_json() -> Option<&'static str> {
-    Some(yach_jev_reviewer::MANIFEST_JSON)
-}
-
-#[cfg(not(feature = "bundled-jev"))]
 fn jev_manifest_json() -> Option<&'static str> {
     None
 }
@@ -379,15 +369,11 @@ pub(crate) fn warn_unknown_components(unknown: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use yach_backend::{ExtensionInstallStore, Preset, UserConfigStore};
+    use yach_backend::{ExtensionInstallScope, ExtensionInstallStore, Preset, UserConfigStore};
 
     use super::{apply_preset, ensure_first_run};
-    // Used by tests that exist whenever hashline is absent (the
-    // not-compiled-in cases) or whenever both packages materialize.
-    #[cfg(any(not(feature = "bundled-hashline"), feature = "bundled-jev"))]
-    use yach_backend::ExtensionInstallScope;
 
-    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
+    #[cfg(feature = "bundled-hashline")]
     use super::ephemeral_package_roots;
     #[cfg(feature = "bundled-hashline")]
     use super::{BUNDLED, install, refresh_on_upgrade};
@@ -396,7 +382,7 @@ mod tests {
 
     /// The version segment of a materialized package root: its last path
     /// component.
-    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
+    #[cfg(feature = "bundled-hashline")]
     fn materialized_version(package_root: &std::path::Path) -> Option<&str> {
         package_root.file_name()?.to_str()
     }
@@ -414,9 +400,9 @@ mod tests {
         path
     }
 
-    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
+    #[cfg(feature = "bundled-hashline")]
     #[test]
-    fn upgrade_refresh_repoints_existing_and_skips_removed() {
+    fn upgrade_refresh_repoints_available_and_skips_unavailable() {
         let home = temp_home("bundled-upgrade");
         let stale = home.join(".yach/bundled/yach-hashline/0.0.1");
         let stale_jev = home.join(".yach/bundled/yach-jev-reviewer/0.0.1");
@@ -434,7 +420,7 @@ mod tests {
                 .install_bundled("yach.jev-reviewer", &stale_jev, ExtensionInstallScope::User)
                 .is_ok()
         );
-        let removed = BTreeSet::from([String::from("yach.jev-reviewer")]);
+        let removed = BTreeSet::new();
 
         let changed = refresh_on_upgrade(&home, &mut store, &removed);
         assert!(matches!(changed, Ok(true)));
@@ -449,7 +435,7 @@ mod tests {
             .find(|r| r.source == "yach.jev-reviewer");
         assert!(
             jev.is_some_and(|r| r.package_root.ends_with("0.0.1")),
-            "removed ids are untouched"
+            "unavailable ids are untouched"
         );
 
         let unchanged = refresh_on_upgrade(&home, &mut store, &removed);
@@ -501,7 +487,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
+    #[cfg(feature = "bundled-hashline")]
     #[test]
     fn first_apply_preserves_existing_disabled_record() {
         let home = temp_home("first-apply");
@@ -525,11 +511,12 @@ mod tests {
             hashline.is_some_and(|r| !r.enabled),
             "existing choice preserved"
         );
+        assert!(matches!(&report, Ok(Some(r)) if r.not_compiled_in == ["yach.jev-reviewer"]));
         assert!(
             store
                 .records
                 .iter()
-                .any(|r| r.source == "yach.jev-reviewer" && r.enabled)
+                .all(|r| r.source != "yach.jev-reviewer")
         );
         assert!(
             matches!(ensure_first_run(&home, &config, &store_path), Ok(None)),
@@ -560,7 +547,7 @@ mod tests {
         assert!(matches!(&reset, Ok(r) if r.installed.contains(&"yach.hashline")));
     }
 
-    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
+    #[cfg(feature = "bundled-hashline")]
     #[test]
     fn ephemeral_roots_materialize_included_without_touching_the_store() {
         let home = temp_home("ephemeral-full");
@@ -609,16 +596,17 @@ mod tests {
             sources.contains(&"/opt/example.third-party"),
             "non-bundled persisted roots pass through"
         );
-        for id in ["yach.hashline", "yach.jev-reviewer"] {
-            let root = roots.iter().find(|r| r.source_ref.as_deref() == Some(id));
-            assert!(
-                root.is_some_and(|r| {
-                    materialized_version(&r.root) == Some(env!("CARGO_PKG_VERSION"))
-                        && r.root.join("yach.extension.json").is_file()
-                }),
-                "{id} is materialized at the current version in memory"
-            );
-        }
+        let hashline = roots
+            .iter()
+            .find(|r| r.source_ref.as_deref() == Some("yach.hashline"));
+        assert!(
+            hashline.is_some_and(|r| {
+                materialized_version(&r.root) == Some(env!("CARGO_PKG_VERSION"))
+                    && r.root.join("yach.extension.json").is_file()
+            }),
+            "hashline is materialized at the current version in memory"
+        );
+        assert!(!sources.contains(&"yach.jev-reviewer"));
         assert_eq!(
             std::fs::read(&store_path).unwrap_or_default(),
             before,
@@ -670,7 +658,7 @@ mod tests {
 
         let report = ensure_first_run(&home, &config, &store_path);
         assert!(report.is_err(), "store save failure propagates");
-        #[cfg(any(feature = "bundled-hashline", feature = "bundled-jev"))]
+        #[cfg(feature = "bundled-hashline")]
         assert!(
             home.join(".yach/bundled").is_dir(),
             "reconciliation ran; only the store save failed"
@@ -712,7 +700,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
+    #[cfg(feature = "bundled-hashline")]
     #[test]
     fn explicit_preset_use_reenables_existing_records() {
         let home = temp_home("preset-round-trip");
@@ -721,12 +709,13 @@ mod tests {
 
         let minimal = apply_preset(&home, &config, &store_path, Preset::Minimal, false, false);
         assert!(matches!(&minimal, Ok(r) if r.preset == Preset::Minimal));
-        // Minimal installs nothing; now seed both as the full preset would.
+        // Minimal installs nothing; full installs only hashline.
         let full = apply_preset(&home, &config, &store_path, Preset::Full, false, false);
-        assert!(matches!(&full, Ok(r) if r.installed.len() == 2));
+        assert!(matches!(&full, Ok(r) if r.installed == ["yach.hashline"]
+            && r.not_compiled_in == ["yach.jev-reviewer"]));
         let minimal_again =
             apply_preset(&home, &config, &store_path, Preset::Minimal, false, false);
-        assert!(matches!(&minimal_again, Ok(r) if r.disabled.len() == 2));
+        assert!(matches!(&minimal_again, Ok(r) if r.disabled == ["yach.hashline"]));
         let Ok(store) = ExtensionInstallStore::load_from_path(&store_path) else {
             unreachable!()
         };
@@ -736,12 +725,41 @@ mod tests {
         // re-enables the existing records instead of preserving their
         // disabled state.
         let full_again = apply_preset(&home, &config, &store_path, Preset::Full, false, false);
-        assert!(matches!(&full_again, Ok(r) if r.enabled.len() == 2 && r.preserved.is_empty()));
+        assert!(
+            matches!(&full_again, Ok(r) if r.enabled == ["yach.hashline"]
+            && r.not_compiled_in == ["yach.jev-reviewer"] && r.preserved.is_empty())
+        );
         let Ok(store) = ExtensionInstallStore::load_from_path(&store_path) else {
             unreachable!()
         };
-        assert_eq!(store.records.len(), 2);
+        assert_eq!(store.records.len(), 1);
         assert!(store.records.iter().all(|r| r.enabled));
+    }
+
+    #[test]
+    fn full_preset_reports_jev_not_compiled_in() {
+        let home = temp_home("jev-not-compiled");
+        let config = UserConfigStore::in_home(&home);
+        let store_path = home.join(".yach/extensions.json");
+
+        let report = apply_preset(&home, &config, &store_path, Preset::Full, false, false);
+        assert!(
+            matches!(&report, Ok(r) if r.not_compiled_in.contains(&"yach.jev-reviewer")),
+            "full succeeds and reports the unavailable reviewer"
+        );
+        let Ok(store) = ExtensionInstallStore::load_from_path(&store_path) else {
+            unreachable!()
+        };
+        assert!(
+            store
+                .records
+                .iter()
+                .all(|r| r.source != "yach.jev-reviewer")
+        );
+        let Ok(snapshot) = config.load() else {
+            unreachable!()
+        };
+        assert_eq!(snapshot.preset_applied, Some(Preset::Full));
     }
 
     #[cfg(not(feature = "bundled-hashline"))]
