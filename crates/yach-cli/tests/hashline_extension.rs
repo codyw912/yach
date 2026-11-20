@@ -2,7 +2,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(any(not(feature = "bundled-hashline"), feature = "bundled-jev"))]
 use std::process::Command;
 #[cfg(feature = "bundled-hashline")]
 use std::sync::Mutex;
@@ -492,7 +491,7 @@ fn first_party_manifest_is_loadable_from_its_package_root() {
         1
     );
 }
-#[cfg(all(feature = "bundled-hashline", feature = "bundled-jev"))]
+#[cfg(feature = "bundled-hashline")]
 #[test]
 fn bundled_hashline_package_lists_disables_and_reenables_through_cli() {
     let stores = TempPackage::new().test_unwrap();
@@ -501,8 +500,7 @@ fn bundled_hashline_package_lists_disables_and_reenables_through_cli() {
     let home = stores.root.join("home");
     fs::create_dir_all(&home).test_unwrap();
 
-    // `preset use full` is the seeding path now: it writes the preset and
-    // installs both bundled records into the user store.
+    // `preset use full` installs hashline and reports the reviewer unavailable.
     let preset = Command::new(env!("CARGO_BIN_EXE_yach"))
         .args(["preset", "use", "full"])
         .env("HOME", &home)
@@ -513,6 +511,7 @@ fn bundled_hashline_package_lists_disables_and_reenables_through_cli() {
     assert!(preset.status.success());
     let preset_stdout = String::from_utf8(preset.stdout).test_unwrap();
     assert!(preset_stdout.contains("installed=yach.hashline"));
+    assert!(preset_stdout.contains("not_compiled_in=yach.jev-reviewer"));
 
     let list = Command::new(env!("CARGO_BIN_EXE_yach"))
         .args(["extension", "list"])
@@ -523,7 +522,8 @@ fn bundled_hashline_package_lists_disables_and_reenables_through_cli() {
         .test_unwrap();
     assert!(list.status.success());
     let list_stdout = String::from_utf8(list.stdout).test_unwrap();
-    assert!(list_stdout.contains("extension_count=2"));
+    assert!(list_stdout.contains("extension_count=1"));
+    assert!(!list_stdout.contains("extension id=yach.jev-reviewer"));
     assert!(list_stdout.contains("extension id=yach.hashline"));
     assert!(list_stdout.contains("activation_state=discovered"));
 
@@ -572,4 +572,17 @@ fn bundled_hashline_package_lists_disables_and_reenables_through_cli() {
     let reenabled_stdout = String::from_utf8(reenabled.stdout).test_unwrap();
     assert!(reenabled_stdout.contains("extension id=yach.hashline"));
     assert!(reenabled_stdout.contains("activation_state=discovered"));
+}
+
+#[test]
+fn bundled_jev_host_reports_not_compiled_in() {
+    let host = Command::new(env!("CARGO_BIN_EXE_yach"))
+        .args(["__extension-host", "jev"])
+        .output()
+        .test_unwrap();
+    assert_eq!(host.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(host.stderr).test_unwrap().trim(),
+        "error=bundled extension not compiled in"
+    );
 }

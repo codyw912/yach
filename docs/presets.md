@@ -7,9 +7,10 @@ A **preset** is a named set of components. Two presets ship:
 | Preset | Components |
 | --- | --- |
 | `minimal` | `bash` (kernel, always present), `skill-index` (reserved) |
-| `full` | `bash`, `project-tools`, `baseline-guidance`, `hashline`, `jev-reviewer`, `skill-index` |
+| `full` | `bash`, `project-tools`, `baseline-guidance`, `hashline`, `jev-reviewer` (not compiled in), `skill-index` |
 
-`full` is the default install; it matches what yach has always done.
+`full` is the default install. It enables the available reference components
+and reports `yach.jev-reviewer` under `not_compiled_in` without installing it.
 `minimal` removes the reference components so the session advertises only
 the kernel `bash` tool and sends no baseline guidance — the harness's own
 additions are out of the way when observing a model's native tool use.
@@ -24,7 +25,7 @@ are configured on their own, outside the preset.
 | `project-tools` | `project_path_info`, `read_text_file`, `search_project`, `list_project_paths`, `edit_text_file`, `create_text_file` | kernel |
 | `baseline-guidance` | The baseline system guidance text sent on every provider request | kernel |
 | `hashline` | Coordinated replacement of `read_text_file` / `edit_text_file` | bundled extension `yach.hashline` |
-| `jev-reviewer` | Reviewer for the `auto-review` approval mode | bundled extension `yach.jev-reviewer` |
+| `jev-reviewer` | Reviewer for the `auto-review` approval mode | extension `yach.jev-reviewer`, not compiled into yach |
 | `skill-index` | Reserved for the skills work | kernel |
 
 `yach component list` reports one line per component:
@@ -33,7 +34,7 @@ are configured on their own, outside the preset.
 component name=project-tools source=kernel state=enabled compiled_in=true
 component name=baseline-guidance source=kernel state=enabled compiled_in=true
 component name=hashline source=bundled-extension state=enabled compiled_in=true
-component name=jev-reviewer source=bundled-extension state=enabled compiled_in=true
+component name=jev-reviewer source=bundled-extension state=not-installed compiled_in=false
 component name=skill-index source=kernel state=reserved compiled_in=true
 ```
 
@@ -73,7 +74,8 @@ note=reads lose the bounded-result and resource-broker path of read_text_file
 `yach component enable|disable` takes a component name (`project-tools`,
 `baseline-guidance`, `hashline`, `jev-reviewer`; `skill-index` is
 reserved). `yach extension install --bundled` takes a bundled extension
-id (`yach.hashline`, `yach.jev-reviewer`) and (re)installs that record.
+id (`yach.hashline`, `yach.jev-reviewer`) and (re)installs that record if this
+binary includes it. Jev is not compiled in, so it cannot be installed this way.
 
 Changes take effect for new sessions; a running session keeps the component
 set it started with.
@@ -113,9 +115,11 @@ With only `bash`, every file read and change goes through the shell path:
 This is the intended behavior for observing a model's native tool use.
 `yach preset use minimal` prints these consequences as `note=` lines.
 
-Note that `jev-reviewer` under `full` is installed and enabled but still
-needs its existing network capability grant, and automatic execution stays
-behind `AUTO_REVIEW_EXECUTION_ENABLED`; installing a component grants
+The Jev reviewer stays in the repository for evaluation until its evals pass.
+It is not compiled into yach, even with `full`. `yach preset use full` succeeds
+and reports `not_compiled_in=yach.jev-reviewer`. An independently installed
+reviewer still needs its network capability grant, and automatic execution
+stays behind `AUTO_REVIEW_EXECUTION_ENABLED`. Installing a component grants
 nothing.
 
 ## Removal and `--reset`
@@ -165,9 +169,9 @@ portable summary pass built from this prompt.
 
 ## Build packaging
 
-`--no-default-features` builds yach without the bundled hashline and Jev
-code — a core binary containing no first-party extension code. From a
-checkout:
+`--no-default-features` builds yach without the bundled hashline code, so the
+core binary contains no first-party extension code. Jev is absent in all
+yach builds, not controlled by a feature. From a checkout:
 
 ```sh
 cargo install --path crates/yach-cli --no-default-features

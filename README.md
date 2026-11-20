@@ -79,10 +79,11 @@ crates.io release is the supported install boundary; `main` may contain
 unreleased changes.
 
 The default install applies the `full` preset on first run, which enables
-yach's reference components (the project tools, baseline guidance, and the
-bundled hashline and Jev extensions). To build a core binary without the
-bundled extension code, install with `--no-default-features`. See
-[docs/presets.md](docs/presets.md) for presets, components, and removal.
+yach's project tools, baseline guidance, and bundled hashline extension.
+The Jev reviewer is not bundled. It stays in the repository for evaluation
+until its evals pass. To build a core binary without hashline, install with
+`--no-default-features`. See [docs/presets.md](docs/presets.md) for presets,
+components, and removal.
 
 ## Quickstart
 
@@ -100,11 +101,12 @@ host-access warning because commands are not sandboxed and may access files,
 credentials, networks, and processes outside the project. `full-access` lasts
 only for the current session, is never persisted, and resets on restart or
 session switch. Direct `/approval full-access` opens the same warning rather
-`auto-review` delegates approval to a reviewer extension
-(e.g. Jev) that assesses each request's hazards and scope against your recent
-messages; user restrictions are enforced by Yach, not the reviewer. The
-reviewer sees your recent user messages plus the action being requested; it is
-not a sandbox — the extension host runs with the agent's privileges. In this
+`auto-review` delegates approval to a separately installed reviewer extension
+that assesses each request's hazards and scope against your recent messages.
+Yach does not ship a reviewer. User restrictions are enforced by Yach, not
+the reviewer. The reviewer sees your recent user messages plus the action being
+requested. It is not a sandbox. The extension host runs with the agent's
+privileges. In this
 build automatic execution is compiled off (`AUTO_REVIEW_EXECUTION_ENABLED =
 false`): actions the reviewer would have allowed are shown to you for
 approval, while reviewer holds (risk, clarification, restrictions) still apply
